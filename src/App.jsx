@@ -208,6 +208,379 @@ function sortTicketsForDisplay(tickets) {
 //       ["1-2-5","1-2-6","1-3-5","1-3-6"] → ["1-23-56"]
 //   ※ 展開すると元の点数集合に完全一致する組み合わせだけをまとめる（過不足ゼロ）。
 //   ※ 内部の点数カウントやオッズ計算には使わない。あくまで画面表示用。
+const TICKET_AUTO_SAVE_KEY = "hunaken_v63_ticket_autosave_v2";
+const LEGACY_DEVICE_AUTO_SAVE_KEY = "hunaken_v63_device_autosave_v1";
+const AUTO_SAVE_NOTICE_KEY = "hunaken_v63_device_autosave_notice_v1";
+
+function cleanupLegacyDeviceAutoSave() {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.removeItem(LEGACY_DEVICE_AUTO_SAVE_KEY);
+  } catch (_) { /* noop */ }
+}
+
+function loadDeviceAutoSave() {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    cleanupLegacyDeviceAutoSave();
+    const raw = localStorage.getItem(TICKET_AUTO_SAVE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || data.app !== "hunaken-academia" || !data.state) return null;
+    return data.state;
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveDeviceAutoSave(state) {
+  try {
+    if (typeof localStorage === "undefined") return false;
+    // ボートレース日和様由来の展示・モーター・オッズ・枠別情報などは保存しない。
+    // 端末内に残すのは、ユーザーが作った買い目リストと配当入力のみ。
+    localStorage.setItem(TICKET_AUTO_SAVE_KEY, JSON.stringify({
+      app: "hunaken-academia",
+      kind: "v63-ticket-autosave",
+      version: 2,
+      savedAt: Date.now(),
+      state: {
+        cart: Array.isArray(state.cart) ? state.cart : [],
+        payoutOddsInput: typeof state.payoutOddsInput === "string" ? state.payoutOddsInput : "",
+      },
+    }));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// AI予想の仮想収支を records 配列から計算する純関数（画面表示にも保存にも使う）
+// ── 縮小推定（ベイズ的シュリンケージ） ──
+//   母数nが少ない成績は基準値(prior)に寄せて、少走数の過大評価を防ぐ。
+//   例: 5走で80%の選手 → (80×5 + 基準×15)/(5+15) と、基準寄りに補正される。
+//   n=SHRINK_K で本人成績と基準が半々。母数が取れない場合は従来通り（補正なし）。
+const SHRINK_K = 15;
+function shrinkRate(rate, n, prior) {
+  if (rate == null) return null;
+  if (n == null || prior == null || !(n >= 0)) return rate;
+  return (rate * n + prior * SHRINK_K) / (n + SHRINK_K);
+}
+
+// ── AI評価の実績検証（答え合わせ） ──
+//   保存済みrecords（予想の印＋実際の結果）から、◎○が実際どれだけ来たかを集計。
+//   予測ロジックの重み調整・信頼度確認のためのフィードバックループ。
+function computeVerification(recs) {
+  const list = Array.isArray(recs) ? recs : [];
+  const judged = list.filter((r) => r.result && Array.isArray(r.ranked) && r.ranked.length);
+  const out = { judged: judged.length, marks: { "◎": { n: 0, win: 0, ren2: 0, ren3: 0 }, "○": { n: 0, win: 0, ren2: 0, ren3: 0 } } };
+  for (const r of judged) {
+    const parts = String(r.result).split("-").map(Number);
+    const [f, s, t] = parts;
+    for (const mk of ["◎", "○"]) {
+      const e = r.ranked.find((x) => x.mark === mk);
+      if (!e) continue;
+      const st = out.marks[mk];
+      st.n += 1;
+      if (e.boat === f) st.win += 1;
+      if (e.boat === f || e.boat === s) st.ren2 += 1;
+      if (e.boat === f || e.boat === s || e.boat === t) st.ren3 += 1;
+    }
+  }
+  return out;
+}
+
+function computeAiLedger(recs) {
+  const PER = 100; // 1点100円
+  const list = Array.isArray(recs) ? recs : [];
+  const judged = list.filter((r) => r.result && r.payoutOdds && r.bets && r.bets.length);
+  const patterns = [
+    { key: "honmei", name: "本線", parts: ["本線"] },
+    { key: "taikou", name: "対抗", parts: ["対抗"] },
+    { key: "ana", name: "穴", parts: ["穴"] },
+    { key: "h_t", name: "本線＋対抗", parts: ["本線", "対抗"] },
+    { key: "h_a", name: "本線＋穴", parts: ["本線", "穴"] },
+    { key: "t_a", name: "対抗＋穴", parts: ["対抗", "穴"] },
+    { key: "h_t_a", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
+  ];
+  const stats = {};
+  for (const p of patterns) stats[p.key] = { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
+  for (const r of judged) {
+    const odds = r.payoutOdds;
+    const limits = r.betLimits || {};
+    for (const p of patterns) {
+      const set = new Set();
+      for (const part of p.parts) {
+        const bet = r.bets.find((b) => b.label === part);
+        if (!bet) continue;
+        const lim = limits[part] != null ? limits[part] : bet.tickets.length;
+        for (const t of bet.tickets.slice(0, lim)) set.add(t);
+      }
+      if (set.size === 0) continue;
+      const s = stats[p.key];
+      s.races += 1;
+      s.spent += set.size * PER;
+      if (set.has(r.result)) {
+        s.hit += 1;
+        s.ret += Math.round((PER / 100) * odds);
+      }
+    }
+  }
+  return { judged: judged.length, patterns, stats };
+}
+
+function normalizeSavedObject(v, fallback) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : fallback;
+}
+function normalizeSavedArray(v, fallback) {
+  return Array.isArray(v) ? v : fallback;
+}
+function normalizeSavedString(v, fallback = "") {
+  return typeof v === "string" ? v : fallback;
+}
+function normalizeSavedBool(v, fallback = false) {
+  return typeof v === "boolean" ? v : fallback;
+}
+function normalizeSavedNumber(v, fallback = 0) {
+  return Number.isFinite(Number(v)) ? Number(v) : fallback;
+}
+
+// ── クラウド／端末保存の上限（一般公開向け：データが無限に増えないように） ──
+const MAX_RECORDS = 100;          // 予想記録は最新100件まで
+const MAX_BET_RECORDS = 300;      // 舟券収支（実購入）は最新300件まで
+const MAX_PRACTICE_BET_RECORDS = 50; // 仮想購入収支（練習）は最新50件まで
+
+// 配列を「新しい順で最大 limit 件」に切り詰める。
+// savedAt があれば降順ソート、無ければ既存の並び（先頭が新しい想定）を尊重。
+function capByRecent(list, limit) {
+  const arr = Array.isArray(list) ? list : [];
+  if (arr.length <= limit) return arr;
+  const hasSavedAt = arr.some((x) => x && typeof x.savedAt === "number");
+  if (hasSavedAt) {
+    return [...arr]
+      .sort((a, b) => (Number(b?.savedAt) || 0) - (Number(a?.savedAt) || 0))
+      .slice(0, limit);
+  }
+  // savedAt が無い場合は先頭が新しい想定なので先頭から limit 件
+  return arr.slice(0, limit);
+}
+
+
+
+function cartModeOf(line) {
+  return line?.mode === "practice" ? "practice" : "normal";
+}
+function cartModeLabel(mode) {
+  return mode === "practice" ? "練習モード" : "通常モード";
+}
+function estimateReturnFromOdds(amount, oddsValue) {
+  const amountNum = Number(amount) || 0;
+  const oddsNum = Number(oddsValue) || 0;
+  if (!amountNum || !oddsNum) return null;
+  // 買い目一覧に表示するオッズは「倍率」。100円×16.9倍＝1,690円。
+  // 結果入力欄の配当は「100円あたりの払戻額」なので別計算。
+  return Math.round(amountNum * oddsNum);
+}
+function compoundOddsForTickets(tickets, oddsMap) {
+  const list = Array.isArray(tickets) ? tickets : [];
+  const vals = list
+    .map((t) => Number(oddsMap?.[t]))
+    .filter((o) => Number.isFinite(o) && o > 0);
+  if (!vals.length) return null;
+  const inv = vals.reduce((a, o) => a + 1 / o, 0);
+  return { odds: inv > 0 ? 1 / inv : null, covered: vals.length, total: list.length };
+}
+function formatSignedYen(n) {
+  const v = Math.round(Number(n) || 0);
+  return `${v > 0 ? "+" : v < 0 ? "−" : "±"}${Math.abs(v).toLocaleString()}円`;
+}
+function profitColor(n) {
+  return n > 0 ? "#5dd39e" : n < 0 ? "#ff8a80" : "#9db5cc";
+}
+function allocateTicketAmountsByOdds(tickets, oddsMap, budgetYen) {
+  const list = Array.isArray(tickets) ? tickets : [];
+  if (!list.length) return null;
+  const oddsVals = list.map((t) => Number(oddsMap?.[t]));
+  if (oddsVals.some((o) => !Number.isFinite(o) || o <= 0)) return null;
+
+  // 100円単位で、各買い目が的中した時の払戻が近くなるように配分する。
+  // 予算が少なすぎる場合は各点最低100円になるように引き上げる。
+  const unit = 100;
+  const minBudget = list.length * unit;
+  const safeBudget = Math.max(minBudget, Math.round((Number(budgetYen) || minBudget) / unit) * unit);
+  const totalUnits = Math.max(list.length, Math.round(safeBudget / unit));
+  const weights = oddsVals.map((o) => 1 / o);
+  const weightSum = weights.reduce((a, b) => a + b, 0);
+  if (!weightSum) return null;
+
+  const base = Array(list.length).fill(1);
+  let remaining = totalUnits - list.length;
+  const rawAdds = weights.map((w) => (remaining * w) / weightSum);
+  const floors = rawAdds.map(Math.floor);
+  let used = floors.reduce((a, b) => a + b, 0);
+  for (let i = 0; i < base.length; i++) base[i] += floors[i];
+
+  const order = rawAdds
+    .map((v, i) => ({ i, frac: v - Math.floor(v) }))
+    .sort((a, b) => b.frac - a.frac);
+  for (let k = 0; k < remaining - used; k++) {
+    base[order[k % order.length].i] += 1;
+  }
+
+  const perTicket = {};
+  list.forEach((t, i) => { perTicket[t] = base[i] * unit; });
+  return perTicket;
+}
+function normalizePayoutReturnInput(value) {
+  const n = Number(String(value ?? "").replace(/[^\d.]/g, ""));
+  if (!Number.isFinite(n) || n <= 0) return null;
+  // 結果入力欄は基本「100円あたりの配当」だが、35.8倍のように倍率で入れても使えるようにする。
+  return n < 100 ? Math.round(n * 100) : Math.round(n);
+}
+// ── Googleログイン＋クラウド保存（Supabase） ──
+// Vercel環境変数に VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY を入れると有効化。
+// 保存するのはユーザー作成データのみ：買い目リスト・配当入力・舟券収支履歴。
+const SUPABASE_URL = String(import.meta.env?.VITE_SUPABASE_URL || "").replace(/\/+$/, "");
+const SUPABASE_ANON_KEY = String(import.meta.env?.VITE_SUPABASE_ANON_KEY || "");
+const SUPABASE_TABLE = String(import.meta.env?.VITE_SUPABASE_TABLE || "hunaken_user_data");
+const CLOUD_SAVE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+const CLOUD_SESSION_KEY = "hunaken_v64_supabase_session_v1";
+
+function cloudHeaders(accessToken, json = false) {
+  const h = {
+    apikey: SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${accessToken}`,
+  };
+  if (json) h["Content-Type"] = "application/json";
+  return h;
+}
+
+function normalizeCloudSession(data) {
+  if (!data || !data.access_token) return null;
+  const expiresIn = Number(data.expires_in || 3600);
+  return {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || "",
+    token_type: data.token_type || "bearer",
+    expires_at: data.expires_at ? Number(data.expires_at) : Date.now() + Math.max(60, expiresIn - 30) * 1000,
+  };
+}
+
+function loadCloudSession() {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    const raw = localStorage.getItem(CLOUD_SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveCloudSession(session) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    if (session) localStorage.setItem(CLOUD_SESSION_KEY, JSON.stringify(session));
+    else localStorage.removeItem(CLOUD_SESSION_KEY);
+  } catch (_) { /* noop */ }
+}
+
+function readCloudSessionFromCallbackUrl() {
+  try {
+    if (typeof window === "undefined") return null;
+    const hash = window.location.hash || "";
+    if (!hash.includes("access_token")) return null;
+    const params = new URLSearchParams(hash.replace(/^#/, ""));
+    const session = normalizeCloudSession({
+      access_token: params.get("access_token"),
+      refresh_token: params.get("refresh_token"),
+      token_type: params.get("token_type"),
+      expires_in: params.get("expires_in"),
+    });
+    if (session) {
+      window.history.replaceState(null, document.title, window.location.pathname + window.location.search);
+    }
+    return session;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function refreshCloudSession(session) {
+  if (!CLOUD_SAVE_ENABLED || !session?.refresh_token) return null;
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: cloudHeaders(SUPABASE_ANON_KEY, true),
+    body: JSON.stringify({ refresh_token: session.refresh_token }),
+  });
+  if (!res.ok) return null;
+  return normalizeCloudSession(await res.json());
+}
+
+async function fetchCloudUser(accessToken) {
+  if (!CLOUD_SAVE_ENABLED || !accessToken) return null;
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: cloudHeaders(accessToken),
+  });
+  if (!res.ok) return null;
+  return await res.json();
+}
+
+function cloudStateFrom(row) {
+  return {
+    cart: normalizeSavedArray(row?.cart, []),
+    payoutOddsInput: normalizeSavedString(row?.payout_odds_input, ""),
+    betRecords: capByRecent(normalizeSavedArray(row?.bet_records, []), MAX_BET_RECORDS),
+    practiceBetRecords: capByRecent(normalizeSavedArray(row?.practice_bet_records, []), MAX_PRACTICE_BET_RECORDS),
+    records: capByRecent(normalizeSavedArray(row?.records, []), MAX_RECORDS),
+    aiLedger: normalizeSavedObject(row?.ai_ledger, {}),
+  };
+}
+
+function buildCloudState({ cart, payoutOddsInput, betRecords, practiceBetRecords, records, aiLedger }) {
+  return {
+    cart: normalizeSavedArray(cart, []),
+    payoutOddsInput: normalizeSavedString(payoutOddsInput, ""),
+    betRecords: capByRecent(normalizeSavedArray(betRecords, []), MAX_BET_RECORDS),
+    practiceBetRecords: capByRecent(normalizeSavedArray(practiceBetRecords, []), MAX_PRACTICE_BET_RECORDS),
+    records: capByRecent(normalizeSavedArray(records, []), MAX_RECORDS),
+    aiLedger: normalizeSavedObject(aiLedger, {}),
+  };
+}
+
+async function loadCloudTicketState(userId, accessToken) {
+  if (!CLOUD_SAVE_ENABLED || !userId || !accessToken) return null;
+  const query = `user_id=eq.${encodeURIComponent(userId)}&select=cart,payout_odds_input,bet_records,practice_bet_records,records,ai_ledger,updated_at&limit=1`;
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?${query}`, {
+    headers: cloudHeaders(accessToken),
+  });
+  if (!res.ok) throw new Error("cloud-load-failed");
+  const rows = await res.json();
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
+async function saveCloudTicketState(userId, accessToken, state) {
+  if (!CLOUD_SAVE_ENABLED || !userId || !accessToken) return false;
+  const safe = buildCloudState(state);
+  const body = {
+    user_id: userId,
+    cart: safe.cart,
+    payout_odds_input: safe.payoutOddsInput,
+    bet_records: safe.betRecords,
+    practice_bet_records: safe.practiceBetRecords,
+    records: safe.records,
+    ai_ledger: safe.aiLedger,
+    updated_at: new Date().toISOString(),
+  };
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?on_conflict=user_id`, {
+    method: "POST",
+    headers: {
+      ...cloudHeaders(accessToken, true),
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error("cloud-save-failed");
+  return true;
+}
+
 function compressTickets(tickets) {
   if (!Array.isArray(tickets) || tickets.length === 0) return [];
   const set = new Set(tickets);
@@ -593,7 +966,7 @@ export default function App() {
   const [records, setRecords] = useState([]);       // 保存した予想＋結果
   const [saveMsg, setSaveMsg] = useState("");
   // 集計の絞り込み（的中率・AI収支・自分の収支に共通で適用）
-  const [statPeriod, setStatPeriod] = useState("all");   // "all" | "month" | "last30"
+  const [statPeriod, setStatPeriod] = useState("today");   // "today" | "week" | "all"
   const [statVenue, setStatVenue] = useState("all");     // "all" | 場名
   // 各買い目で実際に買う点数（このレース用）。未設定キーは「全点」扱い
   const [betLimits, setBetLimits] = useState({}); // {本線:6, 対抗:4, 穴:8, 超穴:3}
@@ -608,7 +981,9 @@ export default function App() {
   // 記録関連（予想の保存・結果入力・的中率・AI収支・舟券収支・バックアップ）の表示フラグ。
   // Webアプリ版（Vercel）では localStorage に永続保存されるため有効。
   const SHOW_RECORDS = true;
-  const [betRecords, setBetRecords] = useState([]); // 確定した購入履歴
+  const [betRecords, setBetRecords] = useState([]); // 確定した購入履歴（実購入）
+  const [practiceBetRecords, setPracticeBetRecords] = useState([]); // 仮想購入（練習）履歴
+  const [practiceMode, setPracticeMode] = useState(false); // false=通常モード, true=練習モード
   const [betMsg, setBetMsg] = useState("");
   const [cart, setCart] = useState([]);  // 記録前の買い目リスト [{id,label,tickets,amountPerPoint}]
   const [payoutOddsInput, setPayoutOddsInput] = useState(""); // 配当(100円あたり)
@@ -618,8 +993,30 @@ export default function App() {
     f1: [], f2: [], f3: [],  // フォーメーション選択
   });
   const setBD = (k, v) => setBetDraft((p) => ({ ...p, [k]: v }));
+  const [autoSaveReady, setAutoSaveReady] = useState(false);
+  const [autoSaveMsg, setAutoSaveMsg] = useState("");
+  const skipNextTicketAutoSaveRef = useRef(false);
 
+  // Googleログイン＋クラウド保存（買い目・配当・舟券収支・仮想購入収支・予想記録・AI仮想収支）
+  const [cloudAuth, setCloudAuth] = useState({ enabled: CLOUD_SAVE_ENABLED, ready: false, user: null, session: null });
+  const [cloudLoaded, setCloudLoaded] = useState(!CLOUD_SAVE_ENABLED);
+  const [cloudMsg, setCloudMsg] = useState("");
+  const cloudSaveTimerRef = useRef(null);
+  const lastCloudSaveJsonRef = useRef("");
+  const skipNextCloudSaveRef = useRef(false);
+  // 最新のログイン状態を保持（persist関数が古い値を見ないように）
+  const cloudUserIdRef = useRef(null);
+  useEffect(() => { cloudUserIdRef.current = cloudAuth.user?.id || null; }, [cloudAuth.user?.id]);
+  // ログイン中（クラウドが正）かどうか。true の間は端末内保存に書かない／読まない。
+  const isCloudActive = () => CLOUD_SAVE_ENABLED && !!cloudUserIdRef.current;
+
+  const betRecordsLoadedRef = useRef(false);
   useEffect(() => {
+    // クラウド有効環境では認証確定まで待つ。ログイン中は端末から読まない（クラウド復元に任せる）。
+    if (CLOUD_SAVE_ENABLED && !cloudAuth.ready) return;
+    if (betRecordsLoadedRef.current) return;
+    betRecordsLoadedRef.current = true;
+    if (CLOUD_SAVE_ENABLED && cloudAuth.user?.id) return;
     (async () => {
       let loaded = null;
       try {
@@ -632,24 +1029,70 @@ export default function App() {
           if (ls) loaded = JSON.parse(ls);
         } catch (e) { /* noop */ }
       }
-      if (loaded) setBetRecords(loaded);
+      if (loaded) setBetRecords(capByRecent(loaded, MAX_BET_RECORDS));
     })();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cloudAuth.ready, cloudAuth.user?.id]);
 
   const persistBets = async (updater) => {
     let computed;
     setBetRecords((prev) => {
-      computed = typeof updater === "function" ? updater(prev) : updater;
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      computed = capByRecent(next, MAX_BET_RECORDS);
       return computed;
     });
+    // ログイン中はクラウドが正。端末内保存（window.storage / localStorage）には書かない。
+    if (isCloudActive()) return;
     const json = JSON.stringify(computed);
     try { await window.storage.set("betRecords", json); } catch (e) { /* noop */ }
     try { localStorage.setItem("hunaken_betRecords", json); } catch (e) { /* noop */ }
   };
+
+  // 仮想購入（練習）履歴の読み込み・保存（最新50件）
+  const practiceBetsLoadedRef = useRef(false);
+  useEffect(() => {
+    if (CLOUD_SAVE_ENABLED && !cloudAuth.ready) return;
+    if (practiceBetsLoadedRef.current) return;
+    practiceBetsLoadedRef.current = true;
+    if (CLOUD_SAVE_ENABLED && cloudAuth.user?.id) return;
+    (async () => {
+      let loaded = null;
+      try {
+        const r = await window.storage.get("practiceBetRecords");
+        if (r && r.value) loaded = JSON.parse(r.value);
+      } catch (e) { /* noop */ }
+      if (!loaded) {
+        try {
+          const ls = localStorage.getItem("hunaken_practiceBetRecords");
+          if (ls) loaded = JSON.parse(ls);
+        } catch (e) { /* noop */ }
+      }
+      if (loaded) setPracticeBetRecords(capByRecent(loaded, MAX_PRACTICE_BET_RECORDS));
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cloudAuth.ready, cloudAuth.user?.id]);
+
+  const persistPracticeBets = async (updater) => {
+    let computed;
+    setPracticeBetRecords((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      computed = capByRecent(next, MAX_PRACTICE_BET_RECORDS);
+      return computed;
+    });
+    if (isCloudActive()) return;
+    const json = JSON.stringify(computed);
+    try { await window.storage.set("practiceBetRecords", json); } catch (e) { /* noop */ }
+    try { localStorage.setItem("hunaken_practiceBetRecords", json); } catch (e) { /* noop */ }
+  };
   const setResultDigit = (k, v) => setResultDigits((p) => ({ ...p, [k]: v }));
 
   // 起動時に保存レコードを読み込み
+  const recordsLoadedRef = useRef(false);
   useEffect(() => {
+    if (CLOUD_SAVE_ENABLED && !cloudAuth.ready) return;
+    if (recordsLoadedRef.current) return;
+    recordsLoadedRef.current = true;
+    if (CLOUD_SAVE_ENABLED && cloudAuth.user?.id) return;
     (async () => {
       let loaded = null;
       try {
@@ -662,20 +1105,220 @@ export default function App() {
           if (ls) loaded = JSON.parse(ls);
         } catch (e) { /* noop */ }
       }
-      if (loaded) setRecords(loaded);
+      if (loaded) setRecords(capByRecent(loaded, MAX_RECORDS));
     })();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cloudAuth.ready, cloudAuth.user?.id]);
 
   const persistRecords = async (updater) => {
     // updater は配列、または (prev)=>next の関数
     let computed;
     setRecords((prev) => {
-      computed = typeof updater === "function" ? updater(prev) : updater;
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      computed = capByRecent(next, MAX_RECORDS);
       return computed;
     });
+    // ログイン中はクラウドが正。端末内保存には書かない。
+    if (isCloudActive()) return;
     const json = JSON.stringify(computed);
     try { await window.storage.set("records", json); } catch (e) { /* noop */ }
     try { localStorage.setItem("hunaken_records", json); } catch (e) { /* noop */ }
+  };
+
+
+  // 保存用：絞り込みなしの「全records」から計算したAI予想の仮想収支（スナップショット）
+  // クラウド自動保存の依存配列で使うため、クラウド保存useEffectより前に定義する。
+  const aiLedgerAll = useMemo(() => computeAiLedger(records), [records]);
+
+  // ── Googleログイン・クラウド保存 ──
+  useEffect(() => {
+    let cancelled = false;
+    const initCloudAuth = async () => {
+      if (!CLOUD_SAVE_ENABLED) {
+        setCloudAuth({ enabled: false, ready: true, user: null, session: null });
+        setCloudLoaded(true);
+        return;
+      }
+      try {
+        let session = readCloudSessionFromCallbackUrl() || loadCloudSession();
+        if (session && session.expires_at && session.expires_at < Date.now() + 60_000) {
+          session = await refreshCloudSession(session);
+        }
+        if (!session?.access_token) {
+          saveCloudSession(null);
+          if (!cancelled) {
+            setCloudAuth({ enabled: true, ready: true, user: null, session: null });
+            setCloudLoaded(true);
+          }
+          return;
+        }
+        const user = await fetchCloudUser(session.access_token);
+        if (!user?.id) throw new Error("no-user");
+        saveCloudSession(session);
+        if (!cancelled) {
+          setCloudAuth({ enabled: true, ready: true, user, session });
+          setCloudMsg(`✓ Googleログイン中：${user.email || "ユーザー"}`);
+          setTimeout(() => setCloudMsg(""), 3500);
+        }
+      } catch (_) {
+        saveCloudSession(null);
+        if (!cancelled) {
+          setCloudAuth({ enabled: true, ready: true, user: null, session: null });
+          setCloudLoaded(true);
+          setCloudMsg("クラウド保存のログイン確認に失敗しました。もう一度Googleログインしてください。");
+        }
+      }
+    };
+    initCloudAuth();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!CLOUD_SAVE_ENABLED || !cloudAuth.user?.id || !cloudAuth.session?.access_token) return;
+    let cancelled = false;
+    const loadCloud = async () => {
+      // ログインユーザーが変わった瞬間、前ユーザーの画面状態を持ち越さない。
+      // クラウド読込が終わるまで自動保存を止め、画面も一旦クリアする。
+      setCloudLoaded(false);
+      skipNextCloudSaveRef.current = true;
+      skipNextTicketAutoSaveRef.current = true;
+      setCart([]);
+      setPayoutOddsInput("");
+      setBetRecords([]);
+      setPracticeBetRecords([]);
+      setRecords([]);
+      setCloudMsg("クラウド保存を読み込み中...");
+      try {
+        const row = await loadCloudTicketState(cloudAuth.user.id, cloudAuth.session.access_token);
+        if (cancelled) return;
+        if (row) {
+          // このGoogleアカウントのクラウドデータだけを正とする。
+          // クラウドが空でも、端末内保存やlocalStorageにフォールバックしない（別ユーザーのデータ混入を防ぐ）。
+          const cloud = cloudStateFrom(row);
+          const nextCart = normalizeSavedArray(cloud.cart, []);
+          const nextPayout = normalizeSavedString(cloud.payoutOddsInput, "");
+          const nextBetRecords = normalizeSavedArray(cloud.betRecords, []);
+          const nextPracticeBetRecords = normalizeSavedArray(cloud.practiceBetRecords, []);
+          const nextRecords = normalizeSavedArray(cloud.records, []);
+          setCart(nextCart);
+          setPayoutOddsInput(nextPayout);
+          setBetRecords(nextBetRecords);
+          setPracticeBetRecords(nextPracticeBetRecords);
+          setRecords(nextRecords);
+          // ログイン中は端末内保存に書かない（クラウドが正・端末内保存は未ログイン専用）
+          // AI予想の仮想収支は records から再計算したものを正とする（ai_ledger列はバックアップ）
+          const nextAiLedger = computeAiLedger(nextRecords);
+          const state = buildCloudState({ cart: nextCart, payoutOddsInput: nextPayout, betRecords: nextBetRecords, practiceBetRecords: nextPracticeBetRecords, records: nextRecords, aiLedger: nextAiLedger });
+          lastCloudSaveJsonRef.current = JSON.stringify(state);
+          setCloudMsg("✓ このGoogleアカウントのクラウド保存から復元しました");
+        } else {
+          // 新規Googleユーザー：画面に残っているデータは持ち込まず、空状態から開始する。
+          const emptyCart = [];
+          const emptyPayout = "";
+          const emptyBetRecords = [];
+          const emptyRecords = [];
+          setCart(emptyCart);
+          setPayoutOddsInput(emptyPayout);
+          setBetRecords(emptyBetRecords);
+          setPracticeBetRecords([]);
+          setRecords(emptyRecords);
+          // ログイン中は端末内保存に書かない（クラウドが正・端末内保存は未ログイン専用）
+          const state = buildCloudState({ cart: emptyCart, payoutOddsInput: emptyPayout, betRecords: emptyBetRecords, practiceBetRecords: [], records: emptyRecords, aiLedger: {} });
+          await saveCloudTicketState(cloudAuth.user.id, cloudAuth.session.access_token, state);
+          lastCloudSaveJsonRef.current = JSON.stringify(state);
+          setCloudMsg("✓ 新規アカウント用の空データを作成しました");
+        }
+      } catch (_) {
+        setCloudMsg("クラウド保存の読み込みに失敗しました。通信状況を確認してください。");
+      } finally {
+        if (!cancelled) {
+          setCloudLoaded(true);
+          setTimeout(() => setCloudMsg(""), 4500);
+        }
+      }
+    };
+    loadCloud();
+    return () => { cancelled = true; };
+    // ログインユーザーが変わった時だけ読み込み
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cloudAuth.user?.id]);
+
+  useEffect(() => {
+    if (!CLOUD_SAVE_ENABLED || !cloudLoaded || !cloudAuth.user?.id || !cloudAuth.session?.access_token) return;
+    if (skipNextCloudSaveRef.current) {
+      skipNextCloudSaveRef.current = false;
+      return;
+    }
+    const state = buildCloudState({ cart, payoutOddsInput, betRecords, practiceBetRecords, records, aiLedger: aiLedgerAll });
+    const json = JSON.stringify(state);
+    if (json === lastCloudSaveJsonRef.current) return;
+    if (cloudSaveTimerRef.current) clearTimeout(cloudSaveTimerRef.current);
+    cloudSaveTimerRef.current = setTimeout(async () => {
+      try {
+        await saveCloudTicketState(cloudAuth.user.id, cloudAuth.session.access_token, state);
+        lastCloudSaveJsonRef.current = json;
+        setCloudMsg("✓ クラウド保存しました");
+        setTimeout(() => setCloudMsg(""), 1800);
+      } catch (_) {
+        setCloudMsg("クラウド保存に失敗しました。通信状況を確認してください。");
+      }
+    }, 700);
+    return () => {
+      if (cloudSaveTimerRef.current) clearTimeout(cloudSaveTimerRef.current);
+    };
+  }, [cloudLoaded, cloudAuth.user?.id, cloudAuth.session?.access_token, cart, payoutOddsInput, betRecords, practiceBetRecords, records, aiLedgerAll]);
+
+  const signInWithGoogle = () => {
+    if (!CLOUD_SAVE_ENABLED) {
+      setCloudMsg("クラウド保存の設定がまだです。Vercel環境変数を設定してください。");
+      return;
+    }
+    const redirectTo = window.location.origin + window.location.pathname;
+    window.location.href = `${SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectTo)}`;
+  };
+
+  const signOutCloud = async () => {
+    try {
+      if (CLOUD_SAVE_ENABLED && cloudAuth.session?.access_token) {
+        await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
+          method: "POST",
+          headers: cloudHeaders(cloudAuth.session.access_token),
+        });
+      }
+    } catch (_) { /* noop */ }
+    saveCloudSession(null);
+    // 前ユーザーのデータを端末に残さない。クラウド本体には手を触れない（消さない）。
+    // 次の自動保存（端末内・クラウド）が空データで走らないようスキップさせる。
+    skipNextTicketAutoSaveRef.current = true;
+    skipNextCloudSaveRef.current = true;
+    setCart([]);
+    setPayoutOddsInput("");
+    setBetRecords([]);
+    setPracticeBetRecords([]);
+    lastCloudSaveJsonRef.current = "";
+    try { localStorage.removeItem("hunaken_betRecords"); } catch (_) { /* noop */ }
+    try { localStorage.removeItem("hunaken_practiceBetRecords"); } catch (_) { /* noop */ }
+    try { localStorage.removeItem("hunaken_records"); } catch (_) { /* noop */ }
+    try { localStorage.removeItem(TICKET_AUTO_SAVE_KEY); } catch (_) { /* noop */ }
+    setRecords([]);
+    setCloudAuth({ enabled: CLOUD_SAVE_ENABLED, ready: true, user: null, session: null });
+    setCloudLoaded(true);
+    setCloudMsg("Googleログアウトしました。この端末の表示はクリアしました（クラウド保存は消えません）。");
+  };
+
+  const saveCloudNow = async () => {
+    if (!cloudAuth.user?.id || !cloudAuth.session?.access_token) {
+      setCloudMsg("クラウド保存にはGoogleログインが必要です。");
+      return;
+    }
+    try {
+      const state = buildCloudState({ cart, payoutOddsInput, betRecords, practiceBetRecords, records, aiLedger: aiLedgerAll });
+      await saveCloudTicketState(cloudAuth.user.id, cloudAuth.session.access_token, state);
+      lastCloudSaveJsonRef.current = JSON.stringify(state);
+      setCloudMsg("✓ 今の買い目・配当・舟券収支・仮想購入収支・予想記録・AI予想の仮想収支をクラウド保存しました");
+    } catch (_) {
+      setCloudMsg("クラウド保存に失敗しました。通信状況を確認してください。");
+    }
   };
 
   // ── データのバックアップ（エクスポート/インポート） ──
@@ -1247,7 +1890,7 @@ export default function App() {
 
 
 
-  const prefetchStorageKey = (v, d, r) => `hunaken_prefetch_yoso_v108_${v}_${d}_${r}`;
+  const prefetchStorageKey = (v, d, r) => `hunaken_prefetch_yoso_v109_${v}_${d}_${r}`;
 
   const storePrefetchPayload = (v, d, r, data) => {
     try {
@@ -1607,11 +2250,12 @@ export default function App() {
               const pos = i + label.length;
               // 次のラベル候補までを範囲にして、混入を防ぐ
               const seg = sec.slice(pos);
-              const re = /\d+\.\d+|[-−ー]/g;
+              const re = /(\d+\.\d+)\s*%?\s*(?:\(\s*(\d+)\s*\))?|[-−ー]/g;
               const vals = [];
               let m;
               while (vals.length < 6 && (m = re.exec(seg))) {
-                vals.push(/^[-−ー]$/.test(m[0]) ? null : Number(m[0]));
+                if (/^[-−ー]$/.test(m[0])) vals.push(null);
+                else vals.push({ v: Number(m[1]), n: m[2] != null ? Number(m[2]) : null });
               }
               if (vals.length === 6) return vals;
               from = pos;
@@ -1631,11 +2275,12 @@ export default function App() {
             if (mm && Number(mm[1]) === num) {
               const pos = i + 2 + mm.index + mm[0].length; // 数字の直後
               const seg = sec.slice(pos);
-              const re = /\d+\.\d+|[-−ー]/g;
+              const re = /(\d+\.\d+)\s*%?\s*(?:\(\s*(\d+)\s*\))?|[-−ー]/g;
               const vals = [];
               let m;
               while (vals.length < 6 && (m = re.exec(seg))) {
-                vals.push(/^[-−ー]$/.test(m[0]) ? null : Number(m[0]));
+                if (/^[-−ー]$/.test(m[0])) vals.push(null);
+                else vals.push({ v: Number(m[1]), n: m[2] != null ? Number(m[2]) : null });
               }
               if (vals.length === 6) return vals;
             }
@@ -1667,15 +2312,27 @@ export default function App() {
       const ren2 = parseSection(s2);
       const ren3 = parseSection(s3);
 
-      const clean = (sec) => {
+      const cleanV = (sec) => {
         const out = {};
         for (const k of RACER_CATS) {
           const arr = sec ? sec[k] : null;
-          out[k] = arr ? arr.map((v) => (v != null && v >= 0 && v <= 100 ? v : null)) : null;
+          out[k] = arr ? arr.map((o) => (o && o.v != null && o.v >= 0 && o.v <= 100 ? o.v : null)) : null;
         }
         return out;
       };
-      const stats = { win1: clean(win1), ren2: clean(ren2), ren3: clean(ren3) };
+      // 母数（出走数）: 縮小推定用。取れなかった項目は null（従来通り縮小なし）
+      const cleanN = (sec) => {
+        const out = {};
+        for (const k of RACER_CATS) {
+          const arr = sec ? sec[k] : null;
+          out[k] = arr ? arr.map((o) => (o && o.n != null && o.n >= 0 ? o.n : null)) : null;
+        }
+        return out;
+      };
+      const stats = {
+        win1: cleanV(win1), ren2: cleanV(ren2), ren3: cleanV(ren3),
+        win1N: cleanN(win1), ren2N: cleanN(ren2), ren3N: cleanN(ren3),
+      };
       if (!RACER_CATS.some((k) => stats.win1[k] || stats.ren2[k] || stats.ren3[k])) {
         setPMsg(msgKey, "成績を読み取れませんでした。表の部分だけを貼り付けてください");
         return false;
@@ -2023,18 +2680,26 @@ export default function App() {
     }
     const zeroAdj = { w1: 0, w2: 0, w3: 0, top3: 0, tier: 0, tierMax: 1 };
     const { base, season: curSeason, seasonal: usingSeasonal } = getVenueBase(venue, raceDate);
+    // 縮小推定の基準値: 2連/3連対率は「この6艇の平均」を基準に、母数が少ない値を寄せる
+    const fieldMean = (arr) => {
+      const v = (arr || []).filter((x) => x != null);
+      return v.length ? v.reduce((a, x) => a + x, 0) / v.length : null;
+    };
+    const ren2Prior = fieldMean(racerStats?.ren2?.[racerCat]);
+    const ren3Prior = fieldMean(racerStats?.ren3?.[racerCat]);
     const rows = [];
     for (let b = 1; b <= 6; b++) {
       const diff = useDisplayCorrection ? avg - sums[b] : 0; // プラス＝良化
       const course = courses[b];
       const adj = useDisplayCorrection ? lookup(course, diff) : zeroAdj;             // 江戸川は展示補正なし
-      const baseRate = base[course - 1];            // 進入コースの場別1着率（平均）
-      const windAdj = +(WIND[wind][course - 1] - WIND["無風"][course - 1]).toFixed(1); // 無風基準の風補正
-      const final1 = baseRate + adj.w1 + windAdj;   // 基準 + タイム補正 + 風補正
+      const baseRate = base[course - 1];            // 進入コースの基本場平均1着率（季節別・場別）
+      const windAdj = +(WIND[wind][course - 1] - WIND["無風"][course - 1]).toFixed(1); // 無風基準の風補正（AI評価の風項目でのみ使用）
+      const final1 = baseRate + adj.w1;             // 基準 + タイム補正。風補正はここに混ぜない（二重反映防止）
       // 本人の枠別成績ベース（選手成績貼り付け時のみ）
-      const rW1 = racerStats?.win1?.[racerCat]?.[b - 1] ?? null;
-      const rR2 = racerStats?.ren2?.[racerCat]?.[b - 1] ?? null;
-      const rR3 = racerStats?.ren3?.[racerCat]?.[b - 1] ?? null;
+      // 母数が少ない成績は縮小推定で基準値に寄せる（1着率→コース場平均、2連/3連→6艇平均）
+      const rW1 = shrinkRate(racerStats?.win1?.[racerCat]?.[b - 1] ?? null, racerStats?.win1N?.[racerCat]?.[b - 1] ?? null, baseRate);
+      const rR2 = shrinkRate(racerStats?.ren2?.[racerCat]?.[b - 1] ?? null, racerStats?.ren2N?.[racerCat]?.[b - 1] ?? null, ren2Prior);
+      const rR3 = shrinkRate(racerStats?.ren3?.[racerCat]?.[b - 1] ?? null, racerStats?.ren3N?.[racerCat]?.[b - 1] ?? null, ren3Prior);
       const racerR1final = rW1 != null ? rW1 + adj.w1 : null;            // 本人1着率＋1着補正
       const racerR2final = rR2 != null ? rR2 + adj.w1 + adj.w2 : null;   // 本人2連対率＋補正
       const racerR3final = rR3 != null ? rR3 + adj.top3 : null;          // 本人3連対率＋補正
@@ -2078,19 +2743,24 @@ export default function App() {
   }, [sts, fHold, fSts, courses]);
 
   // 指定区分(cat)の枠別成績で rows を作り直す（タイム・風・補正は共通、racerR*finalのみ差し替え）
-  const rowsForCat = (baseRows, cat) => baseRows.map((r) => {
-    const i = r.boat - 1;
-    const rW1 = racerStats?.win1?.[cat]?.[i] ?? null;
-    const rR2 = racerStats?.ren2?.[cat]?.[i] ?? null;
-    const rR3 = racerStats?.ren3?.[cat]?.[i] ?? null;
-    return {
-      ...r,
-      racerW1: rW1, racerR2: rR2, racerR3: rR3,
-      racerR1final: rW1 != null ? rW1 + (r.w1 || 0) : null,
-      racerR2final: rR2 != null ? rR2 + (r.w1 || 0) + (r.w2 || 0) : null,
-      racerR3final: rR3 != null ? rR3 + (r.top3 || 0) : null,
-    };
-  });
+  const rowsForCat = (baseRows, cat) => {
+    const fm = (arr) => { const v = (arr || []).filter((x) => x != null); return v.length ? v.reduce((a, x) => a + x, 0) / v.length : null; };
+    const p2 = fm(racerStats?.ren2?.[cat]);
+    const p3 = fm(racerStats?.ren3?.[cat]);
+    return baseRows.map((r) => {
+      const i = r.boat - 1;
+      const rW1 = shrinkRate(racerStats?.win1?.[cat]?.[i] ?? null, racerStats?.win1N?.[cat]?.[i] ?? null, r.baseRate);
+      const rR2 = shrinkRate(racerStats?.ren2?.[cat]?.[i] ?? null, racerStats?.ren2N?.[cat]?.[i] ?? null, p2);
+      const rR3 = shrinkRate(racerStats?.ren3?.[cat]?.[i] ?? null, racerStats?.ren3N?.[cat]?.[i] ?? null, p3);
+      return {
+        ...r,
+        racerW1: rW1, racerR2: rR2, racerR3: rR3,
+        racerR1final: rW1 != null ? rW1 + (r.w1 || 0) : null,
+        racerR2final: rR2 != null ? rR2 + (r.w1 || 0) + (r.w2 || 0) : null,
+        racerR3final: rR3 != null ? rR3 + (r.top3 || 0) : null,
+      };
+    });
+  };
 
   // 総合AI評価（枠別成績・展示タイム・モーター・風の4項目）。rows を渡すと同じロジックで評価
   const evaluateRows = (rows) => {
@@ -2234,7 +2904,7 @@ export default function App() {
         モーター: cMotor,
         風: cWind,
         ST: stScore,
-        枠基準: cBase,  // 場別コース1着率ベース
+        枠基準: cBase,  // 基本場平均＋展示補正ベース（風は含めない）
         総合印: cGoods, // 4項目チェック（枠/展/機/風）の合計
       };
       const score = cGoods + cRacer + cDiff + cMotor + cWind + cBase + stScore;
@@ -2305,41 +2975,37 @@ export default function App() {
     {
       // 指標が大きいほど良い前提。同値は同順位（＝同点）にする。
       const rankPoints = (getVal, step) => {
-        // 各艇の値を取得（null は最下位扱い）
+        // 連続値配点: 順位でなく「差の大きさ」を点数に反映（接戦と大差を区別）。
+        //   レース内の最小〜最大を 0〜満点 に正規化。全艇同値なら中間点、値なしは0点。
+        const maxPts = step * 5; // step=4→20点満点, step=2→10点満点（従来と同じ満点）
         const arr = ranked.map((r) => ({ r, v: getVal(r) }));
-        // 降順ソート（大きいほど上位）
-        const sorted = [...arr].sort((a, b) => (b.v ?? -Infinity) - (a.v ?? -Infinity));
+        const finite = arr.filter((x) => x.v != null && Number.isFinite(x.v)).map((x) => x.v);
         const pointsOf = {};
-        let lastV = null, lastPts = null;
-        sorted.forEach((item, idx) => {
-          let pts;
-          if (lastV !== null && item.v === lastV) {
-            pts = lastPts;                 // 同値 → 同点
-          } else {
-            pts = Math.max(0, (6 - idx) - 1) * step; // 1位:5*step … 6位:0
-            // ↑ idx0→5*step, idx5→0。step=4で20〜0、step=2で10〜0
-          }
-          pointsOf[item.r.boat] = pts;
-          lastV = item.v; lastPts = pts;
+        if (!finite.length) { arr.forEach((x) => { pointsOf[x.r.boat] = 0; }); return pointsOf; }
+        const mn = Math.min(...finite), mx = Math.max(...finite);
+        arr.forEach((x) => {
+          if (x.v == null || !Number.isFinite(x.v)) { pointsOf[x.r.boat] = 0; return; }
+          pointsOf[x.r.boat] = mx === mn ? Math.round(maxPts / 2) : Math.round(maxPts * (x.v - mn) / (mx - mn));
         });
         return pointsOf;
       };
 
       // 展示の指標: 自コース補正テーブルの「段階(tier)」を段階数で正規化（0〜1、枠の段階差を吸収）
-      //   さらに 3〜6号艇が上位2段階に乗ったら問答無用で最上位扱い（+100のゲタ）。
+      //   さらに 3〜6号艇が上位2段階に乗ったら最上位級扱い（+0.25 のゲタ＝必ずレース内最大以上になる）。
+      //   ※連続値配点に合わせ、ゲタを+100→+0.25に調整（他艇の点数分布を潰さないため）。
       const tenjiVal = (r) => {
         if (r.tier == null || r.tierMax == null) return -Infinity;
         let v = r.tier / (r.tierMax - 1); // 0〜1
         const isOuter = r.course >= 3;
         const topTwoTier = r.tier >= r.tierMax - 2; // 上位2段階
-        if (isOuter && topTwoTier) v += 100;        // 外枠の好タイムは展示1位級に
+        if (isOuter && topTwoTier) v += 0.25;       // 外枠の好タイムは展示1位級に
         return v;
       };
 
       const ptSeisek = rankPoints((r) => (r.racerR1final ?? -Infinity), 4); // 補正込み1着率
       const ptTenji  = rankPoints(tenjiVal, 4);                              // 展示（段階ベース）
       const ptMotor  = rankPoints((r) => (motors[r.boat]?.ren2 ?? -Infinity), 4); // モーター2連対率
-      const ptWaku   = rankPoints((r) => (r.final1 ?? -Infinity), 2);        // 枠基準（予想1着率）10点満点
+      const ptWaku   = rankPoints((r) => (r.final1 ?? -Infinity), 2);        // 枠基準（基本場平均＋展示補正／風なし）10点満点
       const ptSt     = rankPoints((r) => (r.stDiff ?? -Infinity), 4);        // ST（速いほど＋）20点満点
       const ptKaze   = rankPoints((r) => (r.windAdj ?? -Infinity), 2);       // 風補正
 
@@ -2721,6 +3387,46 @@ export default function App() {
 
     const bets = [honmei, taikou, ana];
 
+    // ── スコア→確率→期待値 ──
+    //   1着確率: コース別の場平均1着率(final1)を土台(prior)に、当日評価スコアで補正して正規化。
+    //   3連単確率: Harville式 P(a-b-c)=pa×pb/(1-pa)×pc/(1-pa-pb)（一次近似・本命側をやや過大評価する既知の癖あり）。
+    //   期待値 EV = 推定確率×オッズ。EV>1 は「市場より割安（妙味）」の目安。
+    const meanScore = ranked.reduce((a, r) => a + (r.score || 0), 0) / ranked.length;
+    const winProb = {};
+    {
+      let zSum = 0;
+      for (const r of ranked) {
+        const baseP = Math.max(1, r.final1 ?? r.baseRate ?? 10);
+        const w = baseP * Math.exp(0.08 * ((r.score || 0) - meanScore));
+        winProb[r.boat] = w; zSum += w;
+      }
+      for (const b of Object.keys(winProb)) winProb[b] = winProb[b] / zSum;
+    }
+    const probMap = {};
+    const boatsAll = ranked.map((r) => r.boat);
+    for (const pa1 of boatsAll) for (const pb2 of boatsAll) for (const pc3 of boatsAll) {
+      if (pa1 === pb2 || pa1 === pc3 || pb2 === pc3) continue;
+      const pa = winProb[pa1], pb = winProb[pb2], pc = winProb[pc3];
+      const d1 = 1 - pa, d2 = 1 - pa - pb;
+      if (d1 <= 0 || d2 <= 0) continue;
+      const p = pa * (pb / d1) * (pc / d2);
+      if (Number.isFinite(p) && p > 0) probMap[`${pa1}-${pb2}-${pc3}`] = p;
+    }
+    let evList = [];
+    if (odds) {
+      const seenEv = new Set();
+      for (const bset of bets) {
+        for (const t of bset.tickets) {
+          if (seenEv.has(t)) continue;
+          seenEv.add(t);
+          const o = odds[t];
+          const p = probMap[t];
+          if (o > 0 && p != null) evList.push({ t, from: bset.label, p, o, ev: p * o });
+        }
+      }
+      evList.sort((x, y) => y.ev - x.ev);
+    }
+
     // ── 段階的フィルター＋決まり手シナリオ ──
     // 気配順位(order)を土台に、ST→モーター→F持ち→風で頭を1〜2艇に確定
     const stOf = (b) => { const v = fHold[b] ? null : Number(fSts[b] ?? sts[b]); return Number.isFinite(v) ? v : null; };
@@ -2883,7 +3589,7 @@ export default function App() {
       confidence = { total, level, color, advice, reasons };
     }
 
-    return { ranked, badge, badgeColor, usedData, bets, flow, recommend, confidence };
+    return { ranked, badge, badgeColor, usedData, bets, flow, recommend, confidence, winProb, probMap, evList };
   };
 
   // メイン評価（選択中の区分）
@@ -2919,7 +3625,7 @@ export default function App() {
     }
     const key = `${raceDate}_${venue}_${raceNo}R`;
     const trio = `${first}-${second}-${third}`;
-    const odds = Number(payoutOddsInput) || null;
+    const odds = normalizePayoutReturnInput(payoutOddsInput);
     const curBets = aiEval ? aiEval.bets.map((b) => {
       let tk = b.tickets;
       if (cmpMode === "overlap" && periodCompare) {
@@ -2947,9 +3653,11 @@ export default function App() {
       return [{ key, date: raceDate, venue, race: raceNo, ranked: curRanked, bets: curBets, result: trio, payoutOdds: odds, betLimits: { ...betLimits }, savedAt: Date.now() }, ...prev];
     });
 
-    // 同じ日付・場・レースの「自分の舟券記録」にも結果・配当を反映
+    // 同じ日付・場・レースの収支記録にも結果・配当を反映
+    // 通常モードなら bet_records、練習モードなら practice_bet_records だけを更新する。
+    // 練習モードの結果保存が、実購入の舟券収支に混ざらないように分離する。
     const sameRace = (b) => b.date === raceDate && b.venue === (venue || "—") && b.race === raceNo;
-    await persistBets((prev) => prev.some(sameRace)
+    const applyResultToBetRecords = (prev) => prev.some(sameRace)
       ? prev.map((b) => {
           if (!sameRace(b)) return b;
           const hit = b.tickets.includes(trio);
@@ -2957,52 +3665,70 @@ export default function App() {
           const payout = hit && odds > 0 ? Math.round((hitAmt / 100) * odds) : 0;
           return { ...b, result: trio, hit, payoutOdds: odds || null, payout };
         })
-      : prev);
+      : prev;
 
-    setSaveMsg(`✓ ${key} の結果 ${trio}${odds ? `（配当${odds}）` : ""} を保存しました`);
+    if (practiceMode) {
+      await persistPracticeBets(applyResultToBetRecords);
+    } else {
+      await persistBets(applyResultToBetRecords);
+    }
+
+    const reflectedLabel = practiceMode ? "仮想購入収支" : "舟券収支";
+    setSaveMsg(`✓ ${key} の結果 ${trio}${odds ? `（配当${odds}）` : ""} を保存しました（${reflectedLabel}に反映）`);
   };
 
   // ── 集計の絞り込み（期間・場）を records / betRecords に適用 ──
   const statFilter = useMemo(() => {
-    const now = new Date();
-    const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-    const byPeriodVenue = (list, getDate, getVenue, getRaceKey) => {
+    // 日本時間(JST)基準の日付文字列 YYYY-MM-DD を作る
+    const jstDateStr = (offsetDays = 0) => {
+      const d = new Date(Date.now() + 9 * 3600 * 1000 - offsetDays * 86400 * 1000);
+      return d.toISOString().slice(0, 10);
+    };
+    const todayJst = raceDate || jstDateStr(0); // 「当日」は端末の今日ではなく、画面で選択中の日付を基準にする
+    const weekAgoJst = (() => {
+      const base = new Date(`${todayJst}T00:00:00+09:00`);
+      if (Number.isNaN(base.getTime())) return jstDateStr(6);
+      base.setDate(base.getDate() - 6);
+      const y = base.getFullYear();
+      const m = String(base.getMonth() + 1).padStart(2, "0");
+      const d = String(base.getDate()).padStart(2, "0");
+      return `${y}-${m}-${d}`;
+    })(); // 選択日を含む直近7日間
+    const byPeriodVenue = (list, getDate, getVenue) => {
       let arr = list;
       if (statVenue !== "all") arr = arr.filter((x) => getVenue(x) === statVenue);
-      if (statPeriod === "month") {
-        arr = arr.filter((x) => String(getDate(x) || "").slice(0, 7) === ym);
-      } else if (statPeriod === "last30") {
-        // レース単位で日付降順の直近30レースに含まれるものだけ残す
-        const keys = [...new Set(arr.map(getRaceKey))]
-          .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))  // 新しい順（キー先頭が日付）
-          .slice(0, 30);
-        const keep = new Set(keys);
-        arr = arr.filter((x) => keep.has(getRaceKey(x)));
+      if (statPeriod === "today") {
+        arr = arr.filter((x) => String(getDate(x) || "") === todayJst);
+      } else if (statPeriod === "week") {
+        arr = arr.filter((x) => {
+          const d = String(getDate(x) || "");
+          return d && d >= weekAgoJst && d <= todayJst;
+        });
       }
+      // "all" は絞り込みなし
       return arr;
     };
     const recs = byPeriodVenue(
       records,
       (r) => r.date,
       (r) => r.venue,
-      (r) => `${r.date}_${r.venue}_${r.race}`,
     );
     const bets = byPeriodVenue(
-      betRecords,
+      practiceMode ? practiceBetRecords : betRecords,
       (b) => b.date,
       (b) => b.venue,
-      (b) => `${b.date}_${b.venue}_${b.race}`,
     );
     return { recs, bets };
-  }, [records, betRecords, statPeriod, statVenue]);
+  }, [records, betRecords, practiceBetRecords, practiceMode, statPeriod, statVenue, raceDate]);
 
   // 絞り込みで使う「場の一覧」（記録に出てくる場だけ）
   const statVenueList = useMemo(() => {
     const s = new Set();
     records.forEach((r) => r.venue && s.add(r.venue));
     betRecords.forEach((b) => b.venue && b.venue !== "—" && s.add(b.venue));
+    practiceBetRecords.forEach((b) => b.venue && b.venue !== "—" && s.add(b.venue));
     return [...s];
-  }, [records, betRecords]);
+  }, [records, betRecords, practiceBetRecords]);
 
   // ── 的中率の集計（結果が入っているレコードが対象） ──
   const hitStats = useMemo(() => {
@@ -3024,46 +3750,10 @@ export default function App() {
   }, [statFilter]);
 
   // ── AI予想の収支（もし機械的に買っていたら・1点100円固定） ──
-  const aiLedger = useMemo(() => {
-    const PER = 100; // 1点100円
-    const judged = statFilter.recs.filter((r) => r.result && r.payoutOdds && r.bets && r.bets.length);
-    const patterns = [
-      { key: "honmei", name: "本線", parts: ["本線"] },
-      { key: "taikou", name: "対抗", parts: ["対抗"] },
-      { key: "ana", name: "穴", parts: ["穴"] },
-      { key: "h_t", name: "本線＋対抗", parts: ["本線", "対抗"] },
-      { key: "h_a", name: "本線＋穴", parts: ["本線", "穴"] },
-      { key: "t_a", name: "対抗＋穴", parts: ["対抗", "穴"] },
-      { key: "h_t_a", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
-      { key: "all", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
-    ];
-    const stats = {};
-    for (const p of patterns) stats[p.key] = { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
+  const aiLedger = useMemo(() => computeAiLedger(statFilter.recs), [statFilter]);
 
-    for (const r of judged) {
-      const odds = r.payoutOdds;
-      const limits = r.betLimits || {}; // {本線:6, 対抗:4, ...} レースごとの点数設定
-      for (const p of patterns) {
-        // このパターンの合成買い目（各買い目は上位 limit 点まで・重複除外）
-        const set = new Set();
-        for (const part of p.parts) {
-          const bet = r.bets.find((b) => b.label === part);
-          if (!bet) continue;
-          const lim = limits[part] != null ? limits[part] : bet.tickets.length; // 未設定なら全点
-          for (const t of bet.tickets.slice(0, lim)) set.add(t);
-        }
-        if (set.size === 0) continue;
-        const s = stats[p.key];
-        s.races += 1;
-        s.spent += set.size * PER;
-        if (set.has(r.result)) {
-          s.hit += 1;
-          s.ret += Math.round((PER / 100) * odds);
-        }
-      }
-    }
-    return { judged: judged.length, patterns, stats };
-  }, [statFilter]);
+  // AI評価の実績検証（◎○の答え合わせ・期間/場の絞り込みに連動）
+  const aiVerify = useMemo(() => computeVerification(statFilter.recs), [statFilter]);
 
   // ── 期間比較（買い目の被り） ──
   const periodCompare = useMemo(() => {
@@ -3217,10 +3907,12 @@ export default function App() {
     const line = {
       id: Date.now() + "_" + Math.random().toString(36).slice(2, 7),
       label, tickets: pickedTickets.tickets, amountPerPoint: 100,
+      mode: practiceMode ? "practice" : "normal",
+      allocationBudget: pickedTickets.tickets.length * 100,
       perTicket: null, expanded: false,
     };
     setCart((c) => [...c, line]);
-    setBetMsg(`✓ ${label} をリストに追加`);
+    setBetMsg(`✓ ${label} を${cartModeLabel(practiceMode ? "practice" : "normal")}のリストに追加`);
   };
 
   const addToCart = () => {
@@ -3255,17 +3947,23 @@ export default function App() {
     const line = {
       id: Date.now() + "_" + Math.random().toString(36).slice(2, 7),
       label, tickets, amountPerPoint: 100,  // ベース100円（一律）
+      mode: practiceMode ? "practice" : "normal",
+      allocationBudget: tickets.length * 100,
       perTicket: null,  // {ticket: 金額} 個別設定（nullなら一律）
       expanded: false,
     };
     setCart((c) => [...c, line]);
-    setBetMsg(`✓ ${label}（${tickets.length}点）をリストに追加`);
+    setBetMsg(`✓ ${label}（${tickets.length}点）を${cartModeLabel(practiceMode ? "practice" : "normal")}のリストに追加`);
     setBetDraft((p) => ({ ...p, f1: [], f2: [], f3: [] }));
   };
 
   const updateCartAmount = (id, val) => {
     const amt = Number(String(val).replace(/[^\d]/g, ""));
     setCart((c) => c.map((l) => (l.id === id ? { ...l, amountPerPoint: amt } : l)));
+  };
+  const updateAllocationBudget = (id, val) => {
+    const raw = String(val ?? "").replace(/[^\d]/g, "");
+    setCart((c) => c.map((l) => (l.id === id ? { ...l, allocationBudget: raw } : l)));
   };
   const removeFromCart = (id) => setCart((c) => c.filter((l) => l.id !== id));
 
@@ -3278,6 +3976,39 @@ export default function App() {
   }));
   // 個別設定をやめて一律に戻す
   const resetToFlat = (id) => setCart((c) => c.map((l) => (l.id === id ? { ...l, perTicket: null, expanded: false } : l)));
+  // オッズに応じて、どの買い目が来ても払戻がなるべく近くなるように資金配分する
+  const applyFundAllocation = (id) => {
+    const target = activeCart.find((l) => l.id === id);
+    if (!target) return;
+    if (!odds) { setBetMsg("オッズが未入力のため資金配分できません。先にオッズ欄を貼り付けてください"); return; }
+
+    const rawBudget = String(target.allocationBudget ?? lineTotal(target) ?? "").replace(/[^\d]/g, "");
+    const budget = Number(rawBudget);
+    const points = target.tickets.length;
+    const minBudget = points * 100;
+
+    if (!budget || !Number.isFinite(budget)) {
+      setBetMsg("資金配分する合計金額を入力してください");
+      return;
+    }
+    if (budget % 100 !== 0) {
+      setBetMsg("資金配分額は100円単位で入力してください");
+      return;
+    }
+    if (budget < minBudget) {
+      setBetMsg(`${points}点の買い目なので、資金配分額は最低${minBudget.toLocaleString()}円必要です`);
+      return;
+    }
+
+    const perTicket = allocateTicketAmountsByOdds(target.tickets, odds, budget);
+    if (!perTicket) {
+      setBetMsg("一部の買い目のオッズが未取得のため資金配分できません");
+      return;
+    }
+    const total = Object.values(perTicket).reduce((a, b) => a + (Number(b) || 0), 0);
+    setCart((c) => c.map((l) => (l.id === id ? { ...l, allocationBudget: String(budget), perTicket, amountPerPoint: 0, expanded: true } : l)));
+    setBetMsg(`✓ ${budget.toLocaleString()}円を資金配分しました（払戻が近くなるように100円単位で調整）`);
+  };
   // 1点ごとの金額変更
   const setTicketAmount = (id, ticket, val) => {
     const amt = Number(String(val).replace(/[^\d]/g, ""));
@@ -3288,22 +4019,25 @@ export default function App() {
     ? l.tickets.reduce((a, t) => a + (l.perTicket[t] || 0), 0)
     : l.tickets.length * (l.amountPerPoint || 0);
 
-  // カート合計
+  const activeCartMode = practiceMode ? "practice" : "normal";
+  const activeCart = useMemo(() => (Array.isArray(cart) ? cart : []).filter((l) => cartModeOf(l) === activeCartMode), [cart, activeCartMode]);
+
+  // カート合計（通常モードと練習モードで別々に表示・保存）
   const cartTotal = useMemo(() => {
     let pts = 0, amt = 0;
-    for (const l of cart) { pts += l.tickets.length; amt += lineTotal(l); }
+    for (const l of activeCart) { pts += l.tickets.length; amt += lineTotal(l); }
     return { pts, amt };
-  }, [cart]);
+  }, [activeCart]);
 
   // カートをこのレースの購入として確定（結果出目・配当を反映）
   const commitCart = async () => {
-    if (cart.length === 0) { setBetMsg("リストに買い目がありません"); return; }
+    if (activeCart.length === 0) { setBetMsg(`${practiceMode ? "練習モード" : "通常モード"}のリストに買い目がありません`); return; }
     // 結果は上の「結果の出目（3連単）」の選択を使用
     const { first, second, third } = resultDigits;
     const res = `${first}-${second}-${third}`;
     const hasResult = /^[1-6]-[1-6]-[1-6]$/.test(res) && new Set([first, second, third]).size === 3;
-    const odds = Number(payoutOddsInput);
-    const recs = cart.map((l) => {
+    const odds = normalizePayoutReturnInput(payoutOddsInput);
+    const recs = activeCart.map((l) => {
       const amount = lineTotal(l);
       const hit = hasResult && l.tickets.includes(res);
       // 的中点の購入額（個別ならその点の金額、一律なら amountPerPoint）
@@ -3321,15 +4055,41 @@ export default function App() {
         payout,
       };
     });
-    await persistBets((prev) => [...recs, ...prev]);
+    if (practiceMode) {
+      await persistPracticeBets((prev) => [...recs, ...prev]);
+    } else {
+      await persistBets((prev) => [...recs, ...prev]);
+    }
     const totalAmt = recs.reduce((a, r) => a + r.amount, 0);
     const totalPay = recs.reduce((a, r) => a + (r.payout || 0), 0);
-    setBetMsg(`✓ ${recs.length}件・${totalAmt.toLocaleString()}円を記録${hasResult ? `／払戻 ${totalPay.toLocaleString()}円` : ""}`);
-    setCart([]);
+    setBetMsg(`✓ ${practiceMode ? "【練習】" : ""}${recs.length}件・${totalAmt.toLocaleString()}円を記録${hasResult ? `／払戻 ${totalPay.toLocaleString()}円` : ""}`);
+    setCart((prev) => prev.filter((l) => cartModeOf(l) !== activeCartMode));
   };
 
   const deleteBet = async (id) => {
-    await persistBets((prev) => prev.filter((b) => b.id !== id));
+    if (practiceMode) {
+      await persistPracticeBets((prev) => prev.filter((b) => b.id !== id));
+    } else {
+      await persistBets((prev) => prev.filter((b) => b.id !== id));
+    }
+  };
+
+  // 舟券収支履歴だけを全削除する。
+  // 通常のオールクリアとは別扱いで、買い目リスト・配当入力の端末内自動保存には触れない。
+  const clearBetHistoryOnly = async () => {
+    const list = practiceMode ? practiceBetRecords : betRecords;
+    const label = practiceMode ? "仮想購入" : "舟券";
+    if (list.length === 0) {
+      setBetMsg(`削除する${label}履歴がありません`);
+      return;
+    }
+    if (!window.confirm(`${label}の収支履歴をすべて削除します。買い目リストと配当入力は残ります。よろしいですか？`)) return;
+    if (practiceMode) {
+      await persistPracticeBets([]);
+    } else {
+      await persistBets([]);
+    }
+    setBetMsg(`✓ ${label}の収支履歴を削除しました（買い目リスト・配当入力は維持）`);
   };
 
   // 収支の集計
@@ -3352,6 +4112,11 @@ export default function App() {
     };
   }, [statFilter]);
 
+
+
+  // 現在のモードの収支履歴（通常=実購入 / 練習=仮想購入）
+  // 集計と履歴表示がズレないよう、期間・場の絞り込み後の配列を使う。
+  const activeBetRecords = statFilter.bets;
   const fmt = (n, d = 2) => n.toFixed(d);
   const sign = (n) => (n > 0 ? `+${n}` : `${n}`);
   const col = (n) => (n > 0 ? "#5dd39e" : n < 0 ? "#ff8a80" : "#9db5cc");
@@ -3408,10 +4173,60 @@ export default function App() {
             場別コース率 × タイム補正
           </h1>
           <p style={{ fontSize: 12, color: "#9db5cc", margin: "6px 0 0", lineHeight: 1.6 }}>
-            場ごとのコース別1着率（平均）を基準に、展示タイム＋一周＋まわり足の
-            差（平均−合計）と風の影響を加えて予想1着率を出します。展示系の生数値は画面に出さず、内部計算だけに使います。
+            場ごとの基本場平均1着率を基準に、展示タイム＋1周（桐生は半周ラップ）＋まわり足の
+            差（平均−合計）を内部計算に使います。風はAI評価内の風項目で1回だけ反映します。
             進入・風向きが変わる場合は各艇のコースや風プルダウンを変更してください。
           </p>
+
+          {autoSaveMsg && (
+            <div style={{
+              marginTop: 10, padding: "8px 10px", borderRadius: 8,
+              background: "#112c42", color: autoSaveMsg.startsWith("✓") ? "#7fe3a8" : "#ffcc80",
+              border: "1px solid #244b66", fontSize: 11, lineHeight: 1.5,
+            }}>
+              {autoSaveMsg}
+            </div>
+          )}
+          {CLOUD_SAVE_ENABLED && (
+            <div style={{
+              marginTop: 10, padding: 10, borderRadius: 10,
+              background: "#101f33", border: "1px solid #244b66",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: "#d8e9ff" }}>
+                    Googleログイン・クラウド保存
+                  </div>
+                  <div style={{ fontSize: 11, color: "#9db5cc", marginTop: 3, lineHeight: 1.5 }}>
+                    {cloudAuth.user
+                      ? `${cloudAuth.user.email || "ログイン中"}：買い目・配当・舟券収支・仮想購入収支・予想記録を保存`
+                      : "ログインすると、端末変更後も買い目・配当・舟券収支・仮想購入収支・予想記録を復元できます"}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {cloudAuth.user ? (
+                    <>
+                      <button onClick={saveCloudNow} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #2f6b9a", background: "#183a56", color: "#dff1ff", fontWeight: 800 }}>
+                        今すぐ保存
+                      </button>
+                      <button onClick={signOutCloud} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #4d5f78", background: "#17283d", color: "#d8e2ee", fontWeight: 800 }}>
+                        ログアウト
+                      </button>
+                    </>
+                  ) : (
+                    <button onClick={signInWithGoogle} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #2f6b9a", background: "#1d5f8f", color: "#fff", fontWeight: 900 }}>
+                      Googleでログイン
+                    </button>
+                  )}
+                </div>
+              </div>
+              {cloudMsg && (
+                <div style={{ marginTop: 8, fontSize: 11, color: cloudMsg.startsWith("✓") ? "#7fe3a8" : "#ffcc80", lineHeight: 1.5 }}>
+                  {cloudMsg}
+                </div>
+              )}
+            </div>
+          )}
         </header>
 
 
@@ -3605,7 +4420,7 @@ export default function App() {
               marginTop: 12, marginBottom: 6,
               paddingLeft: 8, borderLeft: "3px solid #3d7ab8",
             }}>
-              各コースの平均1着率
+              基本場平均1着率
               {venue && (() => {
                 const { season, seasonal } = getVenueBase(venue, raceDate);
                 return seasonal ? (
@@ -4382,14 +5197,14 @@ export default function App() {
 
             {/* 予想1着率ランキング */}
             <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8", marginBottom: 8 }}>
-              場平均で見る1着率
+              進入反映後の基本1着率
             </div>
             <div style={{ display: "grid", gap: 6, marginBottom: 28 }}>
               {[...result.rows]
-                .sort((a, b) => (b.baseRate + b.windAdj) - (a.baseRate + a.windAdj))
+                .sort((a, b) => b.baseRate - a.baseRate)
                 .map((r, i) => {
-                const venue1 = r.baseRate + r.windAdj;
-                const all = result.rows.map((x) => x.baseRate + x.windAdj);
+                const venue1 = r.baseRate;
+                const all = result.rows.map((x) => x.baseRate);
                 const max = Math.max(...all, 1);
                 const w = Math.max((venue1 / max) * 100, 0);
                 return (
@@ -4407,9 +5222,6 @@ export default function App() {
                       </div>
                       <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 2 }}>
                         {r.course}コース進入
-                        {wind !== "無風" && (
-                          <> ／ 風反映済</>
-                        )}
                         {tilts[r.boat] !== "" && parseFloat(tilts[r.boat]) >= 1.0 && (
                           <span style={{ color: "#f9c513", fontWeight: 800 }}> ⚡伸び警戒</span>
                         )}
@@ -4546,7 +5358,7 @@ export default function App() {
                         }}>{r.boat}</span>
                         <span style={{ fontSize: 11, color: "#7da3c8" }}>{r.course}C進入</span>
                         <span style={{ fontSize: 11, color: "#7da3c8", marginLeft: "auto" }}>
-                          良 {r.goods}/4 ｜ 場平均参考 {fmt(r.final1, 1)}%
+                          良 {r.goods}/4 ｜ 枠基準参考 {fmt(r.final1, 1)}%
                         </span>
                       </div>
 
@@ -4879,6 +5691,41 @@ export default function App() {
                         </div>
                       </div>
                     )}
+                    {/* 期待値ランキング（推定確率×オッズ）: オッズ入力/取得時のみ表示 */}
+                    {aiEval.evList && aiEval.evList.length > 0 && (
+                      <div style={{ background: "#16273c", borderRadius: 10, padding: "10px 14px", marginBottom: 12 }}>
+                        <div style={{ fontSize: 12, fontWeight: 800, color: "#fff", marginBottom: 2 }}>
+                          期待値ランキング（推定確率 × オッズ）
+                        </div>
+                        <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 8, lineHeight: 1.6 }}>
+                          AIの推定的中確率とオッズを掛けた「割安度」です。<b style={{ color: "#7fe3a8" }}>1.0以上＝市場の評価より妙味あり</b>。
+                          当たりやすさではなく「買う価値」の順です。
+                        </div>
+                        <div style={{ display: "grid", gap: 4 }}>
+                          {aiEval.evList.slice(0, 8).map((e) => {
+                            const good = e.ev >= 1.0;
+                            return (
+                              <div key={e.t} style={{
+                                display: "flex", alignItems: "center", gap: 8, fontSize: 11,
+                                background: "#0e1b2c", borderRadius: 7, padding: "6px 9px", flexWrap: "wrap",
+                              }}>
+                                <span style={{ fontWeight: 800, color: "#cfe0f0", minWidth: 52 }}>{e.t}</span>
+                                <span style={{ color: "#7da3c8", fontSize: 10 }}>{e.from}</span>
+                                <span style={{ color: "#9db5cc" }}>推定 {(e.p * 100).toFixed(1)}%</span>
+                                <span style={{ color: "#f5c518" }}>{e.o.toFixed(1)}倍</span>
+                                <span style={{
+                                  marginLeft: "auto", fontWeight: 800,
+                                  color: good ? "#5dd39e" : "#8aa0b8",
+                                }}>EV {e.ev.toFixed(2)}{good ? " ◎" : ""}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div style={{ fontSize: 9, color: "#5e7a92", marginTop: 6, lineHeight: 1.5 }}>
+                          ※ 推定確率はコース別場平均を土台に当日評価で補正した近似値（Harville式）。本命側をやや高めに見積もる癖があります。参考指標としてご利用ください。
+                        </div>
+                      </div>
+                    )}
                     <div style={{ display: "grid", gap: 10 }}>
                       {aiEval.bets.map((bet) => {
                         const color = bet.label === "本線" ? "#3d7ab8"
@@ -5156,6 +6003,31 @@ export default function App() {
             予想の保存・結果入力・的中率
           </div>
 
+          {/* モード切替（通常／練習） */}
+          <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+            {[[false, "通常モード"], [true, "練習モード"]].map(([m, lbl]) => {
+              const on = practiceMode === m;
+              return (
+                <button
+                  key={String(m)}
+                  onClick={() => setPracticeMode(m)}
+                  style={{
+                    flex: 1, padding: "9px 12px", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 800,
+                    background: on ? (m ? "#7a5a1f" : "#1f5a7a") : "#0e1b2c",
+                    color: on ? "#fff" : "#9db5cc",
+                    border: on ? `1px solid ${m ? "#d8a85a" : "#5a9ed8"}` : "1px solid #2c4762",
+                  }}
+                >{lbl}</button>
+              );
+            })}
+          </div>
+          {practiceMode && (
+            <div style={{ fontSize: 11, color: "#e8c87f", background: "#2a2310", border: "1px solid #5a4a1f", borderRadius: 8, padding: "8px 10px", marginBottom: 10, lineHeight: 1.6 }}>
+              これは練習用の仮想購入記録です。実際の購入結果ではありません。<br />
+              <span style={{ color: "#bda86a" }}>※ 練習モードの記録は直近{MAX_PRACTICE_BET_RECORDS}件まで保存されます（古いものから自動削除）。</span>
+            </div>
+          )}
+
           {/* 対象レース表示 */}
           <div style={{ fontSize: 11, color: "#7da3c8", marginBottom: 12 }}>
             対象：{raceDate}／{venue || "場未選択"}／{raceNo}R
@@ -5207,7 +6079,8 @@ export default function App() {
             </button>
             <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 8, lineHeight: 1.6 }}>
               <b style={{ color: "#5dd39e" }}>予想の保存ボタンを押し忘れても大丈夫です。</b>結果を入れて保存すれば、その予想ごと自動で記録されます（的中率・収支に反映）。<br />
-              ここで入れた結果の出目と配当が、下の舟券収支の払戻金・回収率にも自動で反映されます。
+              ここで入れた結果の出目と配当が、下の{practiceMode ? "仮想購入収支" : "舟券収支"}の払戻金・回収率にも自動で反映されます。<br />
+              {practiceMode ? "練習モード中は実際の舟券収支には反映しません。" : "通常モード中は仮想購入収支には反映しません。"}<br />
               買い目リストの「このレースの購入を記録する」を押すと、この結果・配当を使って計算されます。
             </div>
           </div>
@@ -5220,11 +6093,11 @@ export default function App() {
           )}
 
           {/* 集計の絞り込み（期間・場） */}
-          {(records.length > 0 || betRecords.length > 0) && (
+          {(records.length > 0 || betRecords.length > 0 || practiceBetRecords.length > 0) && (
             <div style={{ background: "#16273c", borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
               <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 8 }}>集計の絞り込み（的中率・収支に反映）</div>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
-                {[["all", "全期間"], ["month", "今月"], ["last30", "直近30レース"]].map(([k, lbl]) => {
+                {[["today", "当日"], ["week", "1週間"], ["all", "全期間"]].map(([k, lbl]) => {
                   const on = statPeriod === k;
                   return (
                     <button
@@ -5305,13 +6178,45 @@ export default function App() {
             </div>
           )}
 
-          {/* AI予想の収支（もし機械的に買っていたら・1点100円） */}
-          {aiLedger.judged > 0 && (
-            <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
-              <div style={{ fontSize: 12, fontWeight: 800, color: "#fff", marginBottom: 2 }}>
-                AI予想の収支（全部1点100円で買ったら・{aiLedger.judged}レース）
+          {/* AI評価の実績（保存記録からの答え合わせ） */}
+          {aiVerify.judged > 0 && (
+            <details style={{ background: "#16273c", borderRadius: 10, padding: "10px 14px", marginBottom: 12 }}>
+              <summary style={{ fontSize: 12, fontWeight: 800, color: "#fff", cursor: "pointer" }}>
+                AI評価の実績（◎○の答え合わせ・{aiVerify.judged}レース）
+              </summary>
+              <div style={{ fontSize: 10, color: "#7da3c8", margin: "8px 0 10px" }}>
+                結果を保存したレースで、AIの印が実際にどれだけ来たかの集計です（期間・場の絞り込みに連動）。
               </div>
-              <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 10 }}>
+              <div style={{ display: "grid", gap: 6 }}>
+                {["◎", "○"].map((mk) => {
+                  const s = aiVerify.marks[mk];
+                  if (!s || s.n === 0) return null;
+                  return (
+                    <div key={mk} style={{
+                      display: "grid", gridTemplateColumns: "0.5fr 1fr 1fr 1fr", gap: 6, alignItems: "center",
+                      background: "#0e1b2c", borderRadius: 8, padding: "8px 10px",
+                    }}>
+                      <span style={{ fontSize: 15, fontWeight: 800, color: mk === "◎" ? "#f5c518" : "#7ac8e8" }}>{mk}</span>
+                      <span style={{ fontSize: 11, color: "#cfe0f0" }}>1着率 <b>{(s.win / s.n * 100).toFixed(0)}%</b></span>
+                      <span style={{ fontSize: 11, color: "#9db5cc" }}>2連対 {(s.ren2 / s.n * 100).toFixed(0)}%</span>
+                      <span style={{ fontSize: 11, color: "#9db5cc" }}>3連対 {(s.ren3 / s.n * 100).toFixed(0)}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 10, color: "#5e7a92", marginTop: 8, lineHeight: 1.6 }}>
+                ※ 全国平均の1コース1着率は約55%。◎の1着率がそれを上回っていれば、評価が機能しているサインです。
+              </div>
+            </details>
+          )}
+
+          {/* AI予想の仮想収支（折りたたみ・1点100円で機械的に買った場合の検証） */}
+          {aiLedger.judged > 0 && (
+            <details style={{ background: "#16273c", borderRadius: 10, padding: "10px 14px", marginBottom: 12 }}>
+              <summary style={{ fontSize: 12, fontWeight: 800, color: "#fff", cursor: "pointer" }}>
+                AI予想の仮想収支（{aiLedger.judged}レース）
+              </summary>
+              <div style={{ fontSize: 10, color: "#7da3c8", margin: "8px 0 10px" }}>
                 結果・配当を保存したレースを対象に、AIの買い目を機械的に買った場合の回収率です（自分の収支とは別）。
               </div>
               <div style={{ display: "grid", gap: 6 }}>
@@ -5340,7 +6245,10 @@ export default function App() {
               <div style={{ fontSize: 10, color: "#5e7a92", marginTop: 8, lineHeight: 1.6 }}>
                 ※ 各パターンの購入額は「点数×100円」。複数パターン合算は買い目の重複を除いて計算しています。
               </div>
-            </div>
+              <div style={{ fontSize: 10, color: "#8a98a8", marginTop: 6, lineHeight: 1.6, borderTop: "1px solid #243b56", paddingTop: 6 }}>
+                ※ 保存した予想記録をもとにした検証用の仮想収支です。実際の購入結果や利益を保証するものではありません。
+              </div>
+            </details>
           )}
 
           {/* 保存レコード一覧 */}
@@ -5408,7 +6316,7 @@ export default function App() {
             </details>
           )}
           <div style={{ fontSize: 10, color: "#5e7a92", lineHeight: 1.6 }}>
-            ※ 保存データはこの端末内にのみ記録されます（ボートレース日和のデータは保存していません）。
+            ※ Googleログイン中はクラウド保存、未ログイン時は端末内保存です。オッズ一覧や外部サイト由来データはクラウド保存しません。
           </div>
 
           {/* データのバックアップ */}
@@ -5481,9 +6389,14 @@ export default function App() {
 
         {/* 舟券の収支記録 */}
         <div style={{ marginTop: 28, borderTop: "1px solid #1d3149", paddingTop: 18 }}>
-          <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8", marginBottom: 10 }}>
-            舟券の収支記録（3連単）
+          <div style={{ fontSize: 11, letterSpacing: "0.2em", color: practiceMode ? "#e8c87f" : "#7da3c8", marginBottom: 10 }}>
+            {practiceMode ? "仮想購入収支（練習・3連単）" : "舟券の収支記録（3連単）"}
           </div>
+          {practiceMode && (
+            <div style={{ fontSize: 11, color: "#e8c87f", background: "#2a2310", border: "1px solid #5a4a1f", borderRadius: 8, padding: "8px 10px", marginBottom: 10, lineHeight: 1.6 }}>
+              これは練習用の仮想購入記録です。実際の購入結果ではありません。
+            </div>
+          )}
 
           {/* 集計サマリー */}
           <div style={{
@@ -5511,6 +6424,19 @@ export default function App() {
                 </div>
               );
             })}
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+            <button
+              onClick={clearBetHistoryOnly}
+              disabled={activeBetRecords.length === 0}
+              style={{
+                padding: "8px 12px", borderRadius: 8, cursor: activeBetRecords.length ? "pointer" : "not-allowed",
+                background: activeBetRecords.length ? "#3a1f1f" : "#16273c",
+                color: activeBetRecords.length ? "#ffb3a8" : "#5e7a92",
+                border: "1px solid #5a2d2d", fontSize: 12, fontWeight: 700,
+              }}
+            >{practiceMode ? "仮想購入履歴を全削除" : "舟券収支履歴を全削除"}</button>
           </div>
 
           {/* 舟券を追加 */}
@@ -5617,17 +6543,54 @@ export default function App() {
           </div>
 
           {/* 買い目リスト（カート） */}
-          {cart.length > 0 && (
+          {activeCart.length > 0 && (
             <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
               <div style={{ fontSize: 12, color: "#9db5cc", marginBottom: 8 }}>
-                買い目リスト（{raceDate.slice(5)}／{venue || "場未選択"}／{raceNo}R）
+                {practiceMode ? "練習モードの買い目リスト" : "通常モードの買い目リスト"}（{raceDate.slice(5)}／{venue || "場未選択"}／{raceNo}R）
               </div>
               <div style={{ display: "grid", gap: 8 }}>
-                {cart.map((l) => (
+                {activeCart.map((l) => {
+                  const compLine = compoundOddsForTickets(l.tickets, odds);
+                  const lineBudget = lineTotal(l);
+                  return (
                   <div key={l.id} style={{ background: "#0e1b2c", borderRadius: 8, padding: "8px 10px" }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
                       <span style={{ fontSize: 13, fontWeight: 800, color: "#cfe0f0" }}>{l.label}</span>
                       <span style={{ fontSize: 11, color: "#7da3c8" }}>{l.tickets.length}点</span>
+                      <span style={{ fontSize: 11, color: "#9db5cc" }}>配分額</span>
+                      <input
+                        value={l.allocationBudget ?? lineTotal(l) ?? l.tickets.length * 100}
+                        onChange={(e) => updateAllocationBudget(l.id, e.target.value)}
+                        inputMode="numeric"
+                        placeholder={`${l.tickets.length * 100}`}
+                        style={{
+                          width: 88, padding: "5px 8px", fontSize: 13,
+                          background: "#16273c", color: "#fff", border: "1px solid #2c4762", borderRadius: 6,
+                        }}
+                      />
+                      <span style={{ fontSize: 11, color: "#9db5cc" }}>円</span>
+                      <button
+                        onClick={() => applyFundAllocation(l.id)}
+                        disabled={!compLine || compLine.covered !== compLine.total}
+                        style={{
+                          fontSize: 11, fontWeight: 800, borderRadius: 6, padding: "5px 10px",
+                          cursor: compLine && compLine.covered === compLine.total ? "pointer" : "not-allowed",
+                          background: compLine && compLine.covered === compLine.total ? "#7a5a1f" : "#16273c",
+                          color: compLine && compLine.covered === compLine.total ? "#fff" : "#5e7a92",
+                          border: "1px solid #5a4a1f",
+                        }}
+                      >資金配分</button>
+                      {compLine?.odds ? (
+                        <span style={{
+                          fontSize: 11, fontWeight: 800, color: "#f5c518",
+                          background: "#231f0a", border: "1px solid #5a4a1f", borderRadius: 999, padding: "3px 8px",
+                        }}>
+                          合成オッズ 約{compLine.odds.toFixed(1)}倍
+                          {compLine.covered !== compLine.total ? `（${compLine.covered}/${compLine.total}点）` : ""}
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: 11, color: "#5e7a92" }}>合成オッズ —</span>
+                      )}
                       <button
                         onClick={() => removeFromCart(l.id)}
                         style={{ marginLeft: "auto", background: "none", border: "none", color: "#5e7a92", cursor: "pointer", fontSize: 12 }}
@@ -5675,9 +6638,15 @@ export default function App() {
                           </span>
                         </div>
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: 6 }}>
-                          {sortTicketsForDisplay(l.tickets).map((t) => (
-                            <div key={t} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          {sortTicketsForDisplay(l.tickets).map((t) => {
+                            const o = odds && odds[t] > 0 ? odds[t] : null;
+                            const amt = l.perTicket?.[t] ?? 0;
+                            const back = estimateReturnFromOdds(amt, o);
+                            const profit = back != null ? back - lineBudget : null;
+                            return (
+                            <div key={t} style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
                               <span style={{ fontSize: 12, color: "#cfe0f0", fontWeight: 700, minWidth: 46 }}>{t}</span>
+                              <span style={{ fontSize: 11, color: o ? "#f5c518" : "#5e7a92", minWidth: 48 }}>{o ? `${o.toFixed(1)}倍` : "—"}</span>
                               <input
                                 value={l.perTicket?.[t] ?? 0}
                                 onChange={(e) => setTicketAmount(l.id, t, e.target.value)}
@@ -5688,8 +6657,15 @@ export default function App() {
                                 }}
                               />
                               <span style={{ fontSize: 11, color: "#9db5cc" }}>円</span>
+                              {back != null && (
+                                <span style={{ fontSize: 10, color: profitColor(profit) }}>
+                                  的中時 {formatSignedYen(profit)}
+                                  <span style={{ color: "#7da3c8" }}>（払戻{back.toLocaleString()}円）</span>
+                                </span>
+                              )}
                             </div>
-                          ))}
+                          );
+                          })}
                         </div>
                         <div style={{ fontSize: 13, fontWeight: 700, color: "#e8eef5", marginTop: 6, textAlign: "right" }}>
                           小計 {lineTotal(l).toLocaleString()}円
@@ -5698,12 +6674,31 @@ export default function App() {
                     )}
 
                     {!l.expanded && (
-                      <div style={{ fontSize: 10, color: "#5e7a92", marginTop: 4, wordBreak: "break-all" }}>
-                        {l.tickets.join("  ")}
+                      <div style={{ marginTop: 6, display: "grid", gap: 3 }}>
+                        {sortTicketsForDisplay(l.tickets).map((t) => {
+                          const o = odds && odds[t] > 0 ? odds[t] : null;
+                          const amt = l.perTicket ? (l.perTicket[t] || 0) : (l.amountPerPoint || 0);
+                          const back = estimateReturnFromOdds(amt, o);
+                          const profit = back != null ? back - lineBudget : null;
+                          return (
+                            <div key={t} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, flexWrap: "wrap" }}>
+                              <span style={{ color: "#cfe0f0", fontWeight: 700, minWidth: 52 }}>{t}</span>
+                              <span style={{ color: o ? "#f5c518" : "#5e7a92", minWidth: 56 }}>{o ? `${o.toFixed(1)}倍` : "—倍"}</span>
+                              <span style={{ color: "#9db5cc" }}>購入額 {amt.toLocaleString()}円</span>
+                              {back != null && (
+                                <span style={{ color: profitColor(profit), fontWeight: 800 }}>
+                                  的中時 {formatSignedYen(profit)}
+                                  <span style={{ color: "#7da3c8", fontWeight: 400 }}>（払戻{back.toLocaleString()}円）</span>
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
               <div style={{ fontSize: 13, fontWeight: 800, color: "#fff", marginTop: 10 }}>
                 合計 {cartTotal.pts}点 ／ {cartTotal.amt.toLocaleString()}円
@@ -5724,13 +6719,13 @@ export default function App() {
           )}
 
           {/* 舟券履歴 */}
-          {betRecords.length > 0 && (
+          {activeBetRecords.length > 0 && (
             <details>
               <summary style={{ fontSize: 12, color: "#9db5cc", cursor: "pointer" }}>
-                舟券の履歴（{betRecords.length}件）
+                {practiceMode ? "仮想購入の履歴" : "舟券の履歴"}（{activeBetRecords.length}件）
               </summary>
               <div style={{ display: "grid", gap: 6, marginTop: 8 }}>
-                {betRecords.map((b) => (
+                {activeBetRecords.map((b) => (
                   <div key={b.id} style={{
                     display: "flex", alignItems: "center", gap: 8,
                     background: "#0e1b2c", borderRadius: 8, padding: "8px 10px", fontSize: 12, flexWrap: "wrap",

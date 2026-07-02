@@ -6,10 +6,10 @@ const CACHE_MS = STATIC_CACHE_MS;
 
 // Vercelの同一実行環境内で共有するキャッシュ。
 // 同じ場・日付・RはTTL内ならBOATCASTへ再アクセスせず、取得中は他ユーザーへ古いキャッシュを返す。
-const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V108__ || new Map();
-globalThis.__HUNAKEN_YOSO_CACHE_V108__ = cacheStore;
-const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V108__ || new Map();
-globalThis.__HUNAKEN_YOSO_INFLIGHT_V108__ = inFlightStore;
+const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V109__ || new Map();
+globalThis.__HUNAKEN_YOSO_CACHE_V109__ = cacheStore;
+const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V109__ || new Map();
+globalThis.__HUNAKEN_YOSO_INFLIGHT_V109__ = inFlightStore;
 
 function cacheDecorate(entry, ttlMs, flags = {}) {
   const now = Date.now();
@@ -1830,7 +1830,7 @@ async function fetchSchedulePayload(venue, ymd) {
     return {
       ok: true,
       action: "schedule",
-      appVersion: "v108",
+      appVersion: "v109",
       venue,
       date: ymd,
       url,
@@ -1935,7 +1935,7 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
       const bc = await fetchBoatcastPayload(venue, raceNo, ymd);
       return {
         ok: true,
-        appVersion: "v108",
+        appVersion: "v109",
         venue,
         race: raceNo,
         date: ymd,
@@ -2067,7 +2067,7 @@ export default async function handler(req, res) {
       res.status(200).json({
         ok: true,
         action: "schedules",
-        appVersion: "v108",
+        appVersion: "v109",
         date: ymd,
         statusesByVenue,
         fetchedAt: new Date().toISOString(),
@@ -2096,7 +2096,7 @@ export default async function handler(req, res) {
         return {
           ok: true,
           action: "odds",
-          appVersion: "v108",
+          appVersion: "v109",
           venue,
           race: raceNo,
           date: ymd,
