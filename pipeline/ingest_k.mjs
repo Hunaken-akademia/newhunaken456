@@ -1,5 +1,5 @@
 // ============================================================
-// K票（競走成績）取り込みスクリプト  —  GitHub Actions / ローカル両対応
+// K票（競走成績）取り込みスクリプト — GitHub Actions / ローカル両対応
 // 使い方:
 //   node ingest_k.mjs 2026-07-02            # 指定日を取り込み
 //   node ingest_k.mjs 2026-07-02 --dry      # DB投入せず中身だけ表示（最初はこれで確認）
@@ -8,10 +8,8 @@
 // 必要な環境変数（GitHub Actions の Secrets / ローカルは .env や export）:
 //   SUPABASE_URL, SUPABASE_SERVICE_KEY   ← service_role キー（RLSを越えて書き込むため）
 //
-// 依存: npm i iconv-lite node-stream-zip lzh-decompress のうち解凍系は環境で調整。
-//   公式Kファイルは伝統的に LZH(.lzh)。Node に定番解凍が無いため、
-//   このスクリプトは「lha コマンド」を使う（Actions では apt で入る）。
-//   → ワークフロー側で: sudo apt-get install -y lhasa
+// 依存: npm i iconv-lite
+// 公式Kファイルは伝統的に LZH(.lzh)。このスクリプトは「lha コマンド」を使う。
 // ============================================================
 import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync } from "node:fs";
@@ -25,11 +23,10 @@ if (!argDate || !/^\d{4}-\d{2}-\d{2}$/.test(argDate)) {
   console.error("日付を YYYY-MM-DD で渡してください。例: node ingest_k.mjs 2026-07-02");
   process.exit(1);
 }
+
 const [Y, M, D] = argDate.split("-");
 const yy = Y.slice(2);
 
-// 公式Kファイルの伝統的なURL・ファイル名（要検証。変わっていたらここだけ直す）
-//   例) https://www1.mbrace.or.jp/od2/K/YYYYMM/kYYMMDD.lzh
 const yyyymm = `${Y}${M}`;
 const fname = `k${yy}${M}${D}.lzh`;
 const URL = `https://www1.mbrace.or.jp/od2/K/${yyyymm}/${fname}`;
@@ -47,17 +44,12 @@ async function download(url, dest) {
 }
 
 function unpack(lzhPath) {
-  // lha (lhasa) で解凍。展開先 TMP に .txt / .TXT が出る想定。
   execSync(`lha xfw=${TMP} ${lzhPath}`, { stdio: "inherit" });
   const txt = readdirSync(TMP).find((f) => /\.txt$/i.test(f));
   if (!txt) throw new Error("解凍後のテキストが見つかりません。lha の出力を確認してください。");
   return `${TMP}/${txt}`;
 }
 
-// ── K票パーサ ──
-// K票は固定長・Shift-JIS。場ごとのヘッダ→各レースの着順行、という構造。
-// 書式は年代で微妙に違うため、ここは「行を分類して緩く拾う」方式にする。
-// 実データを --raw で見て、必要なら列位置を微調整する前提のスケルトン。
 function parseK(text) {
   const lines = text.split(/\r?\n/);
   const rows = [];
@@ -71,52 +63,91 @@ function parseK(text) {
 
   for (const raw of lines) {
     const line = raw.replace(/\u3000/g, " ");
-    // 場の判定: ヘッダ行に場名が出る
+
     for (const [name, no] of Object.entries(placeMap)) {
       if (line.includes(name)) { placeNo = no; break; }
     }
-    // レース番号: 「 1R」「12R」など
+
     const rm = line.match(/(\d{1,2})\s*R/);
     if (rm) raceNo = Number(rm[1]);
 
-    // 着順データ行: 先頭に着順(1-6)＋艇番＋登録番号…が並ぶ固定長を想定
-    //   例: "  01  1 4697 ... .10  逃げ"
-    //   ここは実データに合わせて調整するポイント。まずは緩い正規表現で拾う。
     const m = line.match(/^\s*(\d{2})\s+(\d)\s+(\d{4})\s+/);
     if (m && placeNo && raceNo) {
       const rank = Number(m[1]);
       const boat = Number(m[2]);
       const regno = Number(m[3]);
-      // 決まり手を先に切り離す（STより後ろにある）
+
       const km = line.match(/(まくり差し|まくり|逃げ|差し|抜き|恵まれ)/);
       const head = km ? line.slice(0, line.indexOf(km[0])) : line;
-      // ST欄は行の「後方」にある .xx / F.xx（展示タイム 6.xx を誤取得しないよう、
-      // 小数点の直前が数字でない = 単独の .xx を、後ろから探す）
+
       let st = null, isF = false;
       const stMatches = [...head.matchAll(/(^|[^\d])([FLＦ]?)\.(\d{2})(?!\d)/g)];
       if (stMatches.length) {
-        const last = stMatches[stMatches.length - 1]; // 後方のものがST
+        const last = stMatches[stMatches.length - 1];
         st = Number(`0.${last[3]}`);
         if (/[FＦ]/.test(last[2])) { isF = true; st = -st; }
-        // L（出遅れ）は st を null 扱い（値が信用できない）
         if (/L/i.test(last[2])) { st = null; }
       }
+
       rows.push({
-        race_date: argDate, place_no: placeNo, race_no: raceNo,
-        boat, regno, rank: rank >= 1 && rank <= 6 ? rank : null,
-        st, is_f: isF, kimarite: km ? km[1] : null,
-        course: null, motor_no: null, racer_name: null,
+        race_date: argDate,
+        place_no: placeNo,
+        race_no: raceNo,
+        boat,
+        regno,
+        rank: rank >= 1 && rank <= 6 ? rank : null,
+        st,
+        is_f: isF,
+        kimarite: km ? km[1] : null,
+        course: null,
+        motor_no: null,
+        racer_name: null,
       });
     }
   }
   return rows;
 }
 
+function mergeRow(oldRow, newRow) {
+  // 同一キーが同じバッチ内に重複すると Supabase の upsert が 21000 で落ちるため、投入前に1件へ統合する。
+  // 後から拾えた値があれば補完。rank/regnoなど基本値は既存優先。
+  return {
+    ...oldRow,
+    regno: oldRow.regno ?? newRow.regno,
+    rank: oldRow.rank ?? newRow.rank,
+    st: oldRow.st ?? newRow.st,
+    is_f: oldRow.is_f || newRow.is_f,
+    kimarite: oldRow.kimarite ?? newRow.kimarite,
+    course: oldRow.course ?? newRow.course,
+    motor_no: oldRow.motor_no ?? newRow.motor_no,
+    racer_name: oldRow.racer_name ?? newRow.racer_name,
+  };
+}
+
+function dedupeRows(rows) {
+  const map = new Map();
+  let duplicateCount = 0;
+  for (const row of rows) {
+    const key = `${row.race_date}|${row.place_no}|${row.race_no}|${row.boat}`;
+    if (map.has(key)) {
+      duplicateCount++;
+      map.set(key, mergeRow(map.get(key), row));
+    } else {
+      map.set(key, row);
+    }
+  }
+  const result = [...map.values()];
+  if (duplicateCount) {
+    console.log(`重複行を統合: ${duplicateCount}件 → 投入対象 ${result.length}件`);
+  }
+  return result;
+}
+
 async function upsert(rows) {
   const SUPA = process.env.SUPABASE_URL;
   const KEY = process.env.SUPABASE_SERVICE_KEY;
   if (!SUPA || !KEY) throw new Error("SUPABASE_URL / SUPABASE_SERVICE_KEY が未設定です");
-  // 500件ずつ upsert（重複は unique 制約で弾く＝再実行しても安全）
+
   const chunk = 500;
   for (let i = 0; i < rows.length; i += chunk) {
     const batch = rows.slice(i, i + chunk);
@@ -148,9 +179,12 @@ async function upsert(rows) {
       return;
     }
 
-    const rows = parseK(text);
-    console.log(`パース結果: ${rows.length} 行`);
-    console.log("サンプル(先頭5件):", JSON.stringify(rows.slice(0, 5), null, 2));
+    const parsedRows = parseK(text);
+    console.log(`パース結果: ${parsedRows.length} 行`);
+    console.log("サンプル(先頭5件):", JSON.stringify(parsedRows.slice(0, 5), null, 2));
+
+    const rows = dedupeRows(parsedRows);
+    console.log(`投入対象: ${rows.length} 行`);
 
     if (DRY) { console.log("--dry のためDB投入はスキップ"); return; }
     await upsert(rows);
