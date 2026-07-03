@@ -1,0 +1,40 @@
+# .github/workflows/backfill-k.yml
+# 直近7日分のK票をまとめて取り込む手動実行ワークフロー
+name: backfill-k-recent7
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry:
+        description: "DB投入せず確認だけにする？ true / false"
+        required: false
+        default: "false"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: install lha
+        run: sudo apt-get update && sudo apt-get install -y lhasa
+
+      - name: install deps
+        working-directory: pipeline
+        run: npm install iconv-lite
+
+      - name: backfill recent 7 days
+        working-directory: pipeline
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          if [ "${{ github.event.inputs.dry }}" = "true" ]; then
+            node backfill_k.mjs --dry
+          else
+            node backfill_k.mjs
+          fi
