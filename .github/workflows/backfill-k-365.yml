@@ -1,0 +1,43 @@
+name: backfill-k-recent365
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry:
+        description: 'trueならDB保存せず動作確認のみ / falseならSupabaseへ保存'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Backfill recent 365 days
+        working-directory: pipeline
+        run: |
+          if [ "${{ github.event.inputs.dry }}" = "true" ]; then
+            node backfill_k.mjs --dry
+          else
+            node backfill_k.mjs
+          fi
