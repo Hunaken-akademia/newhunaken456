@@ -45,4 +45,4 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: node ingest_k.mjs ${{ steps.d.outputs.date }} --raw
+        run: node ingest_k.mjs ${{ steps.d.outputs.date }}
