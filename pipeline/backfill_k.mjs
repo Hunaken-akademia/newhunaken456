@@ -1,90 +1,99 @@
-// ============================================================
-// 直近180日分 K票バックフィルスクリプト
-// GitHub Actions / ローカル両対応
-//
-// 使い方:
-//   node backfill_k.mjs            # JST基準で昨日から180日分を順番に取り込み
-//   node backfill_k.mjs --dry      # DB投入せず確認だけ
-//
-// 前提:
-//   同じ pipeline フォルダ内に ingest_k.mjs があること
-//   SUPABASE_URL / SUPABASE_SERVICE_KEY は GitHub Secrets に登録済み
-// ============================================================
-import { spawnSync } from "node:child_process";
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const DRY = process.argv.includes("--dry");
-const DAYS = 180;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-function formatDateJST(date) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Tokyo",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
+const DAYS = 365;
+const args = process.argv.slice(2);
+const dry = args.includes('--dry');
+
+function jstDateString(date) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Tokyo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
   }).formatToParts(date);
 
-  const y = parts.find((p) => p.type === "year")?.value;
-  const m = parts.find((p) => p.type === "month")?.value;
-  const d = parts.find((p) => p.type === "day")?.value;
+  const y = parts.find((p) => p.type === 'year').value;
+  const m = parts.find((p) => p.type === 'month').value;
+  const d = parts.find((p) => p.type === 'day').value;
   return `${y}-${m}-${d}`;
 }
 
-function addDays(date, diff) {
-  const next = new Date(date);
-  next.setUTCDate(next.getUTCDate() + diff);
-  return next;
+function addDays(date, days) {
+  const copy = new Date(date.getTime());
+  copy.setUTCDate(copy.getUTCDate() + days);
+  return copy;
 }
 
-// JSTの「今日」を基準に、昨日から過去180日分を作る
-// 古い日付 → 新しい日付の順で取り込む
-const now = new Date();
-const dates = [];
-for (let i = DAYS; i >= 1; i -= 1) {
-  dates.push(formatDateJST(addDays(now, -i)));
-}
+function buildRecentDates(days) {
+  // JST基準の「昨日」から過去days日分。古い日付から順番に返す。
+  const todayJst = jstDateString(new Date());
+  const todayUtcMidnight = new Date(`${todayJst}T00:00:00Z`);
+  const yesterday = addDays(todayUtcMidnight, -1);
 
-console.log("============================================");
-console.log(`K票バックフィル開始: 直近${DAYS}日分`);
-console.log(`対象開始日: ${dates[0]}`);
-console.log(`対象終了日: ${dates[dates.length - 1]}`);
-console.log(DRY ? "モード: dry-run（DB投入なし）" : "モード: 本投入");
-console.log("============================================");
-
-let success = 0;
-let failed = 0;
-const failedDates = [];
-
-for (const date of dates) {
-  console.log(`\n--- ${date} 取り込み開始 ---`);
-
-  const args = ["ingest_k.mjs", date];
-  if (DRY) args.push("--dry");
-
-  const result = spawnSync("node", args, {
-    cwd: new URL(".", import.meta.url).pathname,
-    stdio: "inherit",
-    env: process.env,
-  });
-
-  if (result.status === 0) {
-    success += 1;
-    console.log(`--- ${date} 取り込み成功 ---`);
-  } else {
-    failed += 1;
-    failedDates.push(date);
-    console.error(`--- ${date} 取り込み失敗 status=${result.status} ---`);
-    // 1日失敗しても残りの日付は続行する
+  const dates = [];
+  for (let i = days - 1; i >= 0; i--) {
+    dates.push(jstDateString(addDays(yesterday, -i)));
   }
+  return dates;
 }
 
-console.log("\n============================================");
-console.log(`K票バックフィル完了: 成功 ${success}日 / 失敗 ${failed}日`);
-if (failedDates.length > 0) {
-  console.log(`失敗日: ${failedDates.join(", ")}`);
-}
-console.log("============================================");
+function runNode(script, scriptArgs) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [script, ...scriptArgs], {
+      cwd: __dirname,
+      stdio: 'inherit',
+      env: process.env,
+    });
 
-if (success === 0) {
-  console.error("全日失敗したため終了コード1で終了します");
+    child.on('close', (code) => resolve(code));
+    child.on('error', (err) => {
+      console.error(err);
+      resolve(1);
+    });
+  });
+}
+
+async function main() {
+  const ingestPath = path.join(__dirname, 'ingest_k.mjs');
+  const dates = buildRecentDates(DAYS);
+
+  console.log(`backfill recent ${DAYS} days start`);
+  console.log(`dry=${dry}`);
+  console.log(`from=${dates[0]} to=${dates[dates.length - 1]}`);
+
+  let ok = 0;
+  let ng = 0;
+  const failed = [];
+
+  for (const date of dates) {
+    console.log(`\n===== ${date} start =====`);
+    const childArgs = [date];
+    if (dry) childArgs.push('--dry');
+
+    const code = await runNode(ingestPath, childArgs);
+    if (code === 0) {
+      ok += 1;
+      console.log(`===== ${date} done =====`);
+    } else {
+      ng += 1;
+      failed.push(date);
+      console.error(`===== ${date} failed code=${code} =====`);
+    }
+  }
+
+  console.log('\nbackfill finished');
+  console.log(`ok=${ok} ng=${ng}`);
+  if (failed.length) console.log(`failed dates=${failed.join(', ')}`);
+
+  if (ok === 0) process.exit(1);
+}
+
+main().catch((err) => {
+  console.error(err);
   process.exit(1);
-}
+});
