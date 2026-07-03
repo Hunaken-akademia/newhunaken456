@@ -76,15 +76,26 @@ function parseK(text) {
       if (compact.includes(n)) { placeNo = no; break; }
     }
 
-    // レース番号＋決まり手: "1R ... 差し" のようにレース見出し末尾に出る
+    // レース番号: "1R" / "12R" の見出し行でレース番号を更新。
+    // 決まり手はこの行ではなく、次のヘッダー行の末尾に出ることがあるため一旦リセットする。
     const rm = line.match(/^\s*(\d{1,2})R\b/);
     if (rm) {
       raceNo = Number(rm[1]);
-      const km = line.match(/(まくり差し|まくり|逃げ|差し|抜き|恵まれ)\s*$/);
-      currentKimarite = km ? km[1] : null;
+      currentKimarite = null;
+      const kmSameLine = line.match(/(まくり差し|まくり|逃げ|差し|抜き|恵まれ)\s*$/);
+      if (kmSameLine) currentKimarite = kmSameLine[1];
       continue;
     }
 
+    // 決まり手: K票では
+    // "着 艇 登番 ... ﾚｰｽﾀｲﾑ 差し"
+    // のように、着順行の直前のヘッダー行末尾に出る。
+    // ここでレース単位の決まり手を保持し、1着行にだけ付与する。
+    if (raceNo && /ﾚｰｽﾀｲﾑ|レースタイム/.test(line)) {
+      const kmHeader = line.match(/(まくり差し|まくり|逃げ|差し|抜き|恵まれ)\s*$/);
+      if (kmHeader) currentKimarite = kmHeader[1];
+      continue;
+    }
     // 着順行:
     // 01  2 4724 吉　田　祐　貴 62   52  6.91   2    0.13     1.51.6
     const m = line.match(/^\s*(\d{2})\s+(\d)\s+(\d{4})\s+(.+?)\s+(\d{1,3})\s+(\d{1,3})\s+(\d\.\d{2})\s+(\d)\s+([FLＦＬ]?\s*0?\.\d{2}|[FLＦＬ]?\.\d{2}|[FLＦＬ]?\d\.\d{2})\b/);
