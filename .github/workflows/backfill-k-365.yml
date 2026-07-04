@@ -30,6 +30,11 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install lha
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lhasa
+
       - name: Install dependencies
         run: npm install iconv-lite
 
