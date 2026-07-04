@@ -31,7 +31,7 @@ jobs:
           node-version: 22
 
       - name: Install dependencies
-        run: npm install
+        run: npm install iconv-lite
 
       - name: Backfill recent 365 days
         working-directory: pipeline
