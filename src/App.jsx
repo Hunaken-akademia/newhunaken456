@@ -1174,7 +1174,12 @@ export default function App() {
     return d.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   };
 
-  const apiCacheNote = () => "";
+  const apiCacheNote = (data, label = "共有キャッシュ") => {
+    if (!data || !data.cached) return "";
+    const src = data.cacheWarning ? `（${data.cacheWarning}）` : "";
+    const age = Number.isFinite(Number(data.cacheAgeSec)) ? `・${data.cacheAgeSec}秒前` : "";
+    return `／${label}${src}${age}`;
+  };
   const applyBoatcastRows = (rows, { displayDisabled = false } = {}) => {
     if (!Array.isArray(rows) || !rows.length || displayDisabled) return;
 
@@ -1237,8 +1242,8 @@ export default function App() {
       if (data.odds && Object.keys(data.odds).length >= 10) {
         setOdds(data.odds);
         const cacheNote = apiCacheNote(data, "オッズ共有キャッシュ");
-        setPMsg("odds", `✓ ${targetVenue}${targetRaceNo}Rの3連単オッズ ${Object.keys(data.odds).length}点を更新しました`);
-        setAutoMsg(`${targetVenue}${targetRaceNo}Rのオッズを更新しました。`);
+        setPMsg("odds", `✓ ${targetVenue}${targetRaceNo}Rの3連単オッズ ${Object.keys(data.odds).length}点を更新しました${cacheNote}`);
+        setAutoMsg(`${targetVenue}${targetRaceNo}Rのオッズを更新しました${cacheNote}。`);
         setAutoRefreshInfo("");
       } else {
         throw new Error(data.error || "3連単オッズを十分に取得できませんでした");
@@ -1331,7 +1336,7 @@ export default function App() {
 
       applyBoatcastRows(rows, { displayDisabled });
 
-      const simpleFetchMsg = `${targetVenue}${targetRaceNo}Rのデータを取得しました。`;
+      const simpleFetchMsg = `${targetVenue}${targetRaceNo}Rのデータを取得しました${cacheNote}。`;
       setPMsg("tenji", simpleFetchMsg);
       setAutoMsg(simpleFetchMsg);
       setAutoRefreshInfo("");

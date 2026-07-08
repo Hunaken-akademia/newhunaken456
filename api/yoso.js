@@ -11,6 +11,100 @@ globalThis.__HUNAKEN_YOSO_CACHE_V109__ = cacheStore;
 const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V109__ || new Map();
 globalThis.__HUNAKEN_YOSO_INFLIGHT_V109__ = inFlightStore;
 
+const SUPABASE_REST_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
+const ENABLE_PERSISTENT_CACHE = !!(SUPABASE_REST_URL && SUPABASE_SERVICE_KEY);
+
+function parseCacheKey(key) {
+  const parts = String(key || "").split(":");
+  const cacheType = parts[0] || "unknown";
+  if (cacheType === "full" || cacheType === "odds") {
+    return { cacheType, venue: parts[1] || "", raceNo: Number(parts[2]) || null, ymd: parts[3] || "" };
+  }
+  if (cacheType === "schedule") {
+    return { cacheType, venue: parts[1] || "", raceNo: null, ymd: parts[2] || "" };
+  }
+  return { cacheType, venue: "", raceNo: null, ymd: "" };
+}
+
+function ymdToDate(ymd) {
+  const s = String(ymd || "").replace(/\D/g, "");
+  return /^\d{8}$/.test(s) ? `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}` : null;
+}
+
+async function supabaseCacheRequest(path, options = {}) {
+  if (!ENABLE_PERSISTENT_CACHE) return null;
+  const res = await fetch(`${SUPABASE_REST_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SERVICE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Supabase cache ${res.status}: ${body}`);
+  }
+  if (res.status === 204) return null;
+  return await res.json();
+}
+
+async function readPersistentCache(key) {
+  if (!ENABLE_PERSISTENT_CACHE) return null;
+  try {
+    const rows = await supabaseCacheRequest(`yoso_cache?cache_key=eq.${encodeURIComponent(key)}&select=payload,created_at,updated_at,expires_at,stale_expires_at&limit=1`);
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row || !row.payload) return null;
+    const now = Date.now();
+    const expiresAt = Date.parse(row.expires_at || "");
+    const staleExpiresAt = Date.parse(row.stale_expires_at || "");
+    const updatedAt = Date.parse(row.updated_at || row.created_at || "") || now;
+    return {
+      data: row.payload,
+      savedAt: updatedAt,
+      fresh: Number.isFinite(expiresAt) && now < expiresAt,
+      stale: Number.isFinite(staleExpiresAt) && now < staleExpiresAt,
+    };
+  } catch (e) {
+    console.warn("persistent cache read skipped:", e?.message || e);
+    return null;
+  }
+}
+
+async function writePersistentCache(key, data, ttlMs, staleMs) {
+  if (!ENABLE_PERSISTENT_CACHE) return;
+  try {
+    const meta = parseCacheKey(key);
+    const now = Date.now();
+    const body = [{
+      cache_key: key,
+      cache_type: meta.cacheType,
+      race_date: ymdToDate(meta.ymd),
+      venue: meta.venue || null,
+      race_no: meta.raceNo,
+      payload: data,
+      expires_at: new Date(now + ttlMs).toISOString(),
+      stale_expires_at: new Date(now + staleMs).toISOString(),
+      updated_at: new Date(now).toISOString(),
+    }];
+    await supabaseCacheRequest("yoso_cache?on_conflict=cache_key", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    console.warn("persistent cache write skipped:", e?.message || e);
+  }
+}
+
+function dataCacheNotice(source) {
+  if (source === "supabase") return "Supabase共有キャッシュから表示";
+  if (source === "memory") return "サーバー内キャッシュから表示";
+  return "";
+}
+
 function cacheDecorate(entry, ttlMs, flags = {}) {
   const now = Date.now();
   const ageMs = Math.max(0, now - Number(entry?.savedAt || 0));
@@ -37,7 +131,13 @@ async function withSharedCache(key, ttlMs, fetcher, options = {}) {
   const ageMs = cached ? now - Number(cached.savedAt || 0) : Infinity;
 
   if (cached && ageMs < ttlMs) {
-    return cacheDecorate(cached, ttlMs);
+    return cacheDecorate(cached, ttlMs, { cacheWarning: dataCacheNotice("memory") });
+  }
+
+  const persistent = await readPersistentCache(key);
+  if (persistent?.fresh) {
+    cacheStore.set(key, { savedAt: persistent.savedAt, data: persistent.data });
+    return cacheDecorate({ savedAt: persistent.savedAt, data: persistent.data }, ttlMs, { cacheWarning: dataCacheNotice("supabase") });
   }
 
   const inFlight = inFlightStore.get(key);
@@ -59,10 +159,18 @@ async function withSharedCache(key, ttlMs, fetcher, options = {}) {
     }
   }
 
+  if (persistent?.stale) {
+    const staleEntry = { savedAt: persistent.savedAt, data: persistent.data };
+    cacheStore.set(key, staleEntry);
+    // 古いキャッシュを即返しつつ、バックグラウンド更新は次回アクセス時に任せる。
+    return cacheDecorate(staleEntry, ttlMs, { stale: true, cacheWarning: "Supabaseの古い共有キャッシュを表示" });
+  }
+
   const promise = (async () => {
     const data = await fetcher();
     const entry = { savedAt: Date.now(), data };
     cacheStore.set(key, entry);
+    await writePersistentCache(key, data, ttlMs, staleMs);
     return {
       ...data,
       cached: false,
