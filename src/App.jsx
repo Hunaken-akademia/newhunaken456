@@ -1648,7 +1648,7 @@ export default function App() {
         oddsNote = `／3連単オッズ${Object.keys(data.odds).length}点も自動取得`;
         setPMsg("odds", `✓ ${targetVenue}${targetRaceNo}Rの3連単オッズ ${Object.keys(data.odds).length}点を自動取得しました（合成オッズに反映）`);
       } else if (AUTO_FETCH_VENUES.includes(targetVenue)) {
-        oddsNote = "／オッズは未取得（締切後またはページ未対応時は手動コピペ可）";
+        oddsNote = "／オッズは未取得";
       }
 
       const rows = data.rows || [];
@@ -2882,40 +2882,33 @@ export default function App() {
     const ranked = [...evals].sort((a, b) => b.score - a.score);
     ranked.forEach((r, i) => { r.rankPos = i + 1; });
 
-    // ── 項目別の配点（順位ベース・同値は同点）──
-    //   成績/展示/モーター/ST: 1位20点〜6位0点（4点刻み）
-    //   枠基準/風: 1位10点〜6位0点（2点刻み）
+    // ── 項目別の配点（連続値・レース内で最小0〜最大満点に正規化）──
+    //   成績/展示/モーター/ST: 20点満点、枠基準/風: 10点満点。差の大きさを点数に反映（接戦は僅差、大差は開く）。
     {
-      // 指標が大きいほど良い前提。同値は同順位（＝同点）にする。
+      // 指標が大きいほど良い前提。順位だけではなく「差の大きさ」を配点に反映する。
       const rankPoints = (getVal, step) => {
-        // 各艇の値を取得（null は最下位扱い）
+        const maxPts = step * 5; // step=4→20点満点, step=2→10点満点
         const arr = ranked.map((r) => ({ r, v: getVal(r) }));
-        // 降順ソート（大きいほど上位）
-        const sorted = [...arr].sort((a, b) => (b.v ?? -Infinity) - (a.v ?? -Infinity));
+        const finite = arr.filter((x) => x.v != null && Number.isFinite(x.v)).map((x) => x.v);
         const pointsOf = {};
-        let lastV = null, lastPts = null;
-        sorted.forEach((item, idx) => {
-          let pts;
-          if (lastV !== null && item.v === lastV) {
-            pts = lastPts;                 // 同値 → 同点
-          } else {
-            pts = Math.max(0, (6 - idx) - 1) * step; // 1位:5*step … 6位:0
-            // ↑ idx0→5*step, idx5→0。step=4で20〜0、step=2で10〜0
-          }
-          pointsOf[item.r.boat] = pts;
-          lastV = item.v; lastPts = pts;
+        if (!finite.length) { arr.forEach((x) => { pointsOf[x.r.boat] = 0; }); return pointsOf; }
+        const mn = Math.min(...finite), mx = Math.max(...finite);
+        arr.forEach((x) => {
+          if (x.v == null || !Number.isFinite(x.v)) { pointsOf[x.r.boat] = 0; return; }
+          pointsOf[x.r.boat] = mx === mn ? Math.round(maxPts / 2) : Math.round(maxPts * (x.v - mn) / (mx - mn));
         });
         return pointsOf;
       };
 
       // 展示の指標: 自コース補正テーブルの「段階(tier)」を段階数で正規化（0〜1、枠の段階差を吸収）
-      //   さらに 3〜6号艇が上位2段階に乗ったら問答無用で最上位扱い（+100のゲタ）。
+      //   さらに 3〜6号艇が上位2段階に乗ったら最上位級扱い（+0.25 のゲタ）。
+      //   ※連続値配点に合わせ、ゲタを+100→+0.25に調整（他艇の点数分布を潰さないため）。
       const tenjiVal = (r) => {
         if (r.tier == null || r.tierMax == null) return -Infinity;
         let v = r.tier / (r.tierMax - 1); // 0〜1
         const isOuter = r.course >= 3;
         const topTwoTier = r.tier >= r.tierMax - 2; // 上位2段階
-        if (isOuter && topTwoTier) v += 100;        // 外枠の好タイムは展示1位級に
+        if (isOuter && topTwoTier) v += 0.25;       // 外枠の好タイムは展示1位級に
         return v;
       };
 
@@ -3304,6 +3297,46 @@ export default function App() {
 
     const bets = [honmei, taikou, ana];
 
+    // ── スコア→確率→期待値 ──
+    //   1着確率: コース別の場平均1着率(final1)を土台(prior)に、当日評価スコアで補正して正規化。
+    //   3連単確率: Harville式 P(a-b-c)=pa×pb/(1-pa)×pc/(1-pa-pb)（一次近似）。
+    //   期待値 EV = 推定確率×オッズ。EV>1 は「市場より割安（妙味）」の目安。
+    const meanScore = ranked.reduce((a, r) => a + (r.score || 0), 0) / Math.max(1, ranked.length);
+    const winProb = {};
+    {
+      let zSum = 0;
+      for (const r of ranked) {
+        const baseP = Math.max(1, r.final1 ?? r.baseRate ?? 10);
+        const w = baseP * Math.exp(0.08 * ((r.score || 0) - meanScore));
+        winProb[r.boat] = w; zSum += w;
+      }
+      for (const b of Object.keys(winProb)) winProb[b] = zSum > 0 ? winProb[b] / zSum : 0;
+    }
+    const probMap = {};
+    const boatsAll = ranked.map((r) => r.boat);
+    for (const pa1 of boatsAll) for (const pb2 of boatsAll) for (const pc3 of boatsAll) {
+      if (pa1 === pb2 || pa1 === pc3 || pb2 === pc3) continue;
+      const pa = winProb[pa1], pb = winProb[pb2], pc = winProb[pc3];
+      const d1 = 1 - pa, d2 = 1 - pa - pb;
+      if (d1 <= 0 || d2 <= 0) continue;
+      const p = pa * (pb / d1) * (pc / d2);
+      if (Number.isFinite(p) && p > 0) probMap[`${pa1}-${pb2}-${pc3}`] = p;
+    }
+    let evList = [];
+    if (odds) {
+      const seenEv = new Set();
+      for (const bset of bets) {
+        for (const t of bset.tickets) {
+          if (seenEv.has(t)) continue;
+          seenEv.add(t);
+          const o = odds[t];
+          const p = probMap[t];
+          if (o > 0 && p != null) evList.push({ t, from: bset.label, p, o, ev: p * o });
+        }
+      }
+      evList.sort((x, y) => y.ev - x.ev);
+    }
+
     // ── 段階的フィルター＋決まり手シナリオ ──
     // 気配順位(order)を土台に、ST→モーター→F持ち→風で頭を1〜2艇に確定
     const stOf = (b) => { const v = fHold[b] ? null : Number(fSts[b] ?? sts[b]); return Number.isFinite(v) ? v : null; };
@@ -3466,7 +3499,7 @@ export default function App() {
       confidence = { total, level, color, advice, reasons };
     }
 
-    return { ranked, badge, badgeColor, usedData, bets, flow, recommend, confidence };
+    return { ranked, badge, badgeColor, usedData, bets, flow, recommend, confidence, winProb, probMap, evList };
   };
 
   // メイン評価（選択中の区分）
@@ -4265,25 +4298,19 @@ export default function App() {
           {/* 風による増減値は内部計算のみ。画面には直接表示しない。 */}
         </div>
 
-        {/* 枠別情報一括入力（他のコピペ欄は非表示） */}
+        {/* コピペ欄は廃止。自動取得・DB成績・共有キャッシュで反映する。 */}
         <div style={{
           display: "flex", alignItems: "center", gap: 8,
           marginBottom: 10, flexWrap: "wrap",
         }}>
-          {Object.entries(PANELS).map(([key, p]) => (
-            <button
-              key={key}
-              onClick={() => setOpenPanel((v) => (v === key ? null : key))}
-              style={{
-                padding: "10px 14px", borderRadius: 10, cursor: "pointer",
-                background: openPanel === key ? "#2c4762" : "#3d7ab8",
-                color: "#fff", fontSize: 13, fontWeight: 700,
-                border: openPanel === key ? "1px solid #5a87b8" : "none",
-              }}
-            >
-              {p.title}
-            </button>
-          ))}
+          <div style={{
+            padding: "9px 12px", borderRadius: 10,
+            background: "#123326", color: "#7ee2aa",
+            fontSize: 12, fontWeight: 700,
+            border: "1px solid #1c7047",
+          }}>
+            ✓ コピペ不要：自動取得＋DB成績で反映
+          </div>
           <button
             onClick={allClear}
             style={{
@@ -4303,56 +4330,6 @@ export default function App() {
             border: autoMsg.startsWith("✓") ? "1px solid #1c7047" : "1px solid #5e2d3a",
             fontSize: 12, fontWeight: 700,
           }}>{autoMsg}</div>
-        )}
-
-        {openPanel && (
-          <div style={{
-            background: "#16273c", borderRadius: 10, padding: 12, marginBottom: 12,
-          }}>
-            <div style={{ fontSize: 11, color: "#9db5cc", lineHeight: 1.6, marginBottom: 8 }}>
-              {PANELS[openPanel].help}
-            </div>
-            <textarea
-              value={pTexts[openPanel]}
-              onChange={(e) => setPText(openPanel, e.target.value)}
-              placeholder="ここに貼り付け"
-              rows={5}
-              style={{
-                width: "100%", boxSizing: "border-box",
-                background: "#0e1b2c", color: "#fff",
-                border: "1px solid #2c4762", borderRadius: 8,
-                padding: 10, fontSize: 13, resize: "vertical",
-              }}
-            />
-            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
-              <button
-                onClick={PANELS[openPanel].parse}
-                style={{
-                  padding: "9px 18px", borderRadius: 8, cursor: "pointer",
-                  background: "#3d7ab8", color: "#fff",
-                  fontSize: 13, fontWeight: 700, border: "none",
-                }}
-              >
-                解析して入力
-              </button>
-              <button
-                onClick={() => { setPText(openPanel, ""); setPMsg(openPanel, ""); }}
-                style={{
-                  padding: "9px 14px", borderRadius: 8, cursor: "pointer",
-                  background: "#0e1b2c", color: "#9db5cc",
-                  fontSize: 13, fontWeight: 700, border: "1px solid #2c4762",
-                }}
-              >
-                クリア
-              </button>
-              {pMsgs[openPanel] && (
-                <span style={{
-                  fontSize: 12,
-                  color: pMsgs[openPanel].startsWith("✓") ? "#5dd39e" : "#ff8a80",
-                }}>{pMsgs[openPanel]}</span>
-              )}
-            </div>
-          </div>
         )}
 
         {/* 平均STの期間切替 */}
@@ -4380,7 +4357,7 @@ export default function App() {
           {stTable ? (
             <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ ST表 読込済（切替で自動反映）</span>
           ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>※自動取得または補助データ貼付で有効</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>※自動取得後にDB平均STを反映</span>
           )}
         </div>
 
@@ -4432,7 +4409,7 @@ export default function App() {
           {kimari ? (
             <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 決まり手 読込済</span>
           ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>決まり手は貼付情報を使用</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>決まり手はDB成績を使用</span>
           )}
           {nigeSim ? (
             <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ {nigeStatus}</span>
@@ -5257,7 +5234,7 @@ export default function App() {
                               );
                             })}
                             <div style={{ fontSize: 9, color: "#5e7a92", marginTop: 5, lineHeight: 1.5 }}>
-                              成績・展示・ﾓｰﾀｰ・ST=各20点（4点刻み）、枠基準・風=各10点（2点刻み）。同値は同点。
+                              成績・展示・ﾓｰﾀｰ・ST=各20点、枠基準・風=各10点。この6艇の中で最も良い艇が満点、最も悪い艇が0点になるよう、差の大きさに応じて配点（接戦は僅差、大差は開く）。
                             </div>
                           </div>
                         );
@@ -5517,6 +5494,41 @@ export default function App() {
                         )}
                         <div style={{ fontSize: 9, color: "#5e7a92", marginTop: 6, lineHeight: 1.5 }}>
                           ※ レースの荒れ度（{aiEval.badge}）と決まり手から算出した目安です。各買い目の点数プルダウンで調整できます。
+                        </div>
+                      </div>
+                    )}
+                    {/* 期待値ランキング（推定確率×オッズ）: オッズ入力/取得時のみ表示 */}
+                    {aiEval.evList && aiEval.evList.length > 0 && (
+                      <div style={{ background: "#16273c", borderRadius: 10, padding: "10px 14px", marginBottom: 12 }}>
+                        <div style={{ fontSize: 12, fontWeight: 800, color: "#fff", marginBottom: 2 }}>
+                          期待値ランキング（推定確率 × オッズ）
+                        </div>
+                        <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 8, lineHeight: 1.6 }}>
+                          AIの推定的中確率とオッズを掛けた「割安度」です。<b style={{ color: "#7fe3a8" }}>1.0以上＝市場の評価より妙味あり</b>。
+                          当たりやすさではなく「買う価値」の順です。
+                        </div>
+                        <div style={{ display: "grid", gap: 4 }}>
+                          {aiEval.evList.slice(0, 8).map((e) => {
+                            const good = e.ev >= 1.0;
+                            return (
+                              <div key={e.t} style={{
+                                display: "flex", alignItems: "center", gap: 8, fontSize: 11,
+                                background: "#0e1b2c", borderRadius: 7, padding: "6px 9px", flexWrap: "wrap",
+                              }}>
+                                <span style={{ fontWeight: 800, color: "#cfe0f0", minWidth: 52 }}>{e.t}</span>
+                                <span style={{ color: "#7da3c8", fontSize: 10 }}>{e.from}</span>
+                                <span style={{ color: "#9db5cc" }}>推定 {(e.p * 100).toFixed(1)}%</span>
+                                <span style={{ color: "#f5c518" }}>{e.o.toFixed(1)}倍</span>
+                                <span style={{
+                                  marginLeft: "auto", fontWeight: 800,
+                                  color: good ? "#5dd39e" : "#8aa0b8",
+                                }}>EV {e.ev.toFixed(2)}{good ? " ◎" : ""}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div style={{ fontSize: 9, color: "#5e7a92", marginTop: 6, lineHeight: 1.5 }}>
+                          ※ 推定確率はコース別場平均を土台に当日評価で補正した近似値（Harville式）。本命側をやや高めに見積もる癖があります。参考指標としてご利用ください。
                         </div>
                       </div>
                     )}
