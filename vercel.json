@@ -1,6 +1,5 @@
 {
-  "framework": "vite",
-  "installCommand": "npm install --no-audit --no-fund --legacy-peer-deps",
-  "buildCommand": "npm run build",
+  "installCommand": "corepack enable && pnpm install --no-frozen-lockfile",
+  "buildCommand": "pnpm run build",
   "outputDirectory": "dist"
 }
