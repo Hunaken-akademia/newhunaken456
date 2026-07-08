@@ -1,5 +1,5 @@
 {
-  "installCommand": "npm ci --no-audit --no-fund --legacy-peer-deps",
-  "buildCommand": "npm run build",
+  "installCommand": "curl -fsSL https://bun.sh/install | bash && ~/.bun/bin/bun install",
+  "buildCommand": "~/.bun/bin/bun run build",
   "outputDirectory": "dist"
 }
