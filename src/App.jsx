@@ -2130,7 +2130,7 @@ export default function App() {
     let alive = true;
     async function run() {
       if (!CORRECTION_TABLE_ENABLED) {
-        if (alive) setCorrectionStatus("固定補正");
+        if (alive) setCorrectionStatus(`固定補正（ENVなし URL:${SUPABASE_URL ? "有" : "無"} KEY:${SUPABASE_ANON_KEY ? "有" : "無"}）`);
         return;
       }
       try {
@@ -2141,10 +2141,11 @@ export default function App() {
           setCorrectionTable(table);
           setCorrectionStatus(`DB補正 ${table.days || 365}日`);
         } else {
-          setCorrectionStatus("固定補正");
+          setCorrectionStatus("固定補正（latestなし）");
         }
-      } catch (_) {
-        if (alive) setCorrectionStatus("固定補正");
+      } catch (e) {
+        console.error("correction_tables load error", e);
+        if (alive) setCorrectionStatus(`固定補正（${String(e?.message || e).slice(0, 80)}）`);
       }
     }
     run();
