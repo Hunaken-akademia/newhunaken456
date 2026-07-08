@@ -17,6 +17,246 @@ function publicSupabaseHeaders(json = false) {
   return h;
 }
 
+
+function daysAgoIso(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - Number(days || 0));
+  return d.toISOString().slice(0, 10);
+}
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function round1(v) {
+  return Math.round(Number(v || 0) * 10) / 10;
+}
+
+function emptyRateStats() {
+  return { win1: {}, ren2: {}, ren3: {}, n: {} };
+}
+
+function rateFromRows(rows, pred) {
+  const n = rows.length;
+  if (!n) return null;
+  return round1((rows.filter(pred).length / n) * 100);
+}
+
+function buildRacerCourseStatsFromDb(rawRows, profiles, courses, venueName) {
+  const stats = emptyRateStats();
+  const placeNo = PLACE_NO_BY_VENUE[venueName] || null;
+  const cats = [
+    { label: "今期", days: 365 },
+    { label: "直近6ヶ月", days: 180 },
+    { label: "直近3ヶ月", days: 90 },
+    { label: "直近1ヶ月", days: 30 },
+    { label: "当地", days: 365, local: true },
+  ];
+
+  for (const c of cats) {
+    stats.win1[c.label] = Array(6).fill(null);
+    stats.ren2[c.label] = Array(6).fill(null);
+    stats.ren3[c.label] = Array(6).fill(null);
+    stats.n[c.label] = Array(6).fill(0);
+  }
+
+  for (let b = 1; b <= 6; b++) {
+    const regno = Number(profiles?.[b]?.regNo || profiles?.[b]?.regno || profiles?.[b]?.registerNo || 0);
+    const course = Number(courses?.[b] || b);
+    if (!regno || !course) continue;
+
+    for (const c of cats) {
+      const from = daysAgoIso(c.days);
+      const filtered = rawRows.filter((r) => {
+        const rd = String(r.race_date || "").slice(0, 10);
+        return Number(r.regno) === regno
+          && Number(r.course) === course
+          && rd >= from
+          && (!c.local || !placeNo || Number(r.place_no) === placeNo)
+          && r.rank != null;
+      });
+      stats.n[c.label][b - 1] = filtered.length;
+      stats.win1[c.label][b - 1] = rateFromRows(filtered, (r) => Number(r.rank) === 1);
+      stats.ren2[c.label][b - 1] = rateFromRows(filtered, (r) => Number(r.rank) <= 2);
+      stats.ren3[c.label][b - 1] = rateFromRows(filtered, (r) => Number(r.rank) <= 3);
+    }
+  }
+  return stats;
+}
+
+async function fetchRestPages(table, baseQs, maxRows = 50000) {
+  const all = [];
+  const page = 1000;
+  for (let offset = 0; offset < maxRows; offset += page) {
+    const qs = new URLSearchParams(baseQs.toString());
+    qs.set("limit", String(page));
+    qs.set("offset", String(offset));
+    const url = `${SUPABASE_URL}/rest/v1/${table}?${qs.toString()}`;
+    const res = await fetch(url, { headers: publicSupabaseHeaders(false) });
+    if (!res.ok) throw new Error(`${table} load failed: ${res.status}`);
+    const rows = await res.json();
+    if (!Array.isArray(rows) || !rows.length) break;
+    all.push(...rows);
+    if (rows.length < page) break;
+  }
+  return all;
+}
+
+async function fetchRaceResultsForRacers(regnos, days = 365) {
+  if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
+  const nums = [...new Set((regnos || []).map((v) => Number(v)).filter(Boolean))];
+  if (!nums.length) return [];
+  const qs = new URLSearchParams();
+  qs.set("select", "regno,course,rank,place_no,race_date");
+  qs.set("regno", `in.(${nums.join(",")})`);
+  qs.set("race_date", `gte.${daysAgoIso(days)}`);
+  qs.set("order", "race_date.desc");
+  return await fetchRestPages("race_results", qs, 50000);
+}
+
+
+async function fetchRaceResultsForVenue(placeNo, days = 365) {
+  if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
+  if (!placeNo) return [];
+  const qs = new URLSearchParams();
+  qs.set("select", "race_date,place_no,race_no,boat,course,rank,kimarite,regno,st,is_f");
+  qs.set("place_no", `eq.${Number(placeNo)}`);
+  qs.set("race_date", `gte.${daysAgoIso(days)}`);
+  qs.set("order", "race_date.desc");
+  return await fetchRestPages("race_results", qs, 50000);
+}
+
+function buildEscapeSimulationFromDb(rows, currentCourses = {}, currentRows = null, racerStats = null, racerCat = "今期", sts = {}, fHold = {}, fSts = {}, wind = "無風") {
+  const byRace = new Map();
+  for (const r of rows || []) {
+    if (r?.race_date == null || r?.place_no == null || r?.race_no == null) continue;
+    if (r.rank == null || r.course == null) continue;
+    const key = `${String(r.race_date).slice(0,10)}|${r.place_no}|${r.race_no}`;
+    if (!byRace.has(key)) byRace.set(key, []);
+    byRace.get(key).push(r);
+  }
+
+  const second = [0, 0, 0, 0, 0];
+  const third = [0, 0, 0, 0, 0];
+  const deme = [0, 0, 0, 0, 0];
+  const failKimarite = { "差し": 0, "まくり": 0, "まくり差し": 0, "抜き": 0, "恵まれ": 0, "その他": 0 };
+  const failWinCourse = [0, 0, 0, 0, 0]; // 2〜6コース
+  let total = 0;
+  let c1Win = 0;
+  let nige = 0;
+  let fail = 0;
+
+  for (const raceRows of byRace.values()) {
+    if (raceRows.length < 5) continue;
+    const c1 = raceRows.find((r) => Number(r.course) === 1);
+    const winner = raceRows.find((r) => Number(r.rank) === 1);
+    if (!c1 || !winner) continue;
+    total++;
+    const c1Won = Number(c1.rank) === 1;
+    if (c1Won) c1Win++;
+    const isNige = c1Won && String(winner.kimarite || c1.kimarite || "").includes("逃げ");
+    if (isNige) {
+      nige++;
+      const r2 = raceRows.find((r) => Number(r.rank) === 2);
+      const r3 = raceRows.find((r) => Number(r.rank) === 3);
+      const c2 = Number(r2?.course || 0);
+      const c3 = Number(r3?.course || 0);
+      if (c2 >= 2 && c2 <= 6) { second[c2 - 2]++; deme[c2 - 2]++; }
+      if (c3 >= 2 && c3 <= 6) third[c3 - 2]++;
+    } else {
+      fail++;
+      const wc = Number(winner.course || 0);
+      if (wc >= 2 && wc <= 6) failWinCourse[wc - 2]++;
+      const k = String(winner.kimarite || "その他").trim() || "その他";
+      if (Object.prototype.hasOwnProperty.call(failKimarite, k)) failKimarite[k]++;
+      else failKimarite["その他"]++;
+    }
+  }
+
+  const pct = (n, d) => d ? round1((n / d) * 100) : null;
+  const byBoatSecond = Array(5).fill(null);
+  const byBoatThird = Array(5).fill(null);
+  const byBoatDeme = Array(5).fill(null);
+  const byCourseSecond = second.map((v) => pct(v, nige));
+  const byCourseThird = third.map((v) => pct(v, nige));
+  const byCourseDeme = deme.map((v) => pct(v, nige));
+
+  // 現在の進入変更に合わせて、2〜6艇欄へ「その艇が入っているコース」の分布を割り当てる。
+  for (let boat = 2; boat <= 6; boat++) {
+    const course = Number(currentCourses?.[boat] || boat);
+    if (course >= 2 && course <= 6) {
+      byBoatSecond[boat - 2] = byCourseSecond[course - 2];
+      byBoatThird[boat - 2] = byCourseThird[course - 2];
+      byBoatDeme[boat - 2] = byCourseDeme[course - 2];
+    }
+  }
+
+  const c1Boat = Number(Object.entries(currentCourses || {}).find(([, c]) => Number(c) === 1)?.[0] || 1);
+  const r1 = currentRows?.find?.((r) => Number(r.boat) === c1Boat) || null;
+  const c2Boat = Number(Object.entries(currentCourses || {}).find(([, c]) => Number(c) === 2)?.[0] || 2);
+  const c3Boat = Number(Object.entries(currentCourses || {}).find(([, c]) => Number(c) === 3)?.[0] || 3);
+  const r2 = currentRows?.find?.((r) => Number(r.boat) === c2Boat) || null;
+  const r3 = currentRows?.find?.((r) => Number(r.boat) === c3Boat) || null;
+
+  const baseNige = pct(nige, total);
+  const c1WinRate = pct(c1Win, total);
+  const c1RacerWin = racerStats?.win1?.[racerCat]?.[c1Boat - 1] ?? null;
+  const c1RacerRen3 = racerStats?.ren3?.[racerCat]?.[c1Boat - 1] ?? null;
+
+  const effSt = (b) => {
+    const raw = fHold?.[b] && fSts?.[b] !== "" ? fSts[b] : sts?.[b];
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  };
+  const st1 = effSt(c1Boat);
+  const stOthers = [1,2,3,4,5,6].filter((b) => b !== c1Boat).map(effSt).filter((v) => v != null);
+  const avgOthers = stOthers.length ? stOthers.reduce((a,b)=>a+b,0)/stOthers.length : null;
+  const stAdv = st1 != null && avgOthers != null ? round1((avgOthers - st1) * 100) / 100 : null; // +なら1Cが早い
+
+  let score = baseNige ?? c1WinRate ?? 50;
+  if (c1RacerWin != null) score = score * 0.55 + c1RacerWin * 0.45;
+  if (c1RacerRen3 != null && c1RacerRen3 >= 75) score += 2;
+  if (r1?.diff != null) score += Number(r1.diff) * 5;
+  if (r1?.windAdj != null) score += Number(r1.windAdj) * 0.25;
+  if (stAdv != null) score += stAdv * 40;
+
+  const wall2 = r2 ? ((r2.racerR3final ?? r2.racerR2final ?? 0) + (r2.diff || 0) * 5 - ((effSt(c2Boat) ?? 0.17) - 0.15) * 80) : null;
+  const attack3 = r3 ? ((r3.racerR1final ?? r3.racerR3final ?? 0) + (r3.diff || 0) * 6 - ((effSt(c3Boat) ?? 0.17) - 0.15) * 90) : null;
+  if (wall2 != null && wall2 >= 55) score += 3;
+  if (wall2 != null && wall2 <= 35) score -= 4;
+  if (attack3 != null && attack3 >= 45) score -= 4;
+
+  score = Math.max(1, Math.min(99, round1(score)));
+  const alert = score >= 70 ? "逃げ信頼" : score >= 55 ? "逃げ優勢" : score >= 45 ? "互角" : "逃げ崩れ警戒";
+
+  return {
+    source: "DB",
+    n: total,
+    nigeN: nige,
+    failN: fail,
+    win1: c1WinRate,
+    nigeRate: baseNige,
+    second: byBoatSecond,
+    third: byBoatThird,
+    deme: byBoatDeme,
+    byCourseSecond,
+    byCourseThird,
+    byCourseDeme,
+    failKimarite,
+    failWinCourse: failWinCourse.map((v) => pct(v, fail)),
+    c1Boat,
+    c2Boat,
+    c3Boat,
+    c1RacerWin,
+    c1RacerRen3,
+    stAdv,
+    wall2: wall2 == null ? null : round1(wall2),
+    attack3: attack3 == null ? null : round1(attack3),
+    trustScore: score,
+    alert,
+  };
+}
+
 // ════════════════════════════════════════════════
 // ① 場別・コース別 1着率（平均＝基準値）%
 //    [1コース, 2コース, 3コース, 4コース, 5コース, 6コース]
@@ -704,6 +944,8 @@ export default function App() {
   // モーター情報 {no, rate, win1, ren2, ren3}
   const [motors, setMotors] = useState({ 1: null, 2: null, 3: null, 4: null, 5: null, 6: null });
   const [racerProfiles, setRacerProfiles] = useState({});
+  const [dbRacerRows, setDbRacerRows] = useState([]);
+  const [dbRacerStatus, setDbRacerStatus] = useState("DB選手成績：未取得");
 
   // オッズ一覧 odds[firstBoat] = { "2-3": 22.2, ... }（3連単 1着→"2着-3着":オッズ）
   const [odds, setOdds] = useState(null);
@@ -915,8 +1157,10 @@ export default function App() {
     setCourses({ 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6 });
     setMotors({ 1: null, 2: null, 3: null, 4: null, 5: null, 6: null });
     setRacerProfiles({});
+    setDbRacerRows([]);
+    setDbRacerStatus("DB選手成績：未取得");
     setOdds(null);
-    setKimari(null); setNigeSim(null); setRacerStats(null); setStTable(null);
+    setKimari(null); setNigeSim(null); setDbNigeRows([]); setNigeStatus("逃げシミュ：未取得"); setRacerStats(null); setStTable(null);
     setResultDigits({ first: "", second: "", third: "" });
     setAutoMsg("");
     setSaveMsg("");
@@ -927,6 +1171,8 @@ export default function App() {
   const [kimari, setKimari] = useState(null);       // {期間:{nige,nigashi,sasare,sashi[5],makurare,makuri[5],makuraresashi,makurizashi[5]}}
   const [kimariPeriod, setKimariPeriod] = useState("直近6ヶ月");
   const [nigeSim, setNigeSim] = useState(null);     // {win1,nigeRate,second[5],third[5],deme[5]}
+  const [dbNigeRows, setDbNigeRows] = useState([]);
+  const [nigeStatus, setNigeStatus] = useState("逃げシミュ：未取得");
 
   // 選手成績 {win:{区分:[6]}, ren2:{区分:[6]}, ren3:{区分:[6]}}
   const RACER_CATS = ["今期", "直近6ヶ月", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "女子戦"];
@@ -1929,7 +2175,7 @@ export default function App() {
         setPMsg(msgKey, "逃げシミュレーション・決まり手が見つかりません。枠別情報の該当表をコピーしてください");
         return false;
       }
-      if (nige) setNigeSim(nige);
+      if (nige) setNigeSim({ ...nige, source: "貼付" });
       if (kim) setKimari(kim);
       const got = [nige ? "逃げシミュ" : null, kim ? "決まり手" : null].filter(Boolean).join("・");
       setPMsg(msgKey, `✓ ${got}を読み取りました（決まり手は「${kimariPeriod}」で評価。期間切替可）`);
@@ -2087,19 +2333,19 @@ export default function App() {
     const okRacer = parseRacer(text, "basic");
     const okSt = parseStPaste(text, "basic");
     const okKimari = parseKimari(text, "basic");
-    const got = [okRacer ? "枠別成績" : null, okSt ? "平均ST" : null, okKimari ? "決まり手/逃げ" : null].filter(Boolean);
+    const got = [okRacer ? "枠別成績(貼付)" : null, okSt ? "平均ST" : null, okKimari ? "決まり手/逃げ" : null].filter(Boolean);
     if (got.length) {
       setPMsg("basic", `✓ ${got.join("・")}を一括読み取りしました`);
       return true;
     }
-    setPMsg("basic", "枠別成績・平均ST・決まり手/逃げを読み取れませんでした。枠別情報ページを広めにコピーしてください");
+    setPMsg("basic", "平均ST・決まり手/逃げを読み取れませんでした。枠別成績はDBから自動反映されます。");
     return false;
   };
 
   const PANELS = {
     basic: {
-      title: "📋 枠別情報一括",
-      help: "枠別情報ページを広めにコピペ。枠別成績・平均ST・逃げシミュレーション・決まり手を一括で読み取ります。平均STは今期/直近6ヶ月/直近3ヶ月/直近1ヶ月/当地/一般戦/SG/G1/初日/最終日/ナイター/F持に対応。",
+      title: "📋 補助データ一括",
+      help: "平均ST・逃げシミュレーション・決まり手を貼り付け補助で読み取ります。枠別成績はDBから自動反映されます。",
       parse: parseBasicInfo,
     },
   };
@@ -2157,6 +2403,73 @@ export default function App() {
     return () => { alive = false; };
   }, []);
 
+
+  useEffect(() => {
+    let alive = true;
+    const regnos = [1, 2, 3, 4, 5, 6]
+      .map((b) => Number(racerProfiles?.[b]?.regNo || 0))
+      .filter(Boolean);
+    if (!regnos.length) {
+      setDbRacerRows([]);
+      setDbRacerStatus("DB選手成績：選手未取得");
+      return () => { alive = false; };
+    }
+    if (!CORRECTION_TABLE_ENABLED) {
+      setDbRacerStatus("DB選手成績：ENVなし");
+      return () => { alive = false; };
+    }
+    setDbRacerStatus("DB選手成績：読込中");
+    fetchRaceResultsForRacers(regnos, 365)
+      .then((rows) => {
+        if (!alive) return;
+        setDbRacerRows(Array.isArray(rows) ? rows : []);
+        setDbRacerStatus(`DB選手成績：読込済 ${Array.isArray(rows) ? rows.length : 0}走`);
+      })
+      .catch((e) => {
+        console.error("race_results course stats load error", e);
+        if (alive) {
+          setDbRacerRows([]);
+          setDbRacerStatus(`DB選手成績：失敗 ${String(e?.message || e).slice(0, 60)}`);
+        }
+      });
+    return () => { alive = false; };
+  }, [JSON.stringify([1,2,3,4,5,6].map((b) => racerProfiles?.[b]?.regNo || "")), venue]);
+
+  useEffect(() => {
+    if (!dbRacerRows.length || !Object.keys(racerProfiles || {}).length) return;
+    const stats = buildRacerCourseStatsFromDb(dbRacerRows, racerProfiles, courses, venue);
+    setRacerStats(stats);
+  }, [dbRacerRows, racerProfiles, courses, venue]);
+
+  useEffect(() => {
+    let alive = true;
+    const placeNo = PLACE_NO_BY_VENUE[venue] || null;
+    if (!placeNo) {
+      setDbNigeRows([]);
+      setNigeStatus("逃げシミュ：場未選択");
+      return () => { alive = false; };
+    }
+    if (!CORRECTION_TABLE_ENABLED) {
+      setNigeStatus("逃げシミュ：ENVなし");
+      return () => { alive = false; };
+    }
+    setNigeStatus("逃げシミュ：DB読込中");
+    fetchRaceResultsForVenue(placeNo, 365)
+      .then((rows) => {
+        if (!alive) return;
+        setDbNigeRows(Array.isArray(rows) ? rows : []);
+        setNigeStatus(`逃げシミュ：DB読込済 ${Array.isArray(rows) ? rows.length : 0}行`);
+      })
+      .catch((e) => {
+        console.error("escape simulation db load error", e);
+        if (alive) {
+          setDbNigeRows([]);
+          setNigeStatus(`逃げシミュ：失敗 ${String(e?.message || e).slice(0, 60)}`);
+        }
+      });
+    return () => { alive = false; };
+  }, [venue]);
+
   const result = useMemo(() => {
     if (!venue) return null;
     const useDisplayCorrection = usesDisplayCorrection(venue);
@@ -2209,6 +2522,15 @@ export default function App() {
     const dup = new Set(Object.values(courses)).size !== 6;
     return { avg, rows, rank, racerRank, dup, season: curSeason, usingSeasonal };
   }, [inputs, venue, wind, courses, racerStats, racerCat, raceDate]);
+
+  useEffect(() => {
+    if (!dbNigeRows.length || !result?.rows?.length) return;
+    const sim = buildEscapeSimulationFromDb(dbNigeRows, courses, result.rows, racerStats, racerCat, sts, fHold, fSts, wind);
+    if (sim && sim.n) {
+      setNigeSim(sim);
+      setNigeStatus(`逃げシミュ：DB反映 ${sim.n}R`);
+    }
+  }, [dbNigeRows, courses, result, racerStats, racerCat, sts, fHold, fSts, wind]);
 
   // スリット予測（平均ST／F持ちはF後STを優先、不明はそのままマーク表示）
   const slit = useMemo(() => {
@@ -3940,7 +4262,7 @@ export default function App() {
           {stTable ? (
             <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ ST表 読込済（切替で自動反映）</span>
           ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>※枠別情報一括を貼り付けると有効</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>※自動取得または補助データ貼付で有効</span>
           )}
         </div>
 
@@ -3964,9 +4286,9 @@ export default function App() {
             ))}
           </select>
           {racerStats ? (
-            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 選手成績 読込済（切替で自動反映）</span>
+            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 選手成績 DB自動反映中（{dbRacerStatus}）</span>
           ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>※枠別情報一括を貼り付けると有効</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>{dbRacerStatus}</span>
           )}
         </div>
 
@@ -3992,7 +4314,12 @@ export default function App() {
           {kimari ? (
             <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 決まり手 読込済</span>
           ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>※枠別情報一括を貼り付けると有効</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>決まり手は貼付情報を使用</span>
+          )}
+          {nigeSim ? (
+            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ {nigeStatus}</span>
+          ) : (
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>{nigeStatus}</span>
           )}
         </div>
 
@@ -4218,7 +4545,7 @@ export default function App() {
                   <span style={{
                     background: "#0e1b2c", borderRadius: 5, padding: "3px 7px",
                     fontWeight: 800, color: "#7da3c8",
-                  }}>枠別（{racerCat}）</span>
+                  }}>枠別DB（{racerCat}・{courses[b]}コース{racerStats.n?.[racerCat]?.[b - 1] ? ` n=${racerStats.n[racerCat][b - 1]}` : ""}）</span>
                   {racerStats.win1?.[racerCat]?.[b - 1] != null && (
                     <span>1着 <b style={{ color: "#fff" }}>{racerStats.win1[racerCat][b - 1]}%</b></span>
                   )}
@@ -4592,7 +4919,7 @@ export default function App() {
             {nigeSim && (
               <div style={{ marginBottom: 20 }}>
                 <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8", marginBottom: 8 }}>
-                  逃げシミュレーション（枠別情報）
+                  逃げシミュレーション（DB強化版・進入変更対応）
                 </div>
                 {(() => {
                   const byBoat = Object.fromEntries(result.rows.map((r) => [r.boat, r]));
@@ -4616,11 +4943,39 @@ export default function App() {
                           <span style={{ color: "#7da3c8" }}>内部反映済</span>
                         )}
                       </div>
+                      {nigeSim.trustScore != null && (
+                        <div style={{
+                          background: "#0e1b2c", border: "1px solid #2c4762", borderRadius: 10,
+                          padding: "10px 12px", marginBottom: 8, color: "#9db5cc", fontSize: 12,
+                          display: "grid", gap: 6,
+                        }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                            <span style={{ fontWeight: 900, color: nigeSim.trustScore >= 70 ? "#5dd39e" : nigeSim.trustScore < 45 ? "#ff7b7b" : "#f9c513" }}>
+                              イン逃げ信頼度：{nigeSim.trustScore}%（{nigeSim.alert}）
+                            </span>
+                            <span>母数 <b style={{ color: "#fff" }}>{nigeSim.n}</b>R / 逃げ <b style={{ color: "#fff" }}>{nigeSim.nigeN}</b>回</span>
+                          </div>
+                          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                            {nigeSim.c1RacerWin != null && <span>1C本人1着 <b style={{ color: "#fff" }}>{nigeSim.c1RacerWin}%</b></span>}
+                            {nigeSim.stAdv != null && <span>ST優位 <b style={{ color: nigeSim.stAdv > 0 ? "#5dd39e" : "#ff7b7b" }}>{nigeSim.stAdv > 0 ? "+" : ""}{nigeSim.stAdv.toFixed(2)}</b></span>}
+                            {nigeSim.wall2 != null && <span>2C壁性能 <b style={{ color: nigeSim.wall2 >= 55 ? "#5dd39e" : nigeSim.wall2 <= 35 ? "#ff7b7b" : "#fff" }}>{nigeSim.wall2}</b></span>}
+                            {nigeSim.attack3 != null && <span>3C攻撃警戒 <b style={{ color: nigeSim.attack3 >= 45 ? "#ff7b7b" : "#fff" }}>{nigeSim.attack3}</b></span>}
+                          </div>
+                          {nigeSim.failKimarite && (
+                            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", fontSize: 11 }}>
+                              <span style={{ color: "#7da3c8" }}>逃げ失敗時：</span>
+                              {Object.entries(nigeSim.failKimarite).filter(([,v]) => v).map(([k,v]) => (
+                                <span key={k}>{k} <b style={{ color: "#fff" }}>{v}</b></span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
                       <div style={{ overflowX: "auto" }}>
                         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 480 }}>
                           <thead>
                             <tr style={{ color: "#7da3c8", fontSize: 10 }}>
-                              {["艇", "逃がし2着", "逃がし3着", "1-X出目"].map((h, i) => (
+                              {["艇", "進入", "逃がし2着", "逃がし3着", "1-X出目"].map((h, i) => (
                                 <th key={h} style={{
                                   padding: "5px 6px", textAlign: i === 0 ? "left" : "center",
                                   borderBottom: "1px solid #2c4762", whiteSpace: "nowrap",
@@ -4646,6 +5001,9 @@ export default function App() {
                                       alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 12,
                                     }}>{b}</span>
                                   </td>
+                                  <td style={{ padding: "7px 6px", textAlign: "center", color: "#9db5cc" }}>
+                                    {courses[b] || b}C
+                                  </td>
                                   <td style={{ padding: "7px 6px", textAlign: "center", color: "#e8eef5" }}>
                                     {s2 != null ? `${s2}%` : "−"}
                                   </td>
@@ -4662,7 +5020,7 @@ export default function App() {
                         </table>
                       </div>
                       <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 4 }}>
-                        補正値は内部計算のみに使用しています。
+                        進入変更時は「艇番」ではなく現在の進入コースに合わせて逃がし率・DB枠別成績を再反映します。
                       </div>
                     </>
                   );
