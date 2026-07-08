@@ -46,7 +46,7 @@ function buildRacerCourseStatsFromDb(rawRows, profiles, courses, venueName) {
   const stats = emptyRateStats();
   const placeNo = PLACE_NO_BY_VENUE[venueName] || null;
   const cats = [
-    { label: "今期", days: 365 },
+    { label: "直近1年", days: 365 },
     { label: "直近6ヶ月", days: 180 },
     { label: "直近3ヶ月", days: 90 },
     { label: "直近1ヶ月", days: 30 },
@@ -126,7 +126,7 @@ async function fetchRaceResultsForVenue(placeNo, days = 365) {
   return await fetchRestPages("race_results", qs, 50000);
 }
 
-function buildEscapeSimulationFromDb(rows, currentCourses = {}, currentRows = null, racerStats = null, racerCat = "今期", sts = {}, fHold = {}, fSts = {}, wind = "無風") {
+function buildEscapeSimulationFromDb(rows, currentCourses = {}, currentRows = null, racerStats = null, racerCat = "直近6ヶ月", sts = {}, fHold = {}, fSts = {}, wind = "無風") {
   const byRace = new Map();
   for (const r of rows || []) {
     if (r?.race_date == null || r?.place_no == null || r?.race_no == null) continue;
@@ -1175,18 +1175,18 @@ export default function App() {
   const [nigeStatus, setNigeStatus] = useState("逃げシミュ：未取得");
 
   // 選手成績 {win:{区分:[6]}, ren2:{区分:[6]}, ren3:{区分:[6]}}
-  const RACER_CATS = ["今期", "直近6ヶ月", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "女子戦"];
+  const RACER_CATS = ["直近6ヶ月", "直近1年", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "女子戦"];
   const [racerStats, setRacerStats] = useState(null);
-  const [racerCat, setRacerCat] = useState("今期");
+  const [racerCat, setRacerCat] = useState("直近6ヶ月");
   // 期間比較（買い目の被りを見る）
-  const [cmpA, setCmpA] = useState("今期");
+  const [cmpA, setCmpA] = useState("直近6ヶ月");
   const [cmpB, setCmpB] = useState("直近6ヶ月");
   const [cmpMode, setCmpMode] = useState("all"); // "all"=全部反映 / "overlap"=被りのみ反映
 
   // ── 平均ST表（基本情報ページ）の期間選択 ──
-  const ST_PERIODS = ["今期", "直近6ヶ月", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "初日", "最終日", "ナイター", "F持"];
+  const ST_PERIODS = ["直近6ヶ月", "直近1年", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "初日", "最終日", "ナイター", "F持"];
   const [stTable, setStTable] = useState(null);
-  const [stPeriod, setStPeriod] = useState("今期");
+  const [stPeriod, setStPeriod] = useState("直近6ヶ月");
 
   const applyStTable = (table, period) => {
     const row = table[period];
@@ -1422,9 +1422,8 @@ export default function App() {
 
   const apiCacheNote = (data, label = "共有キャッシュ") => {
     if (!data || !data.cached) return "";
-    const src = data.cacheWarning ? `（${data.cacheWarning}）` : "";
-    const age = Number.isFinite(Number(data.cacheAgeSec)) ? `・${data.cacheAgeSec}秒前` : "";
-    return `／${label}${src}${age}`;
+    const age = Number.isFinite(Number(data.cacheAgeSec)) ? `${data.cacheAgeSec}秒前` : "時刻不明";
+    return `／データ取得済・${age}`;
   };
   const applyBoatcastRows = (rows, { displayDisabled = false } = {}) => {
     if (!Array.isArray(rows) || !rows.length || displayDisabled) return;
@@ -2016,7 +2015,7 @@ export default function App() {
         };
 
         return {
-          "今期": row(["今期"]),
+          "直近1年": row(["今期", "直近1年"]),
           "直近6ヶ月": recentRow(6),
           "直近3ヶ月": recentRow(3),
           "直近1ヶ月": recentRow(1),
@@ -3035,7 +3034,7 @@ export default function App() {
       const oddsMedian = oddsMeans.length
         ? [...oddsMeans].sort((a, b) => a - b)[Math.floor(oddsMeans.length / 2)]
         : null;
-      // 「人気落とし」: 今期(racerCat)の1着率が平均以下だが、他区分の最高1着率が今期＋3%以上
+      // 「人気落とし」: 選択期間(racerCat)の1着率が平均以下だが、他区分の最高1着率が選択期間＋3%以上
       const w1cur = (i) => racerStats?.win1?.[racerCat]?.[i] ?? null;
       const w1best = (i) => {
         if (!racerStats?.win1) return null;
@@ -3062,11 +3061,11 @@ export default function App() {
         if (r.crit.motor === true) {
           reasons.push("モーター良");
         }
-        // 根拠C: 人気落とし（今期↓・他区分↑）
+        // 根拠C: 人気落とし（選択期間↓・他区分↑）
         const i = r.boat - 1;
         const cur = w1cur(i), best = w1best(i);
         if (cur != null && best != null && r1Avg != null && cur <= r1Avg && best >= cur + 3) {
-          reasons.push(`直近6ヶ月等は好成績（${best.toFixed(0)}%）も今期で人気落とし`);
+          reasons.push(`直近6ヶ月等は好成績（${best.toFixed(0)}%）も直近1年で人気落とし`);
         }
         if (reasons.length === 0) continue;
         // 人気薄フィルタ: オッズがあれば中央値以上（人気薄）を優先採用。なければ評価中位以下のみ。
