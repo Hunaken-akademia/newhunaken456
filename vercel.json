@@ -1,5 +1,5 @@
 {
-  "installCommand": "corepack enable && corepack prepare pnpm@10.15.1 --activate && pnpm install --no-frozen-lockfile --config.fetch-retries=3",
-  "buildCommand": "pnpm run build",
+  "installCommand": "npm ci --no-audit --no-fund --legacy-peer-deps",
+  "buildCommand": "npm run build",
   "outputDirectory": "dist"
 }
