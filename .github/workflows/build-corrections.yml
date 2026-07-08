@@ -1,0 +1,41 @@
+name: build-corrections
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: '補正に使う日数'
+        required: true
+        default: '365'
+      wind_k:
+        description: '風補正の縮小推定K'
+        required: true
+        default: '20'
+  schedule:
+    # JST 8:00 = UTC 23:00。daily-ingest後に補正テーブルを更新する想定。
+    - cron: '0 23 * * *'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build correction tables
+        working-directory: pipeline
+        run: |
+          DAYS="${{ github.event.inputs.days || '365' }}"
+          WIND_K="${{ github.event.inputs.wind_k || '20' }}"
+          node build_corrections.mjs "$DAYS" "$WIND_K"
