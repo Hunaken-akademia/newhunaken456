@@ -32,6 +32,90 @@ function ymdToDate(ymd) {
   return /^\d{8}$/.test(s) ? `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}` : null;
 }
 
+
+const PLACE_NO_BY_VENUE = {
+  "桐生": 1, "戸田": 2, "江戸川": 3, "平和島": 4, "多摩川": 5, "浜名湖": 6,
+  "蒲郡": 7, "常滑": 8, "津": 9, "三国": 10, "びわこ": 11, "住之江": 12,
+  "尼崎": 13, "鳴門": 14, "丸亀": 15, "児島": 16, "宮島": 17, "徳山": 18,
+  "下関": 19, "若松": 20, "芦屋": 21, "福岡": 22, "唐津": 23, "大村": 24,
+};
+
+function parseFLCount(flText, letter) {
+  const s = String(flText || "").replace(/[Ｆ]/g, "F").replace(/[Ｌ]/g, "L").replace(/\s+/g, "");
+  const re = new RegExp(`${letter}(\\d*)`, "i");
+  const m = s.match(re);
+  if (!m) return 0;
+  const n = Number(m[1] || 1);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 1;
+}
+
+function preRaceRowsFromRacers({ venue, raceNo, ymd, racers, source = "BOATCAST" }) {
+  const raceDate = ymdToDate(ymd);
+  const placeNo = PLACE_NO_BY_VENUE[venue];
+  if (!raceDate || !placeNo || !Array.isArray(racers) || racers.length === 0) return [];
+
+  return racers
+    .filter((r) => r && Number(r.boat) >= 1 && Number(r.boat) <= 6)
+    .map((r) => {
+      const fCount = parseFLCount(r.fl, "F");
+      const lCount = parseFLCount(r.fl, "L");
+      const preAvgST = numberOrNull(r.avgST);
+      return {
+        race_date: raceDate,
+        place_no: placeNo,
+        race_no: Number(raceNo),
+        boat: Number(r.boat),
+        regno: r.regNo ? Number(r.regNo) : null,
+        racer_name: r.name || null,
+        f_count: fCount,
+        l_count: lCount,
+        f_hold: fCount > 0,
+        l_hold: lCount > 0,
+        pre_avg_st: Number.isFinite(preAvgST) ? preAvgST : null,
+        source,
+        captured_at: new Date().toISOString(),
+      };
+    })
+    .filter((r) => r.regno && Number.isFinite(r.regno));
+}
+
+async function savePreRaceStatus({ venue, raceNo, ymd, racers, source = "BOATCAST" }) {
+  if (!ENABLE_PERSISTENT_CACHE) return { ok: false, skipped: true, reason: "SUPABASE_SERVICE_KEYなし" };
+  const rows = preRaceRowsFromRacers({ venue, raceNo, ymd, racers, source });
+  if (!rows.length) return { ok: false, skipped: true, reason: "保存対象なし" };
+  try {
+    await supabaseCacheRequest("pre_race_status?on_conflict=race_date,place_no,race_no,boat", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(rows),
+    });
+    return { ok: true, count: rows.length };
+  } catch (e) {
+    console.warn("pre_race_status write skipped:", e?.message || e);
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+async function fetchBoatcastPreRaceStatusPayload(venue, raceNo, ymd) {
+  const urls = boatcastRaceUrls(venue, raceNo, ymd);
+  if (!urls) throw new Error(`${venue}の場コードが見つかりません`);
+  const str3 = await fetchHtml(urls.str3);
+  const racers = parseBoatcastRacerInfo(str3);
+  const saved = await savePreRaceStatus({ venue, raceNo, ymd, racers, source: "BOATCAST_STR3" });
+  return {
+    ok: true,
+    action: "prerace",
+    appVersion: "v109",
+    venue,
+    race: Number(raceNo),
+    date: ymd,
+    source: "BOATCAST_STR3",
+    racersCount: racers.length,
+    preRaceStatusSaved: saved,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
 async function supabaseCacheRequest(path, options = {}) {
   if (!ENABLE_PERSISTENT_CACHE) return null;
   const res = await fetch(`${SUPABASE_REST_URL}/rest/v1/${path}`, {
@@ -2041,6 +2125,7 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
   if (JCD[venue]) {
     try {
       const bc = await fetchBoatcastPayload(venue, raceNo, ymd);
+      const preRaceStatusSaved = await savePreRaceStatus({ venue, raceNo, ymd, racers: bc.racers, source: "BOATCAST" });
       return {
         ok: true,
         appVersion: "v109",
@@ -2058,6 +2143,7 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
         displayErrorDetail: bc.displayErrorDetail || "",
         displayDisabled: !!bc.displayDisabled,
         racers: bc.racers,
+        preRaceStatusSaved,
         motors: bc.motors,
         weather: bc.weather,
         odds: bc.odds,
@@ -2187,6 +2273,21 @@ export default async function handler(req, res) {
     const raceNo = Number(race);
     if (!raceNo || raceNo < 1 || raceNo > 12) {
       res.status(400).json({ ok: false, error: "race は 1〜12 を指定してください" });
+      return;
+    }
+
+    if (action === "prerace") {
+      res.setHeader("Cache-Control", "no-store");
+      if (!venue) {
+        res.status(400).json({ ok: false, error: "venue を指定してください" });
+        return;
+      }
+      if (!JCD[venue]) {
+        res.status(400).json({ ok: false, error: `${venue}はBOATCAST取得対象外です` });
+        return;
+      }
+      const payload = await fetchBoatcastPreRaceStatusPayload(venue, raceNo, ymd);
+      res.status(200).json(payload);
       return;
     }
 
