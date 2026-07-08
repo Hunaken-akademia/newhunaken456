@@ -100,6 +100,85 @@ function preRaceRowsFromRacers({ venue, raceNo, ymd, racers, source = "BOATCAST"
     .filter((r) => r.regno && Number.isFinite(r.regno));
 }
 
+
+function exhibitionRowsFromDisplay({ venue, raceNo, ymd, rows, source = "BOATCAST" }) {
+  const raceDate = ymdToDate(ymd);
+  const placeNo = PLACE_NO_BY_VENUE[venue];
+  if (!raceDate || !placeNo || !Array.isArray(rows) || rows.length === 0) return [];
+
+  const numericRows = rows
+    .filter((r) => r && Number(r.boat) >= 1 && Number(r.boat) <= 6)
+    .map((r) => {
+      const exTime = numberOrNull(r.tenji);
+      const lap = numberOrNull(r.isshu);
+      const turn = numberOrNull(r.mawari);
+      const straight = numberOrNull(r.chokusen);
+      const total = [exTime, lap, turn, straight].every((v) => Number.isFinite(v))
+        ? exTime + lap + turn + straight
+        : ([exTime, lap, turn].every((v) => Number.isFinite(v)) ? exTime + lap + turn : null);
+      return { raw: r, exTime, lap, turn, straight, total };
+    });
+
+  const exVals = numericRows.map((r) => r.exTime).filter((v) => Number.isFinite(v));
+  const totalVals = numericRows.map((r) => r.total).filter((v) => Number.isFinite(v));
+  const exAvg = exVals.length ? exVals.reduce((a, b) => a + b, 0) / exVals.length : null;
+  const totalAvg = totalVals.length ? totalVals.reduce((a, b) => a + b, 0) / totalVals.length : null;
+
+  const rankBy = (key) => {
+    const sorted = numericRows
+      .filter((r) => Number.isFinite(r[key]))
+      .sort((a, b) => a[key] - b[key]);
+    const out = new Map();
+    sorted.forEach((r, i) => out.set(Number(r.raw.boat), i + 1));
+    return out;
+  };
+  const exRank = rankBy('exTime');
+  const totalRank = rankBy('total');
+
+  return numericRows.map(({ raw, exTime, lap, turn, straight, total }) => {
+    const racer = raw.racer || {};
+    const boat = Number(raw.boat);
+    const course = Number(raw.course || boat);
+    return {
+      race_date: raceDate,
+      place_no: placeNo,
+      race_no: Number(raceNo),
+      boat,
+      course: Number.isFinite(course) && course >= 1 && course <= 6 ? course : boat,
+      regno: racer.regNo ? Number(racer.regNo) : null,
+      racer_name: racer.name || null,
+      ex_time: Number.isFinite(exTime) ? exTime : null,
+      lap: Number.isFinite(lap) ? lap : null,
+      turn: Number.isFinite(turn) ? turn : null,
+      straight: Number.isFinite(straight) ? straight : null,
+      total_time: Number.isFinite(total) ? total : null,
+      ex_rank: exRank.get(boat) || null,
+      total_rank: totalRank.get(boat) || null,
+      ex_diff: Number.isFinite(exTime) && Number.isFinite(exAvg) ? Number((exAvg - exTime).toFixed(3)) : null,
+      total_diff: Number.isFinite(total) && Number.isFinite(totalAvg) ? Number((totalAvg - total).toFixed(3)) : null,
+      source,
+      captured_at: new Date().toISOString(),
+    };
+  }).filter((r) => r.regno && (r.ex_time != null || r.lap != null || r.turn != null || r.straight != null));
+}
+
+async function saveExhibitionRows({ venue, raceNo, ymd, rows, source = "BOATCAST" }) {
+  if (!ENABLE_PERSISTENT_CACHE) return { ok: false, skipped: true, reason: "SUPABASE_SERVICE_KEYなし" };
+  const payload = exhibitionRowsFromDisplay({ venue, raceNo, ymd, rows, source });
+  if (!payload.length) return { ok: false, skipped: true, reason: "保存対象なし" };
+  try {
+    await supabaseCacheRequest("exhibition?on_conflict=race_date,place_no,race_no,boat", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(payload),
+    });
+    return { ok: true, count: payload.length };
+  } catch (e) {
+    console.warn("exhibition write skipped:", e?.message || e);
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
 async function savePreRaceStatus({ venue, raceNo, ymd, racers, source = "BOATCAST" }) {
   if (!ENABLE_PERSISTENT_CACHE) return { ok: false, skipped: true, reason: "SUPABASE_SERVICE_KEYなし" };
   const rows = preRaceRowsFromRacers({ venue, raceNo, ymd, racers, source });
@@ -1512,7 +1591,11 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
     }
   }
 
-  if (rows) rows = rows.map((r) => ({ ...r, racer: racersByBoat[r.boat] || null }));
+  let exhibitionSaved = { ok: false, skipped: true, reason: "展示未取得" };
+  if (rows) {
+    rows = rows.map((r) => ({ ...r, racer: racersByBoat[r.boat] || null }));
+    exhibitionSaved = await saveExhibitionRows({ venue, raceNo, ymd: dateStr, rows, source: "BOATCAST" });
+  }
 
   let weather = parseBoatcastResultWeather(weatherPrev);
   if (!weather.windKey) weather = parseBoatcastResultWeather(weatherCurrent);
@@ -1547,6 +1630,7 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
     oddsCount: oddsInfo?.ok ? oddsInfo.count : 0,
     oddsUrl: oddsInfo?.ok ? oddsInfo.url : null,
     oddsError: oddsInfo && !oddsInfo.ok ? oddsInfo.error : "",
+    exhibitionSaved,
   };
 }
 
