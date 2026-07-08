@@ -31,6 +31,13 @@ const VENUES = {
   "大村":   [63.0, 11.9, 11.7, 7.3, 5.2, 1.3],
 };
 
+const PLACE_NO_BY_VENUE = {
+  "桐生": 1, "戸田": 2, "江戸川": 3, "平和島": 4, "多摩川": 5, "浜名湖": 6,
+  "蒲郡": 7, "常滑": 8, "津": 9, "三国": 10, "びわこ": 11, "住之江": 12,
+  "尼崎": 13, "鳴門": 14, "丸亀": 15, "児島": 16, "宮島": 17, "徳山": 18,
+  "下関": 19, "若松": 20, "芦屋": 21, "福岡": 22, "唐津": 23, "大村": 24,
+};
+
 // ════════════════════════════════════════════════
 // ①-S 場別・季節別 コース別1着率（%）
 //   各場ごとに { 春,夏,秋,冬 } の [1C,2C,3C,4C,5C,6C] 1着率。
@@ -208,6 +215,7 @@ function sortTicketsForDisplay(tickets) {
 //       ["1-2-5","1-2-6","1-3-5","1-3-6"] → ["1-23-56"]
 //   ※ 展開すると元の点数集合に完全一致する組み合わせだけをまとめる（過不足ゼロ）。
 //   ※ 内部の点数カウントやオッズ計算には使わない。あくまで画面表示用。
+
 const TICKET_AUTO_SAVE_KEY = "hunaken_v63_ticket_autosave_v2";
 const LEGACY_DEVICE_AUTO_SAVE_KEY = "hunaken_v63_device_autosave_v1";
 const AUTO_SAVE_NOTICE_KEY = "hunaken_v63_device_autosave_notice_v1";
@@ -649,6 +657,109 @@ function getVenueBase(venue, dateStr) {
   return { base: VENUES[venue], season, seasonal: false };
 }
 
+function toFiniteNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function fetchLatestCorrectionTables() {
+  if (!CLOUD_SAVE_ENABLED) return null;
+  const query = "id=eq.latest&select=id,updated_at,days,wind_k,venue_base,venue_base_season,wind&limit=1";
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/correction_tables?${query}`, {
+    headers: cloudHeaders(SUPABASE_ANON_KEY),
+  });
+  if (!res.ok) throw new Error(`correction_tables load failed: ${res.status}`);
+  const rows = await res.json();
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
+function buildCorrectionCache(table) {
+  const venueBaseByPlace = {};
+  const venueCountsByPlace = {};
+
+  for (const row of Array.isArray(table?.venue_base) ? table.venue_base : []) {
+    const placeNo = Number(row.place_no);
+    const course = Number(row.course);
+    const win1 = toFiniteNumber(row.win1);
+    const n = toFiniteNumber(row.n);
+    if (!placeNo || course < 1 || course > 6 || win1 == null) continue;
+    if (!venueBaseByPlace[placeNo]) venueBaseByPlace[placeNo] = Array(6).fill(null);
+    if (!venueCountsByPlace[placeNo]) venueCountsByPlace[placeNo] = Array(6).fill(null);
+    venueBaseByPlace[placeNo][course - 1] = win1;
+    venueCountsByPlace[placeNo][course - 1] = n;
+  }
+
+  // wind はK票由来の絶対風向（西/北東など）のため、アプリの「向かい風/追い風」と完全対応はしない。
+  // まずは同じ場・同じ風速帯の全風向を母数加重平均して、固定WINDの代替補正として使う。
+  const windAgg = {};
+  for (const row of Array.isArray(table?.wind) ? table.wind : []) {
+    const placeNo = Number(row.place_no);
+    const bin = Number(row.wspd_bin);
+    const course = Number(row.course);
+    const n = Math.max(0, Number(row.n || 0));
+    const diff = toFiniteNumber(row.shrunk_win1_diff);
+    if (!placeNo || !Number.isFinite(bin) || course < 1 || course > 6 || diff == null || n <= 0) continue;
+    const key = `${placeNo}|${bin}`;
+    if (!windAgg[key]) windAgg[key] = Array.from({ length: 6 }, () => ({ sum: 0, n: 0 }));
+    windAgg[key][course - 1].sum += diff * n;
+    windAgg[key][course - 1].n += n;
+  }
+
+  const windByPlaceBin = {};
+  for (const [key, arr] of Object.entries(windAgg)) {
+    const [placeNo, bin] = key.split("|");
+    if (!windByPlaceBin[placeNo]) windByPlaceBin[placeNo] = {};
+    windByPlaceBin[placeNo][bin] = arr.map((x) => x.n > 0 ? +(x.sum / x.n).toFixed(1) : null);
+  }
+
+  return {
+    raw: table || null,
+    updatedAt: table?.updated_at || null,
+    days: table?.days || null,
+    windK: table?.wind_k || null,
+    venueBaseByPlace,
+    venueCountsByPlace,
+    windByPlaceBin,
+  };
+}
+
+function windBinFromLabel(label) {
+  if (!label || label === "無風") return 0;
+  const m = String(label).match(/(\d+)/);
+  if (!m) return null;
+  const speed = Number(m[1]);
+  if (!Number.isFinite(speed)) return null;
+  if (speed === 0) return 0;
+  if (speed <= 2) return 1;
+  if (speed <= 4) return 2;
+  if (speed <= 6) return 3;
+  if (speed <= 8) return 4;
+  return 5;
+}
+
+function getVenueBaseWithCorrections(venue, dateStr, correctionCache) {
+  const fallback = getVenueBase(venue, dateStr);
+  const placeNo = PLACE_NO_BY_VENUE[venue];
+  const dbBase = placeNo ? correctionCache?.venueBaseByPlace?.[placeNo] : null;
+  if (Array.isArray(dbBase) && dbBase.filter((v) => v != null).length === 6) {
+    return { ...fallback, base: dbBase.map((v) => +Number(v).toFixed(1)), seasonal: false, dynamic: true };
+  }
+  return { ...fallback, dynamic: false };
+}
+
+function getWindAdjWithCorrections(venue, windLabel, course, correctionCache) {
+  const placeNo = PLACE_NO_BY_VENUE[venue];
+  const bin = windBinFromLabel(windLabel);
+  const arr = placeNo != null && bin != null ? correctionCache?.windByPlaceBin?.[placeNo]?.[bin] : null;
+  const db = Array.isArray(arr) ? toFiniteNumber(arr[course - 1]) : null;
+  if (db != null) return { value: db, dynamic: true };
+
+  const fixed = WIND?.[windLabel]?.[course - 1] != null && WIND?.["無風"]?.[course - 1] != null
+    ? +(WIND[windLabel][course - 1] - WIND["無風"][course - 1]).toFixed(1)
+    : 0;
+  return { value: fixed, dynamic: false };
+}
+
 
 // ════════════════════════════════════════════════
 // ②' 風別・コース別 1着率（全国平均）%
@@ -743,52 +854,114 @@ const LANE = {
   6: { bg: "#188038", fg: "#ffffff" },
 };
 
-
-const VENUE_ORDER = [
-  "桐生", "戸田", "江戸川", "平和島",
-  "多摩川", "浜名湖", "蒲郡", "常滑",
-  "津", "三国", "びわこ", "住之江",
-  "尼崎", "鳴門", "丸亀", "児島",
-  "宮島", "徳山", "下関", "若松",
-  "芦屋", "福岡", "唐津", "大村",
-];
-
-const AUTO_FETCH_VENUES = Object.keys(VENUES);
-const NO_ORIGINAL_DISPLAY_VENUES = ["江戸川"];
-const usesDisplayCorrection = (venueName) => !NO_ORIGINAL_DISPLAY_VENUES.includes(venueName);
-const MORNING_VENUES = ["三国", "鳴門", "徳山", "芦屋", "唐津"];
-const NIGHT_VENUES = ["桐生", "蒲郡", "住之江", "丸亀", "下関", "若松"];
-
-function raceScheduleProfile(venueName) {
-  if (MORNING_VENUES.includes(venueName)) return { start: 8 * 60 + 35, interval: 30 };
-  if (NIGHT_VENUES.includes(venueName)) return { start: 15 * 60 + 15, interval: 27 };
-  return { start: 10 * 60 + 40, interval: 30 };
-}
-
-function autoRaceForVenue(venueName, now = new Date()) {
-  const { start, interval } = raceScheduleProfile(venueName);
-  const minutes = now.getHours() * 60 + now.getMinutes();
-  const margin = 8;
-  for (let i = 0; i < 12; i++) {
-    const deadline = start + i * interval;
-    if (minutes <= deadline - margin) return String(i + 1);
-  }
-  return "12";
-}
-
-function todayDateValue() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
 const FIELDS = [
   { key: "tenji", label: "展示" },
-  { key: "isshu", label: "1周" },
-  { key: "mawari", label: "回り足" },
-  { key: "chokusen", label: "直線" },
+  { key: "isshu", label: "周回" },
+  { key: "mawari", label: "周り足" },
 ];
 
-const empty = () => ({ tenji: "", isshu: "", mawari: "", chokusen: "" });
+const empty = () => ({ tenji: "", isshu: "", mawari: "" });
+const emptyInputs = () => ({
+  1: empty(), 2: empty(), 3: empty(), 4: empty(), 5: empty(), 6: empty(),
+});
+const emptyPasteTexts = () => ({ basic: "", tenji: "", st: "", motor: "", racer: "", kimari: "", odds: "" });
+const emptyPasteMsgs = () => ({ basic: "", tenji: "", st: "", motor: "", racer: "", kimari: "", odds: "" });
+const emptyBoatValues = () => ({ 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" });
+const defaultCourses = () => ({ 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6 });
+const defaultFHold = () => ({ 1: false, 2: false, 3: false, 4: false, 5: false, 6: false });
+const emptyMotors = () => ({ 1: null, 2: null, 3: null, 4: null, 5: null, 6: null });
+
+// Android/iPhone/PCでコピー形式が違っても読み取りやすいように、貼り付け文字を正規化
+const normalizePasteText = (value = "") => String(value)
+  .normalize("NFKC")
+  .replace(/\r\n?/g, "\n")
+  .replace(/[\u00A0\u1680\u180E\u2000-\u200D\u202F\u205F\u2060\uFEFF]/g, " ")
+  .replace(/\u3000/g, " ")
+  .replace(/\uFFFC/g, "")
+  .replace(/[‐‑‒–—―−]/g, "-")
+  .replace(/[，、]/g, ",")
+  .replace(/[％]/g, "%")
+  .replace(/\t+/g, "\t")
+  .replace(/[ ]{2,}/g, " ")
+  .split("\n")
+  .map((line) => line.trim())
+  .join("\n")
+  .replace(/\n{3,}/g, "\n\n")
+  // AndroidのDM経由では見出しと数値が連結されやすいので、主要ラベルだけ先に正規化
+  .replace(/直近\s*6\s*[ヶヵカ]?月/g, "直近6ヶ月")
+  .replace(/直近\s*3\s*[ヶヵカ]?月/g, "直近3ヶ月")
+  .replace(/直近\s*1\s*[ヶヵカ]?月/g, "直近1ヶ月")
+  .replace(/直近\s*1\s*年/g, "直近1年")
+  .replace(/SG\s*\/\s*G\s*1/g, "SG/G1")
+  .replace(/1\s*着\s*率/g, "1着率")
+  .replace(/2\s*連\s*対\s*率/g, "2連対率")
+  .replace(/3\s*連\s*対\s*率/g, "3連対率")
+  .replace(/平均\s*ST/g, "平均ST")
+  .replace(/ST\s*順位/g, "ST順位")
+  .replace(/ST\s*考察/g, "ST考察")
+  .replace(/周り\s*足/g, "周り足")
+  .replace(/まわり\s*足/g, "周り足")
+  .replace(/回り\s*足/g, "周り足");
+
+// 解析用ノイズ除去。表内の「詳細」「広告」などは数値解析の邪魔なので読む前だけ消す。
+const stripPasteNoise = (value = "") => normalizePasteText(value)
+  .replace(/【\s*ADVERTISEMENT\s*】/gi, "\n")
+  .replace(/ADVERTISEMENT/gi, "\n")
+  .replace(/広告を見てコンテンツを開く/g, "\n")
+  .replace(/超展開データ\s*New!?/g, "\n")
+  .replace(/超展開\s*データ/g, "\n")
+  .replace(/ST分布値一覧/g, "\n")
+  .replace(/コース別全艇成績1着率一覧表/g, "\n")
+  .replace(/逃がし時全艇複勝率一覧表/g, "\n")
+  .replace(/負けた時の決り手一覧表/g, "\n")
+  .replace(/詳細/g, "\n")
+  .replace(/\n{3,}/g, "\n\n");
+
+const parseNumToken = (token) => {
+  if (token == null) return null;
+  let t = String(token).trim();
+  if (/^[-ー]$/.test(t)) return null;
+  // 直前情報の展示STは F.01 / L.01 のように表示されることがある。
+  // ここではF持ち判定には使わず、数値読み取りを壊さないためだけに接頭辞を外す。
+  t = t.replace(/^[FL](?=\.?\d)/i, "");
+  if (/^\.\d+$/.test(t)) return Number(`0${t}`);
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+};
+
+const readFixedDecimals = (seg, n, { allowDash = false, decimals = 2 } = {}) => {
+  if (seg == null) return null;
+  const d = `{${decimals}}`;
+  const re = allowDash
+    ? new RegExp(`(?:[FL]?\\d+\\.\\d${d}|[FL]?\\.\\d${d}|[-ー])`, "gi")
+    : new RegExp(`(?:[FL]?\\d+\\.\\d${d}|[FL]?\\.\\d${d})`, "gi");
+  const vals = [];
+  let m;
+  while (vals.length < n && (m = re.exec(seg))) vals.push(parseNumToken(m[0]));
+  return vals.length >= n ? vals : null;
+};
+
+const readPercentValues = (seg, n = 6) => {
+  if (seg == null) return null;
+  const vals = [];
+  const re = /(\d{1,3}\.\d)%/g;
+  let m;
+  while (vals.length < n && (m = re.exec(seg))) vals.push(Number(m[1]));
+  return vals.length >= n ? vals : null;
+};
+
+// 値と母数（出走数「(36)」など）をペアで読む版。縮小推定用。
+// 母数が付かない形式では n=null となり、従来通り（縮小なし）で動く。
+const readPercentValuesWithN = (seg, n = 6) => {
+  if (seg == null) return null;
+  const vals = [];
+  const re = /(\d{1,3}\.\d)%\s*(?:\(\s*(\d+)\s*\))?/g;
+  let m;
+  while (vals.length < n && (m = re.exec(seg))) {
+    vals.push({ v: Number(m[1]), n: m[2] != null ? Number(m[2]) : null });
+  }
+  return vals.length >= n ? vals : null;
+};
 
 // 平均ST選択肢 0.00〜0.40
 const ST_OPTIONS = Array.from({ length: 41 }, (_, i) => (i / 100).toFixed(2));
@@ -900,12 +1073,14 @@ export default function App() {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   });
   const [wind, setWind] = useState("無風");
-  const [courses, setCourses] = useState({ 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6 });
-  const [sts, setSts] = useState({ 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" });
-  const [fHold, setFHold] = useState({ 1: false, 2: false, 3: false, 4: false, 5: false, 6: false });
-  const [fSts, setFSts] = useState({ 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" }); // "" = 不明
-  const [tilts, setTilts] = useState({ 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" });
-  const [weights, setWeights] = useState({ 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" });
+  const [correctionTable, setCorrectionTable] = useState(null);
+  const [correctionStatus, setCorrectionStatus] = useState("補正未読込");
+  const [courses, setCourses] = useState(defaultCourses);
+  const [sts, setSts] = useState(emptyBoatValues);
+  const [fHold, setFHold] = useState(defaultFHold);
+  const [fSts, setFSts] = useState(emptyBoatValues); // "" = 不明
+  const [tilts, setTilts] = useState(emptyBoatValues);
+  const [weights, setWeights] = useState(emptyBoatValues);
 
   const setWeight = (b, v) => setWeights((p) => ({ ...p, [b]: v }));
 
@@ -915,48 +1090,45 @@ export default function App() {
   const toggleF = (b) => setFHold((p) => ({ ...p, [b]: !p[b] }));
   const setFSt = (b, v) => setFSts((p) => ({ ...p, [b]: v }));
 
-  // ── テキスト貼り付けからの自動入力（枠別情報一括のみ表示） ──
-  const [openPanel, setOpenPanel] = useState(null); // "basic"
-  const [pTexts, setPTexts] = useState({ basic: "", tenji: "", st: "", motor: "", racer: "", kimari: "", odds: "" });
-  const [pMsgs, setPMsgs] = useState({ basic: "", tenji: "", st: "", motor: "", racer: "", kimari: "", odds: "" });
-  const [autoLoading, setAutoLoading] = useState(false);
-  const [autoMsg, setAutoMsg] = useState("");
-  const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(true);
-  const [autoRefreshInfo, setAutoRefreshInfo] = useState("");
-  const [salesEnded, setSalesEnded] = useState(false);
-  const [venueNotHeld, setVenueNotHeld] = useState(false);
-  const [officialSchedule, setOfficialSchedule] = useState(null);
-  const [venueStatuses, setVenueStatuses] = useState({});
-  const [venueStatusLoading, setVenueStatusLoading] = useState(false);
-  const [prefetchInfo, setPrefetchInfo] = useState("");
-  const autoBusyRef = useRef(false);
-  const lastAutoFetchKeyRef = useRef("");
-  const lastAutoFetchAtRef = useRef(0);
-  const prefetchBusyKeysRef = useRef(new Set());
-  const lastPrefetchAtByKeyRef = useRef({});
-  const autoRefreshEnabledRef = useRef(autoRefreshEnabled);
-  useEffect(() => { autoRefreshEnabledRef.current = autoRefreshEnabled; }, [autoRefreshEnabled]);
-
-  // 展示・1周・回り足は、一度6艇分そろったら固定扱い。
-  // 3分ごとの自動更新では、固定データを再取得せず変動するオッズだけ更新する。
-  const hasCompleteAutoStaticData = (venueName = venue) => {
-    try {
-      if (!usesDisplayCorrection(venueName)) return true;
-      return [1, 2, 3, 4, 5, 6].every((b) => {
-        const r = inputs?.[b] || {};
-        return ["tenji", "isshu", "mawari"].every((k) => String(r[k] ?? "").trim() !== "");
+  // ── テキスト貼り付けからの自動入力（枠別情報は一括入力） ──
+  const [openPanel, setOpenPanel] = useState(null); // "basic" | "tenji" | "motor" | "odds"
+  const [pTexts, setPTexts] = useState(emptyPasteTexts);
+  const [pMsgs, setPMsgs] = useState(emptyPasteMsgs);
+  const [pasteResetKey, setPasteResetKey] = useState(0); // Androidでtextareaの表示が残る時の再描画用
+  const setPText = (k, v) => {
+    const clean = normalizePasteText(v);
+    setPTexts((p) => ({ ...p, [k]: clean }));
+  };
+  const setPMsg = (k, v) => setPMsgs((p) => ({ ...p, [k]: v }));
+  const handlePasteAreaPaste = (k, e) => {
+    const target = e.currentTarget;
+    const clip = e.clipboardData || window.clipboardData;
+    const pasted = clip?.getData?.("text/plain") || clip?.getData?.("Text") || "";
+    if (pasted) {
+      e.preventDefault();
+      const clean = normalizePasteText(pasted);
+      const start = target.selectionStart ?? target.value.length;
+      const end = target.selectionEnd ?? start;
+      const next = `${target.value.slice(0, start)}${clean}${target.value.slice(end)}`;
+      setPText(k, next);
+      requestAnimationFrame(() => {
+        try {
+          const pos = start + clean.length;
+          target.setSelectionRange(pos, pos);
+        } catch (_) { /* noop */ }
       });
-    } catch (e) {
-      return false;
+      return;
     }
+    // Androidの一部ブラウザはpasteイベント時にclipboardDataが空。既定貼り付け後に実DOMをstateへ同期する。
+    setTimeout(() => setPText(k, target.value), 0);
+    requestAnimationFrame(() => setPText(k, target.value));
+  };
+  const handlePasteAreaInput = (k, e) => {
+    setPText(k, e.currentTarget.value);
   };
 
-  const setPText = (k, v) => setPTexts((p) => ({ ...p, [k]: v }));
-  const setPMsg = (k, v) => setPMsgs((p) => ({ ...p, [k]: v }));
-
   // モーター情報 {no, rate, win1, ren2, ren3}
-  const [motors, setMotors] = useState({ 1: null, 2: null, 3: null, 4: null, 5: null, 6: null });
-  const [racerProfiles, setRacerProfiles] = useState({});
+  const [motors, setMotors] = useState(emptyMotors);
 
   // オッズ一覧 odds[firstBoat] = { "2-3": 22.2, ... }（3連単 1着→"2着-3着":オッズ）
   const [odds, setOdds] = useState(null);
@@ -1426,23 +1598,42 @@ export default function App() {
     }
   };
 
-  // すべてのコピペ欄・入力をクリア（保存レコードは消さない）
+  // すべてのコピペ欄・入力をクリア（保存レコード・端末内の買い目保存は消さない）
   const allClear = () => {
-    setPTexts({ basic: "", tenji: "", st: "", motor: "", racer: "", kimari: "", odds: "" });
-    setPMsgs({ basic: "", tenji: "", st: "", motor: "", racer: "", kimari: "", odds: "" });
-    setSts({ 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" });
-    setFHold({ 1: false, 2: false, 3: false, 4: false, 5: false, 6: false });
-    setFSts({ 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" });
-    setTilts({ 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" });
-    setWeights({ 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" });
-    setCourses({ 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6 });
-    setMotors({ 1: null, 2: null, 3: null, 4: null, 5: null, 6: null });
-    setRacerProfiles({});
+    // オールクリアは画面の入力だけを消す。端末内/クラウド保存の買い目リスト・配当・収支には影響させない。
+    skipNextTicketAutoSaveRef.current = true;
+    skipNextCloudSaveRef.current = true;
+    setPTexts(emptyPasteTexts());
+    setPMsgs(emptyPasteMsgs());
+    setPasteResetKey((n) => n + 1);
+    setOpenPanel(null);
+    setInputs(emptyInputs());
+    setSts(emptyBoatValues());
+    setFHold(defaultFHold());
+    setFSts(emptyBoatValues());
+    setTilts(emptyBoatValues());
+    setWeights(emptyBoatValues());
+    setCourses(defaultCourses());
+    setWind("無風");
+    setMotors(emptyMotors());
     setOdds(null);
-    setKimari(null); setNigeSim(null); setRacerStats(null); setStTable(null);
+    setKimari(null);
+    setNigeSim(null);
+    setRacerStats(null);
+    setStTable(null);
     setResultDigits({ first: "", second: "", third: "" });
-    setAutoMsg("");
+    setBetLimits({});
+    setPickerParts(["本線"]);
+    setPickerCount(6);
+    setPickerMode("balance");
+    setPickerAlloc("even");
+    setCart([]);
+    setPayoutOddsInput("");
+    setBetDraft({ source: "自由", f1: [], f2: [], f3: [] });
     setSaveMsg("");
+    setBetMsg("");
+    setAutoSaveMsg("✓ 入力内容をクリアしました（端末内保存は維持）");
+    setTimeout(() => setAutoSaveMsg(""), 2500);
   };
 
   // 決まり手・逃げシミュレーション（枠別情報）
@@ -1471,9 +1662,9 @@ export default function App() {
       const ns = {};
       for (let b = 1; b <= 6; b++) {
         const v = row[b - 1];
-        ns[b] = (v != null && v >= 0 && v <= 0.6) ? Math.min(0.4, v).toFixed(2) : "";
+        if (v != null && v >= 0 && v <= 0.6) ns[b] = Math.min(0.4, v).toFixed(2);
       }
-      setSts((p) => ({ ...p, ...ns }));
+      if (Object.keys(ns).length > 0) setSts((p) => ({ ...p, ...ns }));
     }
     // F持: F持ち時の平均STとして保存（F持ちスイッチは手動）
     const f = table["F持"];
@@ -1490,19 +1681,38 @@ export default function App() {
   // ラベルの後ろから数値を6個読む共通関数を作るヘルパ
   const makeRowReader = (text) => {
     let cursor = 0;
-    return (label, { allowDash = false } = {}) => {
-      const i = text.indexOf(label, cursor);
-      if (i === -1) return null;
-      const pos = i + label.length;
+    return (labels, { allowDash = false, fixedDecimal = null } = {}) => {
+      const list = Array.isArray(labels) ? labels : [labels];
+      let best = -1;
+      let bestLabel = "";
+      for (const label of list) {
+        const i = text.indexOf(label, cursor);
+        if (i !== -1 && (best === -1 || i < best)) {
+          best = i;
+          bestLabel = label;
+        }
+      }
+      if (best === -1) return null;
+      const pos = best + bestLabel.length;
       const seg = text.slice(pos);
-      const re = allowDash
-        ? /-?(?:\d+\.\d+|\.\d+)|[-−ー]|\d+/g
-        : /-?(?:\d+\.\d+|\.\d+|\d+)/g;
       const vals = [];
       let m;
+      if (fixedDecimal != null) {
+        const d = `{${fixedDecimal}}`;
+        const re = allowDash
+          ? new RegExp(`(?:[FL]?\\d+\\.\\d${d}|[FL]?\\.\\d${d}|[-ー])`, "gi")
+          : new RegExp(`(?:[FL]?\\d+\\.\\d${d}|[FL]?\\.\\d${d})`, "gi");
+        while (vals.length < 6 && (m = re.exec(seg))) vals.push(parseNumToken(m[0]));
+        if (vals.length < 6) return null;
+        cursor = pos + re.lastIndex;
+        return vals;
+      }
+      const re = allowDash
+        ? /[FL]?-?(?:\d+\.\d+|\.\d+)|[-−ー]|\d+/gi
+        : /[FL]?-?(?:\d+\.\d+|\.\d+|\d+)/gi;
       while (vals.length < 6 && (m = re.exec(seg))) {
-        if (allowDash && /^[-−ー]$/.test(m[0])) vals.push(null);
-        else vals.push(Number(m[0]));
+        const v = parseNumToken(m[0]);
+        vals.push(v);
       }
       if (vals.length < 6) return null;
       cursor = pos + re.lastIndex;
@@ -1514,15 +1724,15 @@ export default function App() {
   const parseTenji = () => {
     setPMsg("tenji", "");
     try {
-      const text = pTexts.tenji;
+      const text = stripPasteNoise(pTexts.tenji);
       const readRow = makeRowReader(text);
 
       const shinnyu = readRow("進入", { allowDash: true });
-      const tenjiRow = readRow("展示", { allowDash: true });
-      const isshuRow = readRow("周回", { allowDash: true }) || readRow("一周", { allowDash: true }) || readRow("半周ラップ", { allowDash: true }) || readRow("半周", { allowDash: true });
-      const mawariRow = readRow("周り足", { allowDash: true }) || readRow("まわり足", { allowDash: true });
-      const chokusenRow = readRow("直線", { allowDash: true });
-      readRow("ST", { allowDash: true });   // 無視（平均ST欄を上書きしないため）
+      const tenjiRow = readRow("展示", { allowDash: true, fixedDecimal: 2 });
+      const isshuRow = readRow(["周回", "1周", "一周", "半周ラップ"], { allowDash: true, fixedDecimal: 2 });
+      const mawariRow = readRow(["周り足", "まわり足", "回り足"], { allowDash: true, fixedDecimal: 2 });
+      readRow("直線", { allowDash: true, fixedDecimal: 2 }); // 取得はするがV63の合算では無視
+      readRow("ST", { allowDash: true, fixedDecimal: 2 });   // 無視（平均ST欄を上書きしないため／F.01・L.01表記も読み飛ばし対応）
       const weightRow = readRow("体重", { allowDash: true });
       readRow("調整重量", { allowDash: true }); // 無視
       const tiltRow = readRow("チルト", { allowDash: true });
@@ -1540,7 +1750,6 @@ export default function App() {
               tenji: tenjiRow[i] >= 5.5 && tenjiRow[i] <= 7.8 ? String(tenjiRow[i]) : prev[b].tenji,
               isshu: isshuRow[i] >= 15 && isshuRow[i] <= 45 ? String(isshuRow[i]) : prev[b].isshu,
               mawari: mawariRow[i] >= 4.0 && mawariRow[i] <= 15 ? String(mawariRow[i]) : prev[b].mawari,
-              chokusen: chokusenRow && chokusenRow[i] >= 4.0 && chokusenRow[i] <= 15 ? String(chokusenRow[i]) : prev[b].chokusen,
             };
           }
           return next;
@@ -1567,7 +1776,7 @@ export default function App() {
           if (Object.keys(newTilts).length > 0) setTilts((p) => ({ ...p, ...newTilts }));
         }
 
-        setPMsg("tenji", "✓ 6艇分を読み取りました（進入・展示・1周・回り足・直線・体重・チルト）");
+        setPMsg("tenji", "✓ 6艇分を読み取りました（進入・タイム・体重・チルト）");
         return;
       }
 
@@ -1591,10 +1800,6 @@ export default function App() {
         if (tokens[idx + 1] != null && tokens[idx + 1] >= 4.0 && tokens[idx + 1] <= 8.5) {
           mawari = tokens[idx + 1];
         }
-        let chokusen = null;
-        if (tokens[idx + 2] != null && tokens[idx + 2] >= 4.0 && tokens[idx + 2] <= 8.5) {
-          chokusen = tokens[idx + 2];
-        }
         let tenji = null;
         if (tokens[idx + 3] != null && tokens[idx + 3] >= 5.5 && tokens[idx + 3] <= 7.8) {
           tenji = tokens[idx + 3];
@@ -1607,7 +1812,6 @@ export default function App() {
           tenji: tenji != null ? String(tenji) : "",
           isshu: String(isshu),
           mawari: mawari != null ? String(mawari) : "",
-          chokusen: chokusen != null ? String(chokusen) : "",
         };
         if (tilt != null) newTilts[b] = tilt.toFixed(1);
       });
@@ -1618,7 +1822,6 @@ export default function App() {
             tenji: newInputs[b].tenji || prev[b].tenji,
             isshu: newInputs[b].isshu || prev[b].isshu,
             mawari: newInputs[b].mawari || prev[b].mawari,
-            chokusen: newInputs[b].chokusen || prev[b].chokusen,
           };
         }
         return next;
@@ -1630,580 +1833,37 @@ export default function App() {
     }
   };
 
-  const applyBoatcastMeta = (data) => {
-    const racers = Array.isArray(data?.racers) ? data.racers : [];
-    if (!racers.length && !data?.motors) return { racerCount: 0, motorCount: 0, fCount: 0, stCount: 0 };
-
-    const profiles = {};
-    const motorMap = { 1: null, 2: null, 3: null, 4: null, 5: null, 6: null };
-    const fMap = { 1: false, 2: false, 3: false, 4: false, 5: false, 6: false };
-    const stMap = { 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" };
-
-    racers.forEach((r) => {
-      const b = Number(r.boat);
-      if (!b || b < 1 || b > 6) return;
-      profiles[b] = {
-        grade: r.grade || "",
-        regNo: r.regNo || "",
-        name: r.name || "",
-        branch: r.branch || "",
-        birthplace: r.birthplace || "",
-        age: r.age || "",
-        fl: r.fl || "",
-        isFemale: !!r.isFemale,
-      };
-      motorMap[b] = (r.motorNo || r.motorRen2 != null || r.motorRen3 != null)
-        ? {
-            no: r.motorNo || null,
-            ren2: r.motorRen2 != null ? Number(r.motorRen2) : null,
-            ren3: r.motorRen3 != null ? Number(r.motorRen3) : null,
-          }
-        : null;
-      fMap[b] = !!r.fHold;
-      if (r.avgST !== "" && r.avgST != null) stMap[b] = String(r.avgST);
-    });
-
-    if (data?.motors && typeof data.motors === "object") {
-      Object.entries(data.motors).forEach(([k, m]) => {
-        const b = Number(k);
-        if (!b || b < 1 || b > 6 || !m) return;
-        motorMap[b] = {
-          no: m.no || m.motorNo || null,
-          ren2: m.ren2 != null ? Number(m.ren2) : null,
-          ren3: m.ren3 != null ? Number(m.ren3) : null,
-        };
-      });
-    }
-
-    // レースを切り替えた時に直近レースのF持ち・モーター・選手プロフィールを引きずらないよう、
-    // 自動取得データはマージではなく、そのレースの6艇分として丸ごと置き換える。
-    if (racers.length) setRacerProfiles(profiles);
-    setMotors(motorMap);
-    setFHold(fMap);
-    setSts(stMap);
-
-    return {
-      racerCount: Object.keys(profiles).length,
-      motorCount: Object.values(motorMap).filter(Boolean).length,
-      fCount: Object.values(fMap).filter(Boolean).length,
-      stCount: Object.values(stMap).filter(Boolean).length,
-    };
-  };
-
-  const formatApiFetchedAt = (iso) => {
-    if (!iso) return "時刻不明";
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return "時刻不明";
-    return d.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  };
-
-  const apiCacheNote = () => "";
-  const applyBoatcastRows = (rows, { displayDisabled = false } = {}) => {
-    if (!Array.isArray(rows) || !rows.length || displayDisabled) return;
-
-    setInputs((prev) => {
-      const next = { ...prev };
-      for (let b = 1; b <= 6; b++) {
-        next[b] = { ...next[b], tenji: "", isshu: "", mawari: "", chokusen: "" };
-      }
-      rows.forEach((r) => {
-        const b = Number(r.boat);
-        if (!b || b < 1 || b > 6) return;
-        next[b] = {
-          ...next[b],
-          tenji: r.tenji || "",
-          isshu: r.isshu || "",
-          mawari: r.mawari || "",
-          chokusen: r.chokusen || "",
-        };
-      });
-      return next;
-    });
-
-    const nextWeights = { 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" };
-    const nextTilts = { 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" };
-    const nextCourses = { 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6 };
-    rows.forEach((r) => {
-      const b = Number(r.boat);
-      if (!b || b < 1 || b > 6) return;
-      nextWeights[b] = r.weight || "";
-      nextTilts[b] = r.tilt || "";
-      if (r.course && Number(r.course) >= 1 && Number(r.course) <= 6) nextCourses[b] = Number(r.course);
-    });
-    setWeights(nextWeights);
-    setTilts(nextTilts);
-    setCourses(nextCourses);
-  };
-
-
-  // 3分更新用：展示・モーター等の固定データ取得後は、変動するオッズだけを更新する
-  const fetchOfficialOddsOnly = async (override = {}) => {
-    const targetVenue = override.venue || venue;
-    const targetRaceNo = override.raceNo || raceNo;
-    const targetDate = override.raceDate || raceDate;
-    if (!targetVenue) return;
-    if (salesEnded && !override.ignoreSalesEnded) {
-      setAutoMsg(`${targetVenue}は本日の発売終了です。オッズ自動更新は停止中です。`);
-      return;
-    }
-    if (!AUTO_FETCH_VENUES.includes(targetVenue)) return;
-    if (!override.force && autoBusyRef.current) return;
-    autoBusyRef.current = true;
-    setAutoLoading(true);
-    try {
-      const qs = new URLSearchParams({ action: "odds", venue: targetVenue, race: String(targetRaceNo), date: targetDate });
-      const res = await fetch(`/api/yoso?${qs.toString()}`);
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) throw new Error(data.error || "オッズ取得に失敗しました");
-      if (data.venue && String(data.venue) !== String(targetVenue)) throw new Error("別場のキャッシュ応答を検出しました");
-      if (data.race && String(data.race) !== String(targetRaceNo)) throw new Error("別レースのキャッシュ応答を検出しました");
-      if (data.odds && Object.keys(data.odds).length >= 10) {
-        setOdds(data.odds);
-        const cacheNote = apiCacheNote(data, "オッズ共有キャッシュ");
-        setPMsg("odds", `✓ ${targetVenue}${targetRaceNo}Rの3連単オッズ ${Object.keys(data.odds).length}点を更新しました`);
-        setAutoMsg(`${targetVenue}${targetRaceNo}Rのオッズを更新しました。`);
-        setAutoRefreshInfo("");
-      } else {
-        throw new Error(data.error || "3連単オッズを十分に取得できませんでした");
-      }
-    } catch (e) {
-      setAutoMsg(`オッズ更新失敗：${e.message || e}`);
-      setAutoRefreshInfo(`オッズ自動更新エラー：${e.message || e}`);
-    } finally {
-      autoBusyRef.current = false;
-      setAutoLoading(false);
-    }
-  };
-
-  // 公式サイト（許可済み想定）の展示データを自動取得
-  // 合算値は「展示＋1周＋回り足」。直線は取得・表示するが合算には含めない。
-  // 画面上に展示系の生数値は出さず、内部計算のみに使う仕様は維持。
-  const fetchOfficialYoso = async (override = {}) => {
-    const targetVenue = override.venue || venue;
-    const targetRaceNo = override.raceNo || raceNo;
-    const targetDate = override.raceDate || raceDate;
-    const requestKey = `${targetVenue}_${targetDate}_${targetRaceNo}`;
-    const nowMs = Date.now();
-    if (!targetVenue) return;
-    if (override.oddsOnly || (override.background && hasCompleteAutoStaticData(targetVenue))) {
-      return fetchOfficialOddsOnly(override);
-    }
-    if (salesEnded && !override.ignoreSalesEnded) {
-      setAutoMsg(`${targetVenue}は本日の発売終了です。自動取得は停止中です。`);
-      return;
-    }
-    if (!override.force && autoBusyRef.current) return;
-    if (!override.force && lastAutoFetchKeyRef.current === requestKey && nowMs - lastAutoFetchAtRef.current < 30000) return;
-    lastAutoFetchKeyRef.current = requestKey;
-    lastAutoFetchAtRef.current = nowMs;
-    autoBusyRef.current = true;
-    setAutoMsg(override.background ? `自動更新中：${targetVenue}${targetRaceNo}Rを確認しています…` : "");
-    if (!AUTO_FETCH_VENUES.includes(targetVenue)) {
-      setAutoMsg(`${targetVenue || "未選択"}の自動取得に対応していません。`);
-      autoBusyRef.current = false;
-      return;
-    }
-    setAutoLoading(true);
-    try {
-      const qs = new URLSearchParams({
-        venue: targetVenue,
-        race: String(targetRaceNo),
-        date: targetDate,
-      });
-      const res = await fetch(`/api/yoso?${qs.toString()}`);
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) throw new Error(data.error || "取得に失敗しました");
-      if (data.venue && String(data.venue) !== String(targetVenue)) throw new Error("別場のキャッシュ応答を検出しました");
-      if (data.race && String(data.race) !== String(targetRaceNo)) throw new Error("別レースのキャッシュ応答を検出しました");
-
-      // 選手/モーター/F持ち/平均ST/風/オッズは、展示公開前でも反映できるものは先に反映する。
-      const meta = applyBoatcastMeta(data);
-      const w = data.weather || {};
-      const windKey = w.windKey && WIND[w.windKey] ? w.windKey : "";
-      if (windKey) setWind(windKey);
-      const windNote = windKey
-        ? `／風も自動入力：${windKey}`
-        : w.windSpeed
-          ? `／風速${w.windSpeed}m取得（風向きは手動確認）`
-          : "";
-      const cacheNote = apiCacheNote(data, "BOATCAST共有キャッシュ");
-      const metaNote = meta.racerCount || meta.motorCount || meta.fCount
-        ? `／選手${meta.racerCount}名・モーター${meta.motorCount}艇・F持ち${meta.fCount}艇も自動反映`
-        : "";
-      let oddsNote = "";
-      if (data.odds && Object.keys(data.odds).length >= 10) {
-        setOdds(data.odds);
-        oddsNote = `／3連単オッズ${Object.keys(data.odds).length}点も自動取得`;
-        setPMsg("odds", `✓ ${targetVenue}${targetRaceNo}Rの3連単オッズ ${Object.keys(data.odds).length}点を自動取得しました（合成オッズに反映）`);
-      } else if (AUTO_FETCH_VENUES.includes(targetVenue)) {
-        oddsNote = "／オッズは未取得（締切後またはページ未対応時は手動コピペ可）";
-      }
-
-      const rows = data.rows || [];
-      const displayDisabled = data.displayDisabled || !usesDisplayCorrection(targetVenue);
-      if (!displayDisabled && rows.length < 6) {
-        const reasonCode = data.displayReasonCode || "";
-        let msg = `${targetVenue}${targetRaceNo}Rは公開展示待ちです。`;
-        if (reasonCode === "five_boat") msg = `${targetVenue}${targetRaceNo}R：エラー。5艇レースのため。`;
-        else if (reasonCode === "display_shortage") msg = `${targetVenue}${targetRaceNo}R：エラー。展示情報不足のため。`;
-        setPMsg("tenji", msg);
-        setAutoMsg(msg);
-        setAutoRefreshInfo(msg);
-        return;
-      }
-
-      applyBoatcastRows(rows, { displayDisabled });
-
-      const simpleFetchMsg = `${targetVenue}${targetRaceNo}Rのデータを取得しました。`;
-      setPMsg("tenji", simpleFetchMsg);
-      setAutoMsg(simpleFetchMsg);
-      setAutoRefreshInfo("");
-    } catch (e) {
-      setAutoMsg(`取得失敗：${e.message || e}`);
-      setAutoRefreshInfo(`自動更新エラー：${e.message || e}`);
-    } finally {
-      autoBusyRef.current = false;
-      setAutoLoading(false);
-    }
-  };
-
-
-  const normalizeVenueStatus = (data) => {
-    if (!data) return null;
-    const status = data.status || (data.noRace ? "未開催" : data.allClosed ? "発売終了" : data.nextRace ? "発売中" : "未確認");
-    return {
-      ok: data.ok !== false,
-      venue: data.venue,
-      status,
-      noRace: !!data.noRace || status === "未開催",
-      allClosed: !!data.allClosed || status === "発売終了",
-      nextRace: data.nextRace ? String(data.nextRace) : "",
-      nextDeadline: data.nextDeadline || "",
-      scheduleCount: data.scheduleCount ?? (Array.isArray(data.schedule) ? data.schedule.length : 0),
-      grade: data.grade || data.rank || "",
-      eventDay: data.eventDay || data.dayText || "",
-      eventName: data.eventName || "",
-      error: data.error || "",
-      cached: !!data.cached,
-    };
-  };
-
-
-
-  const prefetchStorageKey = (v, d, r) => `hunaken_prefetch_yoso_v109_${v}_${d}_${r}`;
-
-  const storePrefetchPayload = (v, d, r, data) => {
-    try {
-      localStorage.setItem(prefetchStorageKey(v, d, r), JSON.stringify({ savedAt: Date.now(), data }));
-    } catch (e) {}
-  };
-
-  const readPrefetchPayload = (v, d, r) => {
-    try {
-      const raw = localStorage.getItem(prefetchStorageKey(v, d, r));
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      if (!parsed || !parsed.data || Date.now() - Number(parsed.savedAt || 0) > 4 * 60 * 1000) return null;
-      return parsed.data;
-    } catch (e) {
-      return null;
-    }
-  };
-
-  const applyPrefetchedYosoPayload = (data, targetVenue, targetRaceNo, targetDate) => {
-    const rows = data?.rows || [];
-    if (!Array.isArray(rows) || rows.length < 6) return false;
-
-    applyBoatcastRows(rows, { displayDisabled: !!data?.displayDisabled || !usesDisplayCorrection(targetVenue) });
-
-    const meta = applyBoatcastMeta(data);
-
-    const w = data.weather || {};
-    const windKey = w.windKey && WIND[w.windKey] ? w.windKey : "";
-    if (windKey) setWind(windKey);
-    if (data.odds && Object.keys(data.odds).length >= 10) {
-      setOdds(data.odds);
-      setPMsg("odds", `✓ ${targetVenue}${targetRaceNo}Rの3連単オッズ ${Object.keys(data.odds).length}点を事前取得済みデータから反映しました`);
-    }
-    const windNote = windKey ? `／風も自動入力：${windKey}` : "";
-    const metaNote = meta.racerCount || meta.motorCount || meta.fCount ? `／選手・モーター・F持ちも反映` : "";
-    const oddsNote = data.odds && Object.keys(data.odds).length >= 10 ? `／3連単オッズ${Object.keys(data.odds).length}点も反映` : "";
-    const simpleFetchMsg = `${targetVenue}${targetRaceNo}Rのデータを取得しました。`;
-    setPMsg("tenji", simpleFetchMsg);
-    setAutoMsg(simpleFetchMsg);
-    setAutoRefreshInfo("");
-    return true;
-  };
-
-  const tryApplyPrefetchedYoso = (v, r, d) => {
-    const data = readPrefetchPayload(v, d, r);
-    if (!data) return false;
-    return applyPrefetchedYosoPayload(data, v, r, d);
-  };
-
-  const minutesUntilDeadline = (hhmm) => {
-    const m = String(hhmm || "").match(/^(\d{1,2}):(\d{2})$/);
-    if (!m) return null;
-    const deadlineMin = Number(m[1]) * 60 + Number(m[2]);
-    const now = new Date();
-    return deadlineMin - (now.getHours() * 60 + now.getMinutes());
-  };
-
-  // 締切15分前から、対応場の次Rをサーバー側キャッシュへ先読みする。
-  // 画面を開いている間だけ動く。ユーザーが場をタップした時は、通常取得でも3分キャッシュから即返りやすくなる。
-  const prefetchApproachingAutoRaces = async (statuses, targetDate = todayDateValue()) => {
-    if (!autoRefreshEnabledRef.current || document.hidden) return;
-    if (targetDate !== todayDateValue()) return;
-    const raw = Object.values(statuses || {});
-    const candidates = raw
-      .filter((st) => st && AUTO_FETCH_VENUES.includes(st.venue) && !st.noRace && !st.allClosed && st.nextRace && st.nextDeadline)
-      .map((st) => ({ ...st, leftMin: minutesUntilDeadline(st.nextDeadline) }))
-      .filter((st) => st.leftMin != null && st.leftMin <= 15 && st.leftMin >= -1)
-      .sort((a, b) => a.leftMin - b.leftMin)
-      .slice(0, 8);
-
-    if (!candidates.length) {
-      setPrefetchInfo("");
-      return;
-    }
-
-    const done = [];
-    for (const st of candidates) {
-      const key = `${st.venue}_${targetDate}_${st.nextRace}`;
-      const nowMs = Date.now();
-      if (prefetchBusyKeysRef.current.has(key)) continue;
-      if (lastPrefetchAtByKeyRef.current[key] && nowMs - lastPrefetchAtByKeyRef.current[key] < 150000) continue;
-      prefetchBusyKeysRef.current.add(key);
-      lastPrefetchAtByKeyRef.current[key] = nowMs;
-      try {
-        const existing = readPrefetchPayload(st.venue, targetDate, st.nextRace);
-        if (existing && Array.isArray(existing.rows) && existing.rows.length >= 6) {
-          const qs = new URLSearchParams({ action: "odds", venue: st.venue, race: String(st.nextRace), date: targetDate });
-          const res = await fetch(`/api/yoso?${qs.toString()}`);
-          const data = await res.json().catch(() => ({}));
-          if (res.ok && data.ok && data.odds && Object.keys(data.odds).length >= 10) {
-            storePrefetchPayload(st.venue, targetDate, st.nextRace, { ...existing, odds: data.odds, oddsCount: data.oddsCount, oddsUrl: data.oddsUrl, oddsUpdatedAt: data.fetchedAt });
-            done.push(`${st.venue}${st.nextRace}Rオッズ`);
-          }
-        } else {
-          const qs = new URLSearchParams({ venue: st.venue, race: String(st.nextRace), date: targetDate });
-          const res = await fetch(`/api/yoso?${qs.toString()}`);
-          const data = await res.json().catch(() => ({}));
-          if (res.ok && data.ok && Array.isArray(data.rows) && data.rows.length >= 6) {
-            storePrefetchPayload(st.venue, targetDate, st.nextRace, data);
-            done.push(`${st.venue}${st.nextRace}R`);
-          }
-        }
-      } catch (e) {
-        // 15分前でも場によってはまだ展示が出ていないことがあるため、失敗は次回3分後に再試行する。
-      } finally {
-        prefetchBusyKeysRef.current.delete(key);
-      }
-    }
-    if (done.length) {
-      const t = new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
-      setPrefetchInfo("");
-    } else {
-      setPrefetchInfo("");
-    }
-  };
-
-  const refreshVenueStatuses = async (targetDate = todayDateValue(), opts = {}) => {
-    if (!opts.silent) setVenueStatusLoading(true);
-    try {
-      const qs = new URLSearchParams({ action: "schedules", date: targetDate });
-      const res = await fetch(`/api/yoso?${qs.toString()}`);
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) throw new Error(data.error || "開催状況を取得できませんでした");
-      const next = {};
-      const raw = data.statusesByVenue || {};
-      Object.keys(raw).forEach((v) => {
-        next[v] = normalizeVenueStatus(raw[v]);
-      });
-      setVenueStatuses(next);
-      prefetchApproachingAutoRaces(next, targetDate);
-      return next;
-    } catch (e) {
-      if (!opts.silent) setAutoRefreshInfo(`開催状況の取得に失敗しました（${e.message || e}）`);
-      return null;
-    } finally {
-      if (!opts.silent) setVenueStatusLoading(false);
-    }
-  };
-
-
-  const resolveNextRaceFromOfficial = async (v, targetDate = todayDateValue(), opts = {}) => {
-    const fallbackRace = autoRaceForVenue(v);
-    if (!v) return { raceNo: fallbackRace, allClosed: false, fallback: true };
-    try {
-      if (!opts.silent) setAutoRefreshInfo(`${v}の公式締切時刻を確認中…`);
-      const qs = new URLSearchParams({ action: "schedule", venue: v, date: targetDate });
-      const res = await fetch(`/api/yoso?${qs.toString()}`);
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) throw new Error(data.error || "締切時刻の取得に失敗しました");
-
-      setOfficialSchedule(data);
-      const normalized = normalizeVenueStatus(data);
-      setVenueStatuses((p) => ({ ...p, [v]: normalized }));
-      setVenueNotHeld(!!normalized?.noRace);
-      setSalesEnded(!!normalized?.allClosed);
-
-      if (normalized?.noRace) {
-        setAutoRefreshInfo(`${v}は本日未開催です（公式締切時刻で判定）`);
-        return { noRace: true, allClosed: false, raceNo: "", data };
-      }
-
-      if (normalized?.allClosed) {
-        setAutoRefreshInfo(`${v}は本日の全レース発売終了です（公式締切時刻で判定）`);
-        return { allClosed: true, raceNo: "", data };
-      }
-
-      const nextRace = String(data.nextRace || fallbackRace);
-      const deadline = data.nextDeadline ? `／締切${data.nextDeadline}` : "";
-      setAutoRefreshInfo(`公式締切で判定：${v}${nextRace}R${deadline}（次回も約3分後に再判定）`);
-      return { allClosed: false, raceNo: nextRace, deadline: data.nextDeadline || "", data };
-    } catch (e) {
-      setSalesEnded(false);
-      setVenueNotHeld(false);
-      setOfficialSchedule(null);
-      setAutoRefreshInfo(`公式締切時刻の取得に失敗。暫定で${v}${fallbackRace}Rを選択します（${e.message || e}）`);
-      return { raceNo: fallbackRace, allClosed: false, fallback: true, error: e.message || String(e) };
-    }
-  };
-
-  const selectVenueQuick = async (v) => {
-    const today = todayDateValue();
-    setVenue(v);
-    setRaceDate(today);
-    setSalesEnded(false);
-    setVenueNotHeld(false);
-    resetRaceAutoData();
-    setAutoMsg(`${v}の公式締切時刻を確認中…`);
-
-    const resolved = await resolveNextRaceFromOfficial(v, today);
-    if (resolved.noRace) {
-      setRaceNo("1");
-      resetRaceAutoData();
-      setAutoMsg(`${v}は本日未開催です`);
-      return;
-    }
-    if (resolved.allClosed) {
-      setRaceNo("12");
-      resetRaceAutoData();
-      setAutoMsg(`${v}は本日の全レース発売終了です`);
-      return;
-    }
-
-    const nextRace = resolved.raceNo || autoRaceForVenue(v);
-    setRaceNo(nextRace);
-    resetRaceAutoData();
-    if (AUTO_FETCH_VENUES.includes(v)) {
-      const deadline = resolved.deadline ? `（締切${resolved.deadline}）` : "";
-      const appliedPrefetch = tryApplyPrefetchedYoso(v, nextRace, today);
-      if (!appliedPrefetch) {
-        setAutoMsg(`${v}${nextRace}Rを公式締切時刻で自動選択しました${deadline}。取得します…`);
-        window.setTimeout(() => fetchOfficialYoso({ venue: v, raceNo: nextRace, raceDate: today, force: true, ignoreSalesEnded: true }), 80);
-      }
-    } else {
-      setAutoMsg(`${v}${nextRace}Rを公式締切時刻で自動選択しました。展示等の自動取得は順次対応予定です。`);
-    }
-  };
-
-  // 完全自動更新：場・R・日付が選ばれたら自動取得し、開いている間だけ3分ごとに公式締切で次R判定＋再取得
-  useEffect(() => {
-    if (!autoRefreshEnabled || salesEnded || !venue || !AUTO_FETCH_VENUES.includes(venue)) return;
-    const t = window.setTimeout(() => {
-      fetchOfficialYoso({ venue, raceNo, raceDate, background: true });
-    }, 700);
-    return () => window.clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoRefreshEnabled, salesEnded, venue, raceNo, raceDate]);
-
-  useEffect(() => {
-    if (!autoRefreshEnabled) return;
-    const run = async (force = false) => {
-      if (!venue || !AUTO_FETCH_VENUES.includes(venue)) return;
-      if (document.hidden) return;
-      const today = todayDateValue();
-      const resolved = await resolveNextRaceFromOfficial(venue, today, { silent: true });
-      if (resolved.noRace) {
-        setRaceDate(today);
-        setRaceNo("1");
-        resetRaceAutoData();
-        setAutoMsg(`${venue}は本日未開催です`);
-        return;
-      }
-      if (resolved.allClosed) {
-        setRaceDate(today);
-        setRaceNo("12");
-        resetRaceAutoData();
-        setAutoMsg(`${venue}は本日の全レース発売終了です`);
-        return;
-      }
-      const nextRace = resolved.raceNo || autoRaceForVenue(venue);
-      if (raceNo !== nextRace) {
-        setRaceNo(nextRace);
-        resetRaceAutoData();
-      }
-      if (raceDate !== today) setRaceDate(today);
-      fetchOfficialYoso({ venue, raceNo: nextRace, raceDate: today, background: true, force, ignoreSalesEnded: true, oddsOnly: hasCompleteAutoStaticData() });
-    };
-    const id = window.setInterval(() => run(false), 180000);
-    const onFocus = () => run(false);
-    const onVisibility = () => { if (!document.hidden) run(false); };
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      window.clearInterval(id);
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoRefreshEnabled, venue, raceNo, raceDate]);
-
-  // 開催場カード用：全24場の公式締切状況を定期取得（未開催／発売終了／次R）
-  useEffect(() => {
-    const today = todayDateValue();
-    refreshVenueStatuses(today);
-    const id = window.setInterval(() => refreshVenueStatuses(todayDateValue(), { silent: true }), 180000);
-    return () => window.clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   // ② 平均ST表（基本情報: 今期〜ナイター・F持）
   const parseStPaste = (overrideText = null, msgKey = "st") => {
     setPMsg(msgKey, "");
     try {
-      let text = overrideText ?? pTexts.st;
+      let text = stripPasteNoise(overrideText ?? pTexts.st);
       const stStart = text.indexOf("平均ST");
       if (stStart !== -1) {
         let stEnd = text.length;
-        for (const endLabel of ["ST順位", "1着率", "2連対率", "3連対率", "逃げシミュレーション", "決まり手"]) {
+        for (const endLabel of ["ST順位", "ST考察", "1着率", "2連対率", "3連対率", "逃げシミュレーション", "決まり手"]) {
           const j = text.indexOf(endLabel, stStart + 3);
           if (j !== -1) stEnd = Math.min(stEnd, j);
         }
         text = text.slice(stStart, stEnd);
       }
-      let cur = 0;
+
       const table = {};
-      for (const lb of ST_PERIODS) {
-        const i = text.indexOf(lb, cur);
+      for (let pi = 0; pi < ST_PERIODS.length; pi++) {
+        const lb = ST_PERIODS[pi];
+        const i = text.indexOf(lb);
         if (i === -1) { table[lb] = null; continue; }
-        cur = i + lb.length;
-        const seg = text.slice(cur);
-        const re = /\d+\.\d+|\.\d+|[-−ー]/g;
-        const vals = [];
-        let m;
-        while (vals.length < 6 && (m = re.exec(seg))) {
-          vals.push(/^[-−ー]$/.test(m[0]) ? null : Number(m[0]));
+        let end = text.length;
+        for (const other of ST_PERIODS) {
+          if (other === lb) continue;
+          const j = text.indexOf(other, i + lb.length);
+          if (j !== -1) end = Math.min(end, j);
         }
-        if (vals.length === 6) {
-          table[lb] = vals;
-          cur += re.lastIndex;
-        } else {
-          table[lb] = null;
-        }
+        const seg = text.slice(i + lb.length, end);
+        const vals = readFixedDecimals(seg, 6, { allowDash: true, decimals: 2 });
+        table[lb] = vals;
       }
+
       if (ST_PERIODS.some((p) => table[p])) {
         setStTable(table);
         applyStTable(table, stPeriod);
@@ -2223,7 +1883,7 @@ export default function App() {
   const parseRacer = (overrideText = null, msgKey = "racer") => {
     setPMsg(msgKey, "");
     try {
-      const text = overrideText ?? pTexts.racer;
+      const text = stripPasteNoise(overrideText ?? pTexts.racer);
 
       // セクションを次のセクション開始位置までで切り出す
       const sectionText = (label, nextLabels) => {
@@ -2237,73 +1897,34 @@ export default function App() {
         return text.slice(i + label.length, end);
       };
 
-      // セクション内で各区分の行（6艇分）を読む。順序に依存せず各ラベルを毎回先頭から探す
+      // セクション内で各区分の行（6艇分）を読む。
+      // Androidでは「(29)22.2%」や「SG/G145.5%」のようにくっつくため、%付きの数値だけを読む。
       const parseSection = (sec) => {
         if (sec == null) return null;
         const row = (labels) => {
           for (const label of labels) {
-            let from = 0;
-            // 同じラベルが複数回出る場合に備え、6個読めるまで次の出現位置を試す
-            while (true) {
-              const i = sec.indexOf(label, from);
-              if (i === -1) break;
-              const pos = i + label.length;
-              // 次のラベル候補までを範囲にして、混入を防ぐ
-              const seg = sec.slice(pos);
-              const re = /(\d+\.\d+)\s*%?\s*(?:\(\s*(\d+)\s*\))?|[-−ー]/g;
-              const vals = [];
-              let m;
-              while (vals.length < 6 && (m = re.exec(seg))) {
-                if (/^[-−ー]$/.test(m[0])) vals.push(null);
-                else vals.push({ v: Number(m[1]), n: m[2] != null ? Number(m[2]) : null });
-              }
-              if (vals.length === 6) return vals;
-              from = pos;
-            }
+            const i = sec.indexOf(label);
+            if (i === -1) continue;
+            const vals = readPercentValuesWithN(sec.slice(i + label.length), 6);
+            if (vals) return vals;
           }
           return null;
         };
-        // 「直近」+数字（6/3/1）の行を、間の空白・改行を許容して読む
-        const recentRow = (num) => {
-          let from = 0;
-          while (true) {
-            const i = sec.indexOf("直近", from);
-            if (i === -1) break;
-            // 「直近」の後ろ、数字までの間に空白/改行のみを許す
-            const after = sec.slice(i + 2);
-            const mm = after.match(/^[\s　]*(\d)/);
-            if (mm && Number(mm[1]) === num) {
-              const pos = i + 2 + mm.index + mm[0].length; // 数字の直後
-              const seg = sec.slice(pos);
-              const re = /(\d+\.\d+)\s*%?\s*(?:\(\s*(\d+)\s*\))?|[-−ー]/g;
-              const vals = [];
-              let m;
-              while (vals.length < 6 && (m = re.exec(seg))) {
-                if (/^[-−ー]$/.test(m[0])) vals.push(null);
-                else vals.push({ v: Number(m[1]), n: m[2] != null ? Number(m[2]) : null });
-              }
-              if (vals.length === 6) return vals;
-            }
-            from = i + 2;
-          }
-          return null;
-        };
-
         return {
           "今期": row(["今期"]),
-          "直近6ヶ月": recentRow(6),
-          "直近3ヶ月": recentRow(3),
-          "直近1ヶ月": recentRow(1),
+          "直近6ヶ月": row(["直近6ヶ月"]),
+          "直近3ヶ月": row(["直近3ヶ月"]),
+          "直近1ヶ月": row(["直近1ヶ月"]),
           "当地": row(["当地"]),
           "一般戦": row(["一般戦"]),
-          "SG/G1": row(["SG"]),
+          "SG/G1": row(["SG/G1", "SG"]),
           "女子戦": row(["女子戦"]),
         };
       };
 
       const s1 = sectionText("1着率", ["2連対率", "3連対率"]);
       const s2 = sectionText("2連対率", ["3連対率"]);
-      const s3 = sectionText("3連対率", []);
+      const s3 = sectionText("3連対率", ["着順別直近成績", "枠別勝率", "平均ST", "ST順位", "ST考察", "決まり手", "逃げシミュレーション"]);
       if (!s1 && !s2 && !s3) {
         setPMsg(msgKey, "1着率〜3連対率が見つかりません。枠別情報の表をコピーしてください");
         return false;
@@ -2350,16 +1971,76 @@ export default function App() {
   const parseMotor = () => {
     setPMsg("motor", "");
     try {
-      const text = pTexts.motor;
-      const readRow = makeRowReader(text);
+      const text = stripPasteNoise(pTexts.motor);
 
-      const noRow = readRow("番号");
-      readRow("ランク");  // 無視（カーソル送り）
-      readRow("貢献P");   // 無視
-      const rateRow = readRow("勝率");
-      const win1Row = readRow("1着率");
-      const ren2Row = readRow("2連対率");
-      const ren3Row = readRow("3連対率");
+      // Android/Instagram DMでは、選択コピー時に同じ「通算」ブロックが途中で二重に混ざることがある。
+      // 例: 1着率 16.7% 20.9% 15.4% 通算 ... 1着率 16.7% 20.9% 15.4% 35.4% ...
+      // そのためカーソル順ではなく、各ラベルの候補を全部見て「6艇分が成立する行」だけを採用する。
+      const motorLabels = [
+        "番号", "通算", "ランク", "貢献P", "勝率", "1着率", "2連対率", "3連対率",
+        "展示順位", "出走数", "優出数", "優勝数", "中間整備", "履歴", "通算期間",
+      ];
+
+      const findAllLabelPositions = (label) => {
+        const out = [];
+        let at = -1;
+        while ((at = text.indexOf(label, at + 1)) !== -1) out.push(at);
+        return out;
+      };
+
+      const sliceMotorRow = (label, pos) => {
+        const start = pos + label.length;
+        let end = text.length;
+        for (const other of motorLabels) {
+          if (other === label) continue;
+          const i = text.indexOf(other, start);
+          if (i !== -1 && i < end) end = i;
+        }
+        return text.slice(start, end);
+      };
+
+      const parseMotorNumbers = (seg, kind) => {
+        const vals = [];
+        let m;
+        if (kind === "percent") {
+          const re = /-?\d{1,4}(?:\.\d+)?%/g;
+          while (vals.length < 6 && (m = re.exec(seg))) {
+            const v = parseFloat(m[0]);
+            // 5335.4% のように「出走数53」と「35.4%」が連結した壊れ値は採用しない
+            if (Number.isFinite(v) && v >= 0 && v <= 100) vals.push(v);
+          }
+          return vals.length >= 6 ? vals.slice(0, 6) : null;
+        }
+        const re = /-?(?:\d+\.\d+|\.\d+|\d+)/g;
+        while (vals.length < 6 && (m = re.exec(seg))) {
+          const v = parseNumToken(m[0]);
+          if (kind === "integer") {
+            if (v != null && Number.isInteger(v)) vals.push(v);
+          } else if (v != null) {
+            vals.push(v);
+          }
+        }
+        return vals.length >= 6 ? vals.slice(0, 6) : null;
+      };
+
+      const readBestMotorRow = (label, kind, valid = () => true) => {
+        const positions = findAllLabelPositions(label);
+        const candidates = [];
+        for (const pos of positions) {
+          const seg = sliceMotorRow(label, pos);
+          const vals = parseMotorNumbers(seg, kind);
+          if (vals && vals.every(valid)) candidates.push({ pos, vals, len: seg.length });
+        }
+        if (candidates.length === 0) return null;
+        // 重複コピー時は後ろ側に完全な行が残りやすい。成立候補のうち最後のものを優先。
+        return candidates[candidates.length - 1].vals;
+      };
+
+      const noRow = readBestMotorRow("番号", "integer", (v) => v >= 1 && v <= 99);
+      const rateRow = readBestMotorRow("勝率", "number", (v) => v >= 0 && v <= 10);
+      const win1Row = readBestMotorRow("1着率", "percent", (v) => v >= 0 && v <= 100);
+      const ren2Row = readBestMotorRow("2連対率", "percent", (v) => v >= 0 && v <= 100);
+      const ren3Row = readBestMotorRow("3連対率", "percent", (v) => v >= 0 && v <= 100);
 
       if (!rateRow && !ren2Row) {
         setPMsg("motor", "モーター表が見つかりません。番号〜3連対率の行をコピーしてください");
@@ -2387,7 +2068,7 @@ export default function App() {
   const parseKimari = (overrideText = null, msgKey = "kimari") => {
     setPMsg(msgKey, "");
     try {
-      const text = overrideText ?? pTexts.kimari;
+      const text = stripPasteNoise(overrideText ?? pTexts.kimari);
       const readN = (seg, n) => {
         if (seg == null) return null;
         const m = seg.match(/\d+\.\d+/g);
@@ -2476,134 +2157,110 @@ export default function App() {
   const parseOdds = () => {
     setPMsg("odds", "");
     try {
-      const text = pTexts.odds;
-      const rawLines = text.split(/\n/).map((l) => l.replace(/\s+$/, ""));
-      // 区切りはタブ優先、無ければ空白
+      const text = stripPasteNoise(pTexts.odds);
+      const rawLines = text.split(/\n/).map((l) => l.replace(/\s+$/g, ""));
+
+      // Android/Instagram DMでは横長表が折り返され、
+      // 「11.0 3」が「11.03」のように連結されるケースがある。
+      // ここでは行単位ではなく、選手ごとのブロック全体を数値列として読んで復元する。
       const splitCells = (line) => line.includes("\t")
         ? line.split("\t").map((c) => c.trim()).filter((c) => c !== "")
         : line.trim().split(/[ 　]+/).filter((c) => c !== "");
-      const isBoatNo = (x) => /^[1-6]$/.test(String(x || ""));
-      const isOddsNo = (x) => /^\d+(?:\.\d+)?$/.test(String(x || "").replace(/,/g, ""));
-      const toOdds = (x) => Number(String(x || "").replace(/,/g, ""));
 
-      // 唐津・三国スマホ版などの縦並び形式
-      // 例: 「1 選手名」→「2 3 31.9」→「4 51.3」→ ...
-      const parseSequentialOdds = () => {
-        const out = {};
-        let first = null;
-        let second = null;
-        const usable = rawLines.map((l) => l.trim()).filter(Boolean);
-        for (const line of usable) {
-          if (/更新ボタン|レース情報|Copyright/.test(line)) break;
+      const isHeaderLine = (line) => {
+        const cells = splitCells(line);
+        return cells.length >= 2
+          && /^[1-6]$/.test(cells[0])
+          && !/^[\d.\-]/.test(cells[1])
+          && !/合成|単|オッズ|発売|履歴|ADVERTISEMENT/i.test(line);
+      };
+
+      const blocks = [];
+      let cur = null;
+      for (const line of rawLines) {
+        if (line.trim() === "") continue;
+        if (isHeaderLine(line)) {
+          if (cur) blocks.push(cur);
           const cells = splitCells(line);
-          if (cells.length === 0) continue;
-          const isHeader = cells.length >= 2
-            && isBoatNo(cells[0])
-            && !isOddsNo(cells[1])
-            && !/合成|単勝|複勝|3連単|2連単|3連複|人気|高配当|更新/.test(line);
-          if (isHeader) {
-            first = Number(cells[0]);
-            second = null;
-            continue;
-          }
-          if (!first) continue;
-
-          // 新しい2着列: 2着 3着 オッズ
-          if (cells.length >= 3 && isBoatNo(cells[0]) && isBoatNo(cells[1]) && isOddsNo(cells[2])) {
-            second = Number(cells[0]);
-            const third = Number(cells[1]);
-            const o = toOdds(cells[2]);
-            if (second !== first && third !== first && third !== second && o > 0) {
-              out[`${first}-${second}-${third}`] = o;
-            }
-            // 同じ行に続きの「3着 オッズ」がある場合も拾う
-            for (let i = 3; i + 1 < cells.length; i += 2) {
-              const t = Number(cells[i]);
-              const oo = toOdds(cells[i + 1]);
-              if (second && t >= 1 && t <= 6 && t !== first && t !== second && oo > 0) {
-                out[`${first}-${second}-${t}`] = oo;
-              }
-            }
-            continue;
-          }
-
-          // 同じ2着列の続き: 3着 オッズ
-          if (second && cells.length >= 2 && isBoatNo(cells[0]) && isOddsNo(cells[1])) {
-            const third = Number(cells[0]);
-            const o = toOdds(cells[1]);
-            if (third !== first && third !== second && o > 0) {
-              out[`${first}-${second}-${third}`] = o;
-            }
-            for (let i = 2; i + 1 < cells.length; i += 2) {
-              const t = Number(cells[i]);
-              const oo = toOdds(cells[i + 1]);
-              if (t >= 1 && t <= 6 && t !== first && t !== second && oo > 0) {
-                out[`${first}-${second}-${t}`] = oo;
-              }
-            }
-          }
+          cur = { first: Number(cells[0]), rows: [] };
+        } else if (cur) {
+          cur.rows.push(line);
         }
+      }
+      if (cur) blocks.push(cur);
+
+      const splitJoinedOddToken = (token) => {
+        const t = String(token).trim();
+        // 例: 11.03 = 11.0 + 3, 12.13 = 12.1 + 3, 91.14 = 91.1 + 4
+        // オッズ表は基本1桁小数なので、末尾が艇番(1〜6)なら分割する。
+        const m = t.match(/^(\d+\.\d)([1-6])$/);
+        if (m) return [m[1], m[2]];
+        return [t];
+      };
+
+      const numberTokens = (seg) => {
+        const raw = String(seg)
+          .replace(/[合成２2]\s*単/g, " ")
+          .match(/-?\d+(?:\.\d+)?|\.\d+/g) || [];
+        const out = [];
+        raw.forEach((tok) => splitJoinedOddToken(tok).forEach((v) => out.push(v)));
         return out;
       };
 
-      // 従来の横テーブル形式
-      const parseGridOdds = () => {
-        const blocks = [];
-        let cur = null;
-        for (const line of rawLines) {
-          if (line.trim() === "") continue;
-          const cells = splitCells(line);
-          const isHeader = cells.length >= 2
-            && isBoatNo(cells[0])
-            && !/^[\d.]/.test(cells[1])
-            && !/合成|単/.test(line);
-          if (isHeader) {
-            if (cur) blocks.push(cur);
-            cur = { first: Number(cells[0]), rows: [] };
-          } else if (cur && !/合成|単/.test(line)) {
-            cur.rows.push(cells);
-          }
-        }
-        if (cur) blocks.push(cur);
-
-        const out = {};
-        for (const blk of blocks) {
-          const first = blk.first;
-          const rows = blk.rows;
-          if (rows.length === 0) continue;
-          // 1行目: 各列「2着 3着 オッズ」の3つ組
-          const colSeconds = [];
-          const r0 = rows[0];
-          for (let i = 0; i + 2 < r0.length + 1; i += 3) {
-            const sec = Number(r0[i]), third = Number(r0[i + 1]), o = toOdds(r0[i + 2]);
-            if ([sec, third].every((x) => x >= 1 && x <= 6) && o > 0) {
-              colSeconds.push(sec);
-              if (third !== first && third !== sec) out[`${first}-${sec}-${third}`] = o;
-            }
-          }
-          // 2行目以降: 各列「3着 オッズ」の2つ組
-          for (let ri = 1; ri < rows.length; ri++) {
-            const toks = rows[ri];
-            for (let ci = 0; ci < colSeconds.length; ci++) {
-              const third = Number(toks[ci * 2]);
-              const o = toOdds(toks[ci * 2 + 1]);
-              const sec = colSeconds[ci];
-              if (third >= 1 && third <= 6 && o > 0 && third !== first && third !== sec) {
-                out[`${first}-${sec}-${third}`] = o;
-              }
-            }
-          }
-        }
-        return out;
+      const asBoat = (v) => {
+        const n = Number(v);
+        return Number.isInteger(n) && n >= 1 && n <= 6 ? n : null;
+      };
+      const asOdd = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? n : null;
       };
 
-      const seq = parseSequentialOdds();
-      const grid = parseGridOdds();
-      // 唐津・三国の縦並びは120点近く取れるので、より多く読めた方を採用
-      const result = Object.keys(seq).length >= Object.keys(grid).length ? seq : grid;
+      const result = {};
+      for (const blk of blocks) {
+        const first = blk.first;
+        if (!first) continue;
+
+        // 「合成」「2単」以降は買い目別オッズではないので切り落とす。
+        const body = blk.rows.join(" ");
+        const oddsPart = body.split(/合成|２単|2単/)[0];
+        const toks = numberTokens(oddsPart);
+        if (toks.length < 15) continue;
+
+        let idx = 0;
+        const seconds = [];
+
+        // 1段目は「2着 3着 オッズ」の3個セットが5列
+        for (let col = 0; col < 5 && idx + 2 < toks.length; col++) {
+          const sec = asBoat(toks[idx]);
+          const third = asBoat(toks[idx + 1]);
+          const odd = asOdd(toks[idx + 2]);
+          idx += 3;
+          if (sec && third && odd && sec !== first && third !== first && third !== sec) {
+            seconds.push(sec);
+            result[`${first}-${sec}-${third}`] = odd;
+          } else if (sec) {
+            // 先頭行が一部崩れていても、後続行の列位置に使うためsecだけは保持
+            seconds.push(sec);
+          }
+        }
+
+        // 2〜4段目は「3着 オッズ」の2個セットが各5列
+        for (let row = 0; row < 3 && idx + 1 < toks.length; row++) {
+          for (let col = 0; col < seconds.length && idx + 1 < toks.length; col++) {
+            const third = asBoat(toks[idx]);
+            const odd = asOdd(toks[idx + 1]);
+            const sec = seconds[col];
+            idx += 2;
+            if (sec && third && odd && sec !== first && third !== first && third !== sec) {
+              result[`${first}-${sec}-${third}`] = odd;
+            }
+          }
+        }
+      }
 
       if (Object.keys(result).length < 10) {
-        setPMsg("odds", "オッズを十分に読み取れませんでした。締切前の3連単オッズ一覧（丸亀・蒲郡・下関・住之江・唐津・三国・鳴門・児島・福岡・平和島・びわこ・常滑・浜名湖対応）を丸ごとコピーしてください。自動取得できない時もここへ貼れば反映できます");
+        setPMsg("odds", "オッズを十分に読み取れませんでした。オッズ一覧を1〜6号艇分まとめてコピーしてください");
         return;
       }
       setOdds(result);
@@ -2615,7 +2272,7 @@ export default function App() {
 
   const parseBasicInfo = () => {
     setPMsg("basic", "");
-    const text = pTexts.basic;
+    const text = normalizePasteText(pTexts.basic);
     const okRacer = parseRacer(text, "basic");
     const okSt = parseStPaste(text, "basic");
     const okKimari = parseKimari(text, "basic");
@@ -2634,52 +2291,122 @@ export default function App() {
       help: "枠別情報ページを広めにコピペ。枠別成績・平均ST・逃げシミュレーション・決まり手を一括で読み取ります。平均STは今期/直近6ヶ月/直近3ヶ月/直近1ヶ月/当地/一般戦/SG/G1/初日/最終日/ナイター/F持に対応。",
       parse: parseBasicInfo,
     },
+    motor: {
+      title: "📋 モーター",
+      help: "モータ情報の 番号〜3連対率 をコピペ。モーター番号・勝率・1着率・2連対率・3連対率を各艇カードに表示します。",
+      parse: parseMotor,
+    },
+    tenji: {
+      title: "📋 展示タイム",
+      help: "直前情報の 進入〜チルト をコピペ。進入・展示・周回・周り足・体重・チルトを一括入力します（直線・ST・調整重量は無視。STは平均ST欄を上書きしません）。",
+      parse: parseTenji,
+    },
+    odds: {
+      title: "📋 オッズ",
+      help: "オッズ一覧（3連単）を選手名ごと丸ごとコピペ。買い目（本線・対抗・穴）の合成オッズを自動計算します。",
+      parse: parseOdds,
+    },
   };
 
   const setCourse = (boat, c) =>
     setCourses((p) => ({ ...p, [boat]: Number(c) }));
-  const [inputs, setInputs] = useState({
-    1: empty(), 2: empty(), 3: empty(), 4: empty(), 5: empty(), 6: empty(),
-  });
-
-  const emptyBoatMap = (value) => ({ 1: value, 2: value, 3: value, 4: value, 5: value, 6: value });
-
-  const resetRaceAutoData = () => {
-    setInputs({ 1: empty(), 2: empty(), 3: empty(), 4: empty(), 5: empty(), 6: empty() });
-    setWeights(emptyBoatMap(""));
-    setTilts(emptyBoatMap(""));
-    setCourses({ 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6 });
-    setSts(emptyBoatMap(""));
-    setFHold(emptyBoatMap(false));
-    setFSts(emptyBoatMap(""));
-    setMotors(emptyBoatMap(null));
-    setRacerProfiles({});
-    setOdds(null);
-    setWind("無風");
-  };
+  const [inputs, setInputs] = useState(emptyInputs);
 
   const set = (boat, key, v) =>
     setInputs((p) => ({ ...p, [boat]: { ...p[boat], [key]: v } }));
 
+  // ── 端末内自動保存（ファイル保存なしで、同じ端末・同じブラウザなら復元） ──
+  // 保存対象はユーザー作成の「買い目リスト」と「配当入力」のみ。
+  // 展示・モーター・オッズ・枠別情報・ST・F持ち・風など、外部サイト由来の入力は端末内保存しない。
+  //
+  // Googleログイン機能が有効な環境では：
+  //   ・cloudAuth.ready が完了するまで端末内保存の復元を走らせない。
+  //   ・ログイン中（cloudAuth.user あり）は端末内保存を復元せず、クラウド復元に任せる。
+  //   ・端末内保存からの復元は「未ログインユーザー」専用とする。
+  const deviceRestoreDoneRef = useRef(false);
+  useEffect(() => {
+    // クラウド有効環境では、認証状態が確定するまで待つ（端末内データを先に入れない）
+    if (CLOUD_SAVE_ENABLED && !cloudAuth.ready) return;
+    // 一度処理したら再実行しない
+    if (deviceRestoreDoneRef.current) return;
+    deviceRestoreDoneRef.current = true;
+
+    // ログイン中は端末内保存を復元しない（クラウドが正）。autoSaveReady だけ立てて終了。
+    if (CLOUD_SAVE_ENABLED && cloudAuth.user?.id) {
+      setAutoSaveReady(true);
+      return;
+    }
+
+    // 未ログイン（またはクラウド無効環境）：端末内保存から復元
+    const saved = loadDeviceAutoSave();
+    if (!saved) {
+      setAutoSaveReady(true);
+      return;
+    }
+    skipNextTicketAutoSaveRef.current = true;
+    setCart(normalizeSavedArray(saved.cart, []));
+    setPayoutOddsInput(normalizeSavedString(saved.payoutOddsInput, ""));
+    setAutoSaveMsg("✓ 前回の買い目リスト・配当を端末内保存から復元しました");
+    setAutoSaveReady(true);
+    const t = setTimeout(() => setAutoSaveMsg(""), 4000);
+    return () => clearTimeout(t);
+    // cloudAuth.ready / user が確定したタイミングで一度だけ実行
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cloudAuth.ready, cloudAuth.user?.id]);
+
+  useEffect(() => {
+    if (!autoSaveReady) return;
+    // ログイン中は端末内保存を更新しない（クラウドが正。未ログイン用バックアップを上書きしない）
+    if (CLOUD_SAVE_ENABLED && cloudAuth.user?.id) return;
+    if (skipNextTicketAutoSaveRef.current) {
+      skipNextTicketAutoSaveRef.current = false;
+      return;
+    }
+    const ok = saveDeviceAutoSave({ cart, payoutOddsInput });
+    if (!ok) {
+      setAutoSaveMsg("端末内自動保存の容量が足りない可能性があります");
+    }
+  }, [autoSaveReady, cart, payoutOddsInput, cloudAuth.user?.id]);
+
+  const correctionCache = useMemo(() => buildCorrectionCache(correctionTable), [correctionTable]);
+
+  useEffect(() => {
+    let alive = true;
+    async function run() {
+      if (!CLOUD_SAVE_ENABLED) {
+        if (alive) setCorrectionStatus("固定補正");
+        return;
+      }
+      try {
+        setCorrectionStatus("補正読込中");
+        const table = await fetchLatestCorrectionTables();
+        if (!alive) return;
+        if (table) {
+          setCorrectionTable(table);
+          setCorrectionStatus(`DB補正 ${table.days || 365}日`);
+        } else {
+          setCorrectionStatus("固定補正");
+        }
+      } catch (_) {
+        if (alive) setCorrectionStatus("固定補正");
+      }
+    }
+    run();
+    return () => { alive = false; };
+  }, []);
+
   const result = useMemo(() => {
     if (!venue) return null;
-    const useDisplayCorrection = usesDisplayCorrection(venue);
     const sums = {};
-    let avg = 0;
-    if (useDisplayCorrection) {
-      for (let b = 1; b <= 6; b++) {
-        const { tenji, isshu, mawari } = inputs[b];
-        const t = parseFloat(tenji), i = parseFloat(isshu), m = parseFloat(mawari);
-        // 合算値は「展示＋1周＋回り足」。直線は参考指標として表示・保存するが、合算・平均との差には含めない。
-        if ([t, i, m].some((x) => isNaN(x))) return null;
-        sums[b] = t + i + m;
-      }
-      avg = Object.values(sums).reduce((a, b) => a + b, 0) / 6;
-    } else {
-      for (let b = 1; b <= 6; b++) sums[b] = 0;
+    for (let b = 1; b <= 6; b++) {
+      const { tenji, isshu, mawari } = inputs[b];
+      const t = parseFloat(tenji), i = parseFloat(isshu), m = parseFloat(mawari);
+      if ([t, i, m].some((x) => isNaN(x))) return null;
+      sums[b] = t + i + m;
     }
-    const zeroAdj = { w1: 0, w2: 0, w3: 0, top3: 0, tier: 0, tierMax: 1 };
-    const { base, season: curSeason, seasonal: usingSeasonal } = getVenueBase(venue, raceDate);
+    const avg = Object.values(sums).reduce((a, b) => a + b, 0) / 6;
+    const venueBaseInfo = getVenueBaseWithCorrections(venue, raceDate, correctionCache);
+    const { base, season: curSeason, seasonal: usingSeasonal, dynamic: usingDynamicVenueBase } = venueBaseInfo;
     // 縮小推定の基準値: 2連/3連対率は「この6艇の平均」を基準に、母数が少ない値を寄せる
     const fieldMean = (arr) => {
       const v = (arr || []).filter((x) => x != null);
@@ -2689,12 +2416,14 @@ export default function App() {
     const ren3Prior = fieldMean(racerStats?.ren3?.[racerCat]);
     const rows = [];
     for (let b = 1; b <= 6; b++) {
-      const diff = useDisplayCorrection ? avg - sums[b] : 0; // プラス＝良化
+      const diff = avg - sums[b]; // プラス＝良化
       const course = courses[b];
-      const adj = useDisplayCorrection ? lookup(course, diff) : zeroAdj;             // 江戸川は展示補正なし
-      const baseRate = base[course - 1];            // 進入コースの基本場平均1着率（季節別・場別）
-      const windAdj = +(WIND[wind][course - 1] - WIND["無風"][course - 1]).toFixed(1); // 無風基準の風補正（AI評価の風項目でのみ使用）
-      const final1 = baseRate + adj.w1;             // 基準 + タイム補正。風補正はここに混ぜない（二重反映防止）
+      const adj = lookup(course, diff);             // 進入コース基準で補正表を参照
+      const baseRate = base[course - 1];            // 進入コースの場別1着率（平均）
+      const windInfo = getWindAdjWithCorrections(venue, wind, course, correctionCache);
+      const windAdj = windInfo.value; // 無風基準の風補正（DB補正優先、取れなければ固定WIND）
+      const venueWindRate = baseRate + windAdj;     // 場平均 + 風補正（表示用）
+      const final1 = baseRate + adj.w1;             // 枠基準 + タイム補正（風はAI評価の風項目で1回だけ反映）
       // 本人の枠別成績ベース（選手成績貼り付け時のみ）
       // 母数が少ない成績は縮小推定で基準値に寄せる（1着率→コース場平均、2連/3連→6艇平均）
       const rW1 = shrinkRate(racerStats?.win1?.[racerCat]?.[b - 1] ?? null, racerStats?.win1N?.[racerCat]?.[b - 1] ?? null, baseRate);
@@ -2704,7 +2433,8 @@ export default function App() {
       const racerR2final = rR2 != null ? rR2 + adj.w1 + adj.w2 : null;   // 本人2連対率＋補正
       const racerR3final = rR3 != null ? rR3 + adj.top3 : null;          // 本人3連対率＋補正
       rows.push({
-        boat: b, course, sum: sums[b], diff, baseRate, windAdj, final1,
+        boat: b, course, sum: sums[b], diff, baseRate, windAdj, venueWindRate, final1,
+        dynamicWind: windInfo.dynamic,
         racerW1: rW1, racerR2: rR2, racerR3: rR3,
         racerR1final, racerR2final, racerR3final,
         ...adj,
@@ -2717,8 +2447,8 @@ export default function App() {
       ? [...rows].sort((a, b) => sortKey(b) - sortKey(a))
       : null;
     const dup = new Set(Object.values(courses)).size !== 6;
-    return { avg, rows, rank, racerRank, dup, season: curSeason, usingSeasonal };
-  }, [inputs, venue, wind, courses, racerStats, racerCat, raceDate]);
+    return { avg, rows, rank, racerRank, dup, season: curSeason, usingSeasonal, usingDynamicVenueBase };
+  }, [inputs, venue, wind, courses, racerStats, racerCat, raceDate, correctionCache]);
 
   // スリット予測（平均ST／F持ちはF後STを優先、不明はそのままマーク表示）
   const slit = useMemo(() => {
@@ -2904,7 +2634,7 @@ export default function App() {
         モーター: cMotor,
         風: cWind,
         ST: stScore,
-        枠基準: cBase,  // 基本場平均＋展示補正ベース（風は含めない）
+        枠基準: cBase,  // 場別コース1着率ベース
         総合印: cGoods, // 4項目チェック（枠/展/機/風）の合計
       };
       const score = cGoods + cRacer + cDiff + cMotor + cWind + cBase + stScore;
@@ -2969,9 +2699,8 @@ export default function App() {
     const ranked = [...evals].sort((a, b) => b.score - a.score);
     ranked.forEach((r, i) => { r.rankPos = i + 1; });
 
-    // ── 項目別の配点（順位ベース・同値は同点）──
-    //   成績/展示/モーター/ST: 1位20点〜6位0点（4点刻み）
-    //   枠基準/風: 1位10点〜6位0点（2点刻み）
+    // ── 項目別の配点（連続値・レース内で最小0〜最大満点に正規化）──
+    //   成績/展示/モーター/ST: 20点満点、枠基準/風: 10点満点。差の大きさを点数に反映（接戦は僅差、大差は開く）。
     {
       // 指標が大きいほど良い前提。同値は同順位（＝同点）にする。
       const rankPoints = (getVal, step) => {
@@ -3005,7 +2734,7 @@ export default function App() {
       const ptSeisek = rankPoints((r) => (r.racerR1final ?? -Infinity), 4); // 補正込み1着率
       const ptTenji  = rankPoints(tenjiVal, 4);                              // 展示（段階ベース）
       const ptMotor  = rankPoints((r) => (motors[r.boat]?.ren2 ?? -Infinity), 4); // モーター2連対率
-      const ptWaku   = rankPoints((r) => (r.final1 ?? -Infinity), 2);        // 枠基準（基本場平均＋展示補正／風なし）10点満点
+      const ptWaku   = rankPoints((r) => (r.final1 ?? -Infinity), 2);        // 枠基準（風は含めず、風項目で1回だけ反映）10点満点
       const ptSt     = rankPoints((r) => (r.stDiff ?? -Infinity), 4);        // ST（速いほど＋）20点満点
       const ptKaze   = rankPoints((r) => (r.windAdj ?? -Infinity), 2);       // 風補正
 
@@ -3378,7 +3107,7 @@ export default function App() {
       const cand = allTickets.sort((a, b) => likeliness(a) - likeliness(b)).slice(0, 3);
       choBet = {
         label: "超穴",
-        desc: "オッズ未取得のため目安（オッズが自動取得されると合成10倍超で精選）",
+        desc: "オッズ未入力のため目安（オッズを貼ると合成10倍超で精選）",
         tickets: cand,
       };
     }
@@ -3555,7 +3284,7 @@ export default function App() {
       let dataPts = 0;
       const hasRacer = rows.some((r) => r.racerR1final != null || r.racerR3final != null);
       if (hasRacer) dataPts += 14;          // 選手成績
-      dataPts += 8;                         // 展示・1周・回り足（合算対象）＋直線（参考指標）
+      dataPts += 8;                         // 展示・周り足（必須入力なので常時加点）
       if (motorAvg != null) dataPts += 6;   // モーター
       if (kimari) dataPts += 6;             // 決まり手
       if (Number(payoutOddsInput) > 0) dataPts += 6;  // オッズ
@@ -4112,43 +3841,13 @@ export default function App() {
     };
   }, [statFilter]);
 
-
-
   // 現在のモードの収支履歴（通常=実購入 / 練習=仮想購入）
   // 集計と履歴表示がズレないよう、期間・場の絞り込み後の配列を使う。
   const activeBetRecords = statFilter.bets;
+
   const fmt = (n, d = 2) => n.toFixed(d);
   const sign = (n) => (n > 0 ? `+${n}` : `${n}`);
   const col = (n) => (n > 0 ? "#5dd39e" : n < 0 ? "#ff8a80" : "#9db5cc");
-
-  const venueCardRank = (st, v) => {
-    const raw = String(st?.grade || st?.rank || "").toUpperCase();
-    if (/SG/.test(raw)) return "SG";
-    if (/G1|Ｇ1|GⅠ|ＧⅠ/.test(raw)) return "G1";
-    if (/G2|Ｇ2|GⅡ|ＧⅡ/.test(raw)) return "G2";
-    if (/G3|Ｇ3|GⅢ|ＧⅢ/.test(raw)) return "G3";
-    return AUTO_FETCH_VENUES.includes(v) ? "一般" : "準備";
-  };
-
-  const venueCardDay = (st) => {
-    const raw = String(st?.eventDay || "").trim();
-    if (raw) return raw;
-    if (st?.status === "発売中" || st?.nextRace) return "本日開催";
-    return "";
-  };
-
-  const venueCardMark = (v, st) => {
-    const r = Number(st?.nextRace || 0);
-    const t = String(st?.nextDeadline || "");
-    const hour = Number((t.match(/^(\d{1,2}):/) || [])[1] || 0);
-    const night = NIGHT_VENUES.includes(v) || hour >= 17;
-    const morning = MORNING_VENUES.includes(v) || (hour > 0 && hour < 13);
-    if (night) return { text: "宵", bg: "rgba(111,92,255,0.24)", color: "#d5ccff" };
-    if (morning) return { text: "朝", bg: "rgba(46,170,255,0.22)", color: "#9fdcff" };
-    if (r >= 10) return { text: "終盤", bg: "rgba(255,184,77,0.22)", color: "#ffd28a" };
-    return { text: "昼", bg: "rgba(93,211,158,0.18)", color: "#7ee2aa" };
-  };
-
   const pill = (v) => (
     <span style={{
       display: "inline-block", minWidth: 44, textAlign: "center",
@@ -4173,11 +3872,10 @@ export default function App() {
             場別コース率 × タイム補正
           </h1>
           <p style={{ fontSize: 12, color: "#9db5cc", margin: "6px 0 0", lineHeight: 1.6 }}>
-            場ごとの基本場平均1着率を基準に、展示タイム＋1周（桐生は半周ラップ）＋まわり足の
-            差（平均−合計）を内部計算に使います。風はAI評価内の風項目で1回だけ反映します。
-            進入・風向きが変わる場合は各艇のコースや風プルダウンを変更してください。
+            場ごとのコース別1着率（平均）を基準に、展示タイム＋一周＋まわり足の
+            差（平均−合計）を反映し、風はAI総合評価内で1回だけ加味します。
+            進入が変わる場合は各艇のコースを変更してください。
           </p>
-
           {autoSaveMsg && (
             <div style={{
               marginTop: 10, padding: "8px 10px", borderRadius: 8,
@@ -4229,95 +3927,6 @@ export default function App() {
           )}
         </header>
 
-
-        {/* 初期画面：開催場一覧 */}
-        <section style={{ marginBottom: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 }}>
-            <div>
-              <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8", marginBottom: 2 }}>開催場一覧</div>
-              <div style={{ fontSize: 12, color: "#9db5cc" }}>開催中の場だけ選択できます。公式締切時刻から次Rを自動選択します</div>
-            </div>
-            <button
-              onClick={() => { const v = venue || "蒲郡"; selectVenueQuick(v); }}
-              disabled={autoLoading}
-              style={{
-                padding: "8px 10px", borderRadius: 999, border: "1px solid #2c4762",
-                background: "#16273c", color: "#e8eef5", fontSize: 11, fontWeight: 800,
-                cursor: autoLoading ? "wait" : "pointer", whiteSpace: "nowrap",
-              }}
-            >
-              {autoLoading ? "更新中…" : "次R更新"}
-            </button>
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
-            {VENUE_ORDER.map((v) => {
-              const selected = venue === v;
-              const autoOk = AUTO_FETCH_VENUES.includes(v);
-              const st = venueStatuses[v];
-              const noRace = !!(st?.noRace || st?.status === "未開催");
-              const allClosed = !!(st?.allClosed || st?.status === "発売終了");
-              const loading = !st || venueStatusLoading;
-              const held = !!(st && !noRace && !allClosed && st.nextRace);
-              const heldText = loading ? "確認中" : noRace ? "開催なし" : "本日開催";
-              const raceLine = noRace
-                ? "未開催"
-                : allClosed
-                  ? "発売終了"
-                  : held
-                    ? `${st.nextRace}R / ${st.nextDeadline || "締切確認中"}`
-                    : "確認中";
-              const disabled = noRace;
-              return (
-                <button
-                  key={v}
-                  onClick={() => { if (!disabled) selectVenueQuick(v); }}
-                  disabled={disabled}
-                  title={disabled ? `${v}は本日未開催です` : `${v}を選択`}
-                  style={{
-                    minHeight: 104,
-                    padding: 0,
-                    borderRadius: 8,
-                    cursor: disabled ? "not-allowed" : "pointer",
-                    background: selected
-                      ? "linear-gradient(180deg, #314c79 0%, #1f3552 100%)"
-                      : disabled
-                        ? "linear-gradient(180deg, #35383b 0%, #2d3032 100%)"
-                        : allClosed
-                          ? "linear-gradient(180deg, #293342 0%, #202b38 100%)"
-                          : "linear-gradient(180deg, #22344f 0%, #17263b 100%)",
-                    color: disabled ? "#8b9198" : "#e8eef5",
-                    border: selected ? "2px solid #6c8cff" : disabled ? "1px solid #3f4245" : "1px solid #2c4762",
-                    boxShadow: selected ? "0 0 0 2px rgba(108,140,255,0.18)" : "none",
-                    textAlign: "left",
-                    overflow: "hidden",
-                    opacity: disabled ? 0.62 : 1,
-                  }}
-                >
-                  <div style={{
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    padding: "8px 7px", background: disabled ? "rgba(255,255,255,0.04)" : "rgba(113,143,190,0.18)",
-                    borderBottom: "1px solid rgba(255,255,255,0.06)",
-                  }}>
-                    <span style={{ textAlign: "center", fontSize: 19, fontWeight: 900, lineHeight: 1.1 }}>{v}</span>
-                  </div>
-                  <div style={{ padding: "8px 7px 9px", textAlign: "center" }}>
-                    <div style={{ fontSize: 12, color: disabled ? "#8b9198" : "#c4d3e6", fontWeight: 800, minHeight: 20 }}>
-                      {heldText}
-                    </div>
-                    <div style={{
-                      marginTop: 5,
-                      fontSize: noRace || allClosed ? 13 : 15,
-                      color: noRace ? "#9ba0a5" : allClosed ? "#ffd28a" : "#fff",
-                      fontWeight: 900,
-                      letterSpacing: "0.02em",
-                    }}>{raceLine}</div>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-
         {/* 日付・場・レースの選択 */}
         <div style={{ marginBottom: 16 }}>
           <div style={{ fontSize: 11, color: "#7da3c8", marginBottom: 6 }}>日付</div>
@@ -4351,7 +3960,7 @@ export default function App() {
           <div style={{ fontSize: 11, color: "#7da3c8", marginBottom: 6 }}>開催場を選択</div>
           <select
             value={venue}
-            onChange={(e) => { const v = e.target.value; if (v) selectVenueQuick(v); else setVenue(""); }}
+            onChange={(e) => setVenue(e.target.value)}
             style={{
               width: "100%", padding: "11px 12px", fontSize: 16,
               background: "#16273c", color: venue ? "#fff" : "#7da3c8",
@@ -4367,8 +3976,7 @@ export default function App() {
           <div style={{ fontSize: 11, color: "#7da3c8", margin: "12px 0 6px" }}>レース</div>
           <select
             value={raceNo}
-            onChange={(e) => { setRaceNo(e.target.value); setSalesEnded(false); setVenueNotHeld(false); resetRaceAutoData(); }}
-            disabled={salesEnded || venueNotHeld}
+            onChange={(e) => setRaceNo(e.target.value)}
             style={{
               width: "100%", padding: "11px 12px", fontSize: 16,
               background: "#16273c", color: "#fff",
@@ -4379,40 +3987,6 @@ export default function App() {
               <option key={n} value={String(n)}>{n}R</option>
             ))}
           </select>
-          {venue && !salesEnded && !venueNotHeld && (() => {
-            const st = venueStatuses[venue];
-            const sched = officialSchedule && officialSchedule.venue === venue && Array.isArray(officialSchedule.schedule) ? officialSchedule.schedule : [];
-            const hit = sched.find((x) => String(x.race) === String(raceNo));
-            const deadline = hit?.deadline || (st && String(st.nextRace) === String(raceNo) ? st.nextDeadline : "");
-            return deadline ? (
-              <div style={{
-                marginTop: 8, padding: "9px 10px", borderRadius: 8,
-                background: "rgba(61,122,184,0.16)", color: "#dcecff",
-                border: "1px solid rgba(90,135,255,0.35)", fontSize: 13, fontWeight: 900,
-              }}>
-                締切時刻：{deadline}　<span style={{ fontSize: 11, color: "#9db5cc" }}>※公式締切時刻ベース</span>
-              </div>
-            ) : null;
-          })()}
-
-          {salesEnded && venue && (
-            <div style={{
-              marginTop: 8, padding: "8px 10px", borderRadius: 8,
-              background: "rgba(217,75,67,0.18)", color: "#ffb3ad",
-              border: "1px solid rgba(217,75,67,0.35)", fontSize: 12, fontWeight: 800,
-            }}>
-              {venue}は本日の全レース発売終了です
-            </div>
-          )}
-          {venueNotHeld && venue && (
-            <div style={{
-              marginTop: 8, padding: "8px 10px", borderRadius: 8,
-              background: "rgba(125,163,200,0.14)", color: "#b8cce0",
-              border: "1px solid #2c4762", fontSize: 12, fontWeight: 800,
-            }}>
-              {venue}は本日未開催です
-            </div>
-          )}
 
           {venue && (
             <div style={{
@@ -4420,9 +3994,17 @@ export default function App() {
               marginTop: 12, marginBottom: 6,
               paddingLeft: 8, borderLeft: "3px solid #3d7ab8",
             }}>
-              基本場平均1着率
+              各コースの平均1着率
               {venue && (() => {
-                const { season, seasonal } = getVenueBase(venue, raceDate);
+                const info = getVenueBaseWithCorrections(venue, raceDate, correctionCache);
+                const { season, seasonal, dynamic } = info;
+                if (dynamic) {
+                  return (
+                    <span style={{ fontSize: 10, fontWeight: 600, color: "#7fc8a8", marginLeft: 8 }}>
+                      DB補正・直近{correctionTable?.days || 365}日
+                    </span>
+                  );
+                }
                 return seasonal ? (
                   <span style={{ fontSize: 10, fontWeight: 600, color: "#7fc8a8", marginLeft: 8 }}>
                     {season}季 <span style={{ color: "#5e9a82" }}>{SEASON_PERIOD[season]}</span>
@@ -4441,7 +4023,7 @@ export default function App() {
               display: "flex", gap: 4, fontSize: 11,
               color: "#9db5cc", flexWrap: "wrap",
             }}>
-              {getVenueBase(venue, raceDate).base.map((r, i) => (
+              {getVenueBaseWithCorrections(venue, raceDate, correctionCache).base.map((r, i) => (
                 <span key={i} style={{
                   background: "#16273c", borderRadius: 6, padding: "4px 8px",
                 }}>
@@ -4469,10 +4051,15 @@ export default function App() {
             ))}
           </select>
 
-          {/* 風による増減値は内部計算のみ。画面には直接表示しない。 */}
+          <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 8 }}>
+            補正状態：{correctionStatus}
+            {correctionTable?.updated_at ? ` ／ 更新 ${String(correctionTable.updated_at).slice(0, 10)}` : ""}
+          </div>
+
+          {/* 風による％増減は内部計算のみ。画面には直接表示しない。 */}
         </div>
 
-        {/* 枠別情報一括入力（他のコピペ欄は非表示） */}
+        {/* 貼り付け入力（枠別情報は一括入力） */}
         <div style={{
           display: "flex", alignItems: "center", gap: 8,
           marginBottom: 10, flexWrap: "wrap",
@@ -4502,15 +4089,6 @@ export default function App() {
             🗑 オールクリア
           </button>
         </div>
-        {autoMsg && (
-          <div style={{
-            margin: "-2px 0 10px", padding: "8px 10px", borderRadius: 8,
-            background: autoMsg.startsWith("✓") ? "#123326" : "#3a2030",
-            color: autoMsg.startsWith("✓") ? "#7ee2aa" : "#ff8a80",
-            border: autoMsg.startsWith("✓") ? "1px solid #1c7047" : "1px solid #5e2d3a",
-            fontSize: 12, fontWeight: 700,
-          }}>{autoMsg}</div>
-        )}
 
         {openPanel && (
           <div style={{
@@ -4520,8 +4098,11 @@ export default function App() {
               {PANELS[openPanel].help}
             </div>
             <textarea
+              key={`${openPanel}-${pasteResetKey}`}
               value={pTexts[openPanel]}
               onChange={(e) => setPText(openPanel, e.target.value)}
+              onInput={(e) => handlePasteAreaInput(openPanel, e)}
+              onPaste={(e) => handlePasteAreaPaste(openPanel, e)}
               placeholder="ここに貼り付け"
               rows={5}
               style={{
@@ -4644,13 +4225,10 @@ export default function App() {
         </div>
 
         <div style={{ display: "grid", gap: 8, marginBottom: 24 }}>
-          {[1, 2, 3, 4, 5, 6].map((b) => {
-            const noOriginalDisplay = !usesDisplayCorrection(venue);
-            const hasHiddenTiming = !noOriginalDisplay && ["tenji", "isshu", "mawari", "chokusen"].some((k) => String(inputs[b][k] ?? "").trim() !== "");
-            return (
+          {[1, 2, 3, 4, 5, 6].map((b) => (
             <div key={b} style={{
-              display: "grid", gridTemplateColumns: "44px 72px 1fr",
-              gap: 8, alignItems: "center",
+              display: "grid", gridTemplateColumns: "44px 58px 1fr 1fr 1fr",
+              gap: 6, alignItems: "center",
               background: "#16273c", borderRadius: 10, padding: "8px 10px",
             }}>
               <div style={{
@@ -4660,31 +4238,6 @@ export default function App() {
                 fontWeight: 800, fontSize: 17,
                 border: b === 1 ? "1px solid #ccc" : "none",
               }}>{b}</div>
-              {racerProfiles[b] && (
-                <div style={{
-                  gridColumn: "2 / -1", display: "flex", gap: 6, alignItems: "baseline",
-                  flexWrap: "wrap", padding: "2px 0 4px", borderBottom: "1px solid #1d3149",
-                }}>
-                  <span style={{
-                    fontSize: 10, fontWeight: 900, color: "#7da3c8",
-                    background: "#0e1b2c", border: "1px solid #2c4762", borderRadius: 5, padding: "2px 6px",
-                  }}>
-                    {racerProfiles[b].grade}{racerProfiles[b].regNo ? ` / ${racerProfiles[b].regNo}` : ""}
-                  </span>
-                  <span style={{ fontSize: 14, fontWeight: 900, color: "#fff", display: "inline-flex", alignItems: "center", gap: 4 }}>
-                    {racerProfiles[b].name}
-                    {racerProfiles[b].isFemale && <span title="女子選手" style={{ color: "#ff6b8a", fontSize: 15, lineHeight: 1 }}>♥</span>}
-                  </span>
-                  <span style={{ fontSize: 11, color: "#9db5cc" }}>
-                    {racerProfiles[b].branch}{racerProfiles[b].birthplace ? ` / ${racerProfiles[b].birthplace}` : ""}{racerProfiles[b].age ? ` / ${racerProfiles[b].age}歳` : ""}
-                  </span>
-                  {racerProfiles[b].fl && (
-                    <span style={{ fontSize: 10, fontWeight: 900, color: "#ff8a80", background: "#3a2030", borderRadius: 5, padding: "2px 6px" }}>
-                      {racerProfiles[b].fl}
-                    </span>
-                  )}
-                </div>
-              )}
               <div>
                 <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 2 }}>コース</div>
                 <select
@@ -4703,22 +4256,23 @@ export default function App() {
                   ))}
                 </select>
               </div>
-              <div style={{ alignSelf: "stretch", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-                <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 4 }}>{noOriginalDisplay ? "展示補正" : "展示データ"}</div>
-                <div style={{
-                  display: "inline-flex", alignSelf: "flex-start", alignItems: "center", gap: 6,
-                  padding: "6px 10px", borderRadius: 999,
-                  background: noOriginalDisplay ? "#233044" : hasHiddenTiming ? "#143125" : "#2a2230",
-                  color: noOriginalDisplay ? "#9db5cc" : hasHiddenTiming ? "#5dd39e" : "#d3a9cf",
-                  border: noOriginalDisplay ? "1px solid #344b68" : hasHiddenTiming ? "1px solid #245740" : "1px solid #5b4257",
-                  fontSize: 12, fontWeight: 700,
-                }}>
-                  {noOriginalDisplay ? "なし" : hasHiddenTiming ? "✓ 取得済" : "未取得"}
+              {FIELDS.map((f) => (
+                <div key={f.key}>
+                  <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 2 }}>{f.label}</div>
+                  <input
+                    type="number" inputMode="decimal" step="0.01"
+                    value={inputs[b][f.key]}
+                    onChange={(e) => set(b, f.key, e.target.value)}
+                    placeholder="0.00"
+                    style={{
+                      width: "100%", boxSizing: "border-box",
+                      background: "#0e1b2c", color: "#fff",
+                      border: "1px solid #2c4762", borderRadius: 6,
+                      padding: "7px 8px", fontSize: 15,
+                    }}
+                  />
                 </div>
-                <div style={{ fontSize: 10, color: "#5e7a92", marginTop: 4, lineHeight: 1.4 }}>
-                  {noOriginalDisplay ? "江戸川はオリジナル展示なし。内部補正にも使いません" : "展示・1周・回り足・直線は内部計算のみに使用"}
-                </div>
-              </div>
+              ))}
 
               {/* ST・F持ち・チルト（カード2段目） */}
               <div style={{
@@ -4878,8 +4432,7 @@ export default function App() {
                 </div>
               )}
             </div>
-            );
-          })}
+          ))}
         </div>
 
         {/* スリット予測 */}
@@ -4981,7 +4534,7 @@ export default function App() {
               flexWrap: "wrap", marginBottom: 10,
             }}>
               <span style={{ fontSize: 19, fontWeight: 800, color: "#fff" }}>
-                {venue}
+                {venue}（平均: {fmt(result.avg)}）
               </span>
               <span style={{ fontSize: 12, color: "#9db5cc" }}>{wind}</span>
               {aiEval && (
@@ -5028,7 +4581,7 @@ export default function App() {
               </div>
             )}
 
-            {/* 展示系の合計・平均との差表は非表示（内部計算には反映） */}
+            {/* 展示・1周・周り足・合計・差の表は非表示（内部計算のみ） */}
 
             {/* 枠別成績＋補正の予想ランキング */}
             {result.racerRank && (
@@ -5134,7 +4687,7 @@ export default function App() {
                                   <div style={{ width: `${Math.max((main / max) * 100, 0)}%`, height: "100%", background: "#5a87b8" }} />
                                 </div>
                                 <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 2 }}>
-                                  {r.racerR2 != null ? `${r.racerR2}%` : "−"} <span style={{ color: col(r.w1 + r.w2) }}>{sign(+(r.w1 + r.w2).toFixed(1))}%</span>
+                                  2連 {main != null ? `${fmt(main, 1)}%` : "−"}
                                 </div>
                               </div>
                               <span style={{ width: 56, textAlign: "right", fontWeight: 800, fontSize: 16 }}>
@@ -5180,7 +4733,7 @@ export default function App() {
                                   <div style={{ width: `${Math.max((main / max) * 100, 0)}%`, height: "100%", background: "#5a87b8" }} />
                                 </div>
                                 <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 2 }}>
-                                  3連 {r.racerR3final != null ? `${fmt(r.racerR3final, 1)}%` : "−"}
+                                  3連 {main != null ? `${fmt(main, 1)}%` : "−"}
                                 </div>
                               </div>
                               <span style={{ width: 56, textAlign: "right", fontWeight: 800, fontSize: 16 }}>
@@ -5194,46 +4747,6 @@ export default function App() {
                 </div>
               </>
             )}
-
-            {/* 予想1着率ランキング */}
-            <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8", marginBottom: 8 }}>
-              進入反映後の基本1着率
-            </div>
-            <div style={{ display: "grid", gap: 6, marginBottom: 28 }}>
-              {[...result.rows]
-                .sort((a, b) => b.baseRate - a.baseRate)
-                .map((r, i) => {
-                const venue1 = r.baseRate;
-                const all = result.rows.map((x) => x.baseRate);
-                const max = Math.max(...all, 1);
-                const w = Math.max((venue1 / max) * 100, 0);
-                return (
-                  <div key={r.boat} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{ width: 18, fontSize: 12, color: "#7da3c8" }}>{i + 1}.</span>
-                    <span style={{
-                      display: "inline-flex", width: 26, height: 26, borderRadius: 6,
-                      background: LANE[r.boat].bg, color: LANE[r.boat].fg,
-                      alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 14,
-                      border: r.boat === 1 ? "1px solid #ccc" : "none", flexShrink: 0,
-                    }}>{r.boat}</span>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ height: 18, background: "#16273c", borderRadius: 4, overflow: "hidden" }}>
-                        <div style={{ width: `${w}%`, height: "100%", background: "#3d7ab8" }} />
-                      </div>
-                      <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 2 }}>
-                        {r.course}コース進入
-                        {tilts[r.boat] !== "" && parseFloat(tilts[r.boat]) >= 1.0 && (
-                          <span style={{ color: "#f9c513", fontWeight: 800 }}> ⚡伸び警戒</span>
-                        )}
-                      </div>
-                    </div>
-                    <span style={{ width: 56, textAlign: "right", fontWeight: 800, fontSize: 16 }}>
-                      {fmt(venue1, 1)}%
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
 
             {/* 逃げシミュレーション */}
             {nigeSim && (
@@ -5264,7 +4777,7 @@ export default function App() {
                         )}
                       </div>
                       <div style={{ overflowX: "auto" }}>
-                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 480 }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 360 }}>
                           <thead>
                             <tr style={{ color: "#7da3c8", fontSize: 10 }}>
                               {["艇", "逃がし2着", "逃がし3着", "1-X出目"].map((h, i) => (
@@ -5309,7 +4822,7 @@ export default function App() {
                         </table>
                       </div>
                       <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 4 }}>
-                        補正値は内部計算のみに使用しています。
+                        ％増減は内部計算のみに使用しています。
                       </div>
                     </>
                   );
@@ -5358,7 +4871,7 @@ export default function App() {
                         }}>{r.boat}</span>
                         <span style={{ fontSize: 11, color: "#7da3c8" }}>{r.course}C進入</span>
                         <span style={{ fontSize: 11, color: "#7da3c8", marginLeft: "auto" }}>
-                          良 {r.goods}/4 ｜ 枠基準参考 {fmt(r.final1, 1)}%
+                          良 {r.goods}/4 ｜ 場平均＋風 {fmt(r.venueWindRate, 1)}%
                         </span>
                       </div>
 
@@ -5428,7 +4941,7 @@ export default function App() {
                               );
                             })}
                             <div style={{ fontSize: 9, color: "#5e7a92", marginTop: 5, lineHeight: 1.5 }}>
-                              成績・展示・ﾓｰﾀｰ・ST=各20点（4点刻み）、枠基準・風=各10点（2点刻み）。同値は同点。
+                              成績・展示・ﾓｰﾀｰ・ST=各20点、枠基準・風=各10点。この6艇の中で最も良い艇が満点、最も悪い艇が0点になるよう、差の大きさに応じて配点（接戦は僅差、大差は開く）。
                             </div>
                           </div>
                         );
@@ -5656,7 +5169,7 @@ export default function App() {
                           </div>
                         ) : (
                           <div style={{ fontSize: 11, color: "#5e7a92" }}>
-                            枠別情報一括から決まり手データを読み込むと、展開別シナリオが表示されます。
+                            決まり手データを貼ると、展開別シナリオが表示されます。
                           </div>
                         )}
                       </div>
@@ -5691,7 +5204,7 @@ export default function App() {
                         </div>
                       </div>
                     )}
-                    {/* 期待値ランキング（推定確率×オッズ）: オッズ入力/取得時のみ表示 */}
+                    {/* 期待値ランキング（推定確率×オッズ）: オッズ入力時のみ表示 */}
                     {aiEval.evList && aiEval.evList.length > 0 && (
                       <div style={{ background: "#16273c", borderRadius: 10, padding: "10px 14px", marginBottom: 12 }}>
                         <div style={{ fontSize: 12, fontWeight: 800, color: "#fff", marginBottom: 2 }}>
@@ -5794,7 +5307,7 @@ export default function App() {
                               </div>
                             ) : !odds ? (
                               <div style={{ fontSize: 10, color: "#8a98a8", marginBottom: 6 }}>
-                                オッズ未取得のため合成オッズは表示できません（自動取得できると計算されます）
+                                オッズ未入力のため合成オッズは表示できません（オッズ欄を貼ると計算されます）
                               </div>
                             ) : null}
                             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -5899,7 +5412,7 @@ export default function App() {
                         </div>
                         {pickerMode === "ev" && !odds && (
                           <div style={{ fontSize: 10, color: "#e0b07a", marginBottom: 8 }}>
-                            ※ 期待値重視はオッズが必要です。オッズが自動取得されると精度が上がります。
+                            ※ 期待値重視はオッズが必要です。オッズ欄を貼ると精度が上がります。
                           </div>
                         )}
 
@@ -5939,7 +5452,7 @@ export default function App() {
                               </div>
                             ) : !odds ? (
                               <div style={{ fontSize: 10, color: "#8a98a8", marginBottom: 6 }}>
-                                オッズ未取得のため合成オッズは表示できません（自動取得できると計算されます）
+                                オッズ未入力のため合成オッズは表示できません（オッズ欄を貼ると計算されます）
                               </div>
                             ) : null}
                             {pickedTickets.tickets.length > 0 && (
@@ -6316,7 +5829,7 @@ export default function App() {
             </details>
           )}
           <div style={{ fontSize: 10, color: "#5e7a92", lineHeight: 1.6 }}>
-            ※ Googleログイン中はクラウド保存、未ログイン時は端末内保存です。オッズ一覧や外部サイト由来データはクラウド保存しません。
+            ※ 保存データはこの端末内にのみ記録されます（ボートレース日和のデータは保存していません）。
           </div>
 
           {/* データのバックアップ */}
