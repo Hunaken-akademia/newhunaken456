@@ -84,6 +84,90 @@ function buildRacerCourseStatsFromDb(rawRows, profiles, courses, venueName) {
   return stats;
 }
 
+
+function buildDbAverageStTableFromRows(rawRows, profiles, venueName) {
+  const placeNo = PLACE_NO_BY_VENUE[venueName] || null;
+  const periods = [
+    { label: "直近6ヶ月", days: 180 },
+    { label: "直近1年", days: 365 },
+    { label: "直近3ヶ月", days: 90 },
+    { label: "直近1ヶ月", days: 30 },
+    { label: "当地", days: 365, local: true },
+    // 以下は大会区分データが貯まるまで自動では空になり得る。貼付データがあればそちらを優先。
+    { label: "一般戦", days: 365, grade: "一般" },
+    { label: "SG/G1", days: 365, gradeSet: ["SG", "PG1", "G1"] },
+    { label: "女子戦", days: 365, ladies: true },
+    { label: "初日", days: 365, raceTypeIncludes: "初日" },
+    { label: "最終日", days: 365, raceTypeIncludes: "最終日" },
+    { label: "ナイター", days: 365, night: true },
+    { label: "F持", days: 365, fhold: true },
+  ];
+  const out = {};
+  for (const p of periods) out[p.label] = Array(6).fill(null);
+
+  for (let b = 1; b <= 6; b++) {
+    const regno = Number(profiles?.[b]?.regNo || profiles?.[b]?.regno || profiles?.[b]?.registerNo || 0);
+    if (!regno) continue;
+    for (const p of periods) {
+      const from = daysAgoIso(p.days);
+      const filtered = (rawRows || []).filter((r) => {
+        const rd = String(r.race_date || "").slice(0, 10);
+        const st = Number(r.st);
+        if (Number(r.regno) !== regno || !Number.isFinite(st) || st < 0 || st > 0.6 || rd < from) return false;
+        if (p.local && placeNo && Number(r.place_no) !== placeNo) return false;
+        // category metadata may be absent on historical K data. If absent, keep this category empty rather than faking it.
+        if (p.grade && String(r.grade || "") !== p.grade) return false;
+        if (p.gradeSet && !p.gradeSet.includes(String(r.grade || ""))) return false;
+        if (p.ladies && r.is_ladies !== true) return false;
+        if (p.raceTypeIncludes && !String(r.race_type || "").includes(p.raceTypeIncludes)) return false;
+        if (p.fhold && r.f_hold !== true) return false;
+        return true;
+      });
+      if (filtered.length) {
+        const avg = filtered.reduce((a, r) => a + Number(r.st), 0) / filtered.length;
+        out[p.label][b - 1] = avg;
+      }
+    }
+  }
+  return out;
+}
+
+function buildKimariFromDbRows(rows) {
+  const mk = (days) => {
+    const from = daysAgoIso(days);
+    const target = (rows || []).filter((r) => String(r.race_date || "").slice(0, 10) >= from && Number(r.rank) === 1);
+    if (!target.length) return null;
+    const total = target.length;
+    const pct = (n) => round1((n / total) * 100);
+    const byK = { "逃げ": 0, "差し": 0, "まくり": 0, "まくり差し": 0, "抜き": 0, "恵まれ": 0, "その他": 0 };
+    const byCourseK = { "差し": Array(5).fill(0), "まくり": Array(5).fill(0), "まくり差し": Array(5).fill(0) };
+    for (const r of target) {
+      const k = String(r.kimarite || "その他").trim() || "その他";
+      const kk = byK[k] != null ? k : "その他";
+      byK[kk]++;
+      const c = Number(r.course);
+      if (c >= 2 && c <= 6) {
+        if (k.includes("まくり差し")) byCourseK["まくり差し"][c - 2]++;
+        else if (k.includes("まくり")) byCourseK["まくり"][c - 2]++;
+        else if (k.includes("差し")) byCourseK["差し"][c - 2]++;
+      }
+    }
+    return {
+      nige: pct(byK["逃げ"]),
+      nigashi: null,
+      sasare: pct(byK["差し"]),
+      sashi: byCourseK["差し"].map(pct),
+      makurare: pct(byK["まくり"]),
+      makuri: byCourseK["まくり"].map(pct),
+      makuraresashi: pct(byK["まくり差し"]),
+      makurizashi: byCourseK["まくり差し"].map(pct),
+      n: total,
+      source: "DB",
+    };
+  };
+  return { "直近6ヶ月": mk(180), "直近1年": mk(365), "直近3ヶ月": mk(90), "直近1ヶ月": mk(30) };
+}
+
 async function fetchRestPages(table, baseQs, maxRows = 50000) {
   const all = [];
   const page = 1000;
@@ -107,7 +191,7 @@ async function fetchRaceResultsForRacers(regnos, days = 365) {
   const nums = [...new Set((regnos || []).map((v) => Number(v)).filter(Boolean))];
   if (!nums.length) return [];
   const qs = new URLSearchParams();
-  qs.set("select", "regno,course,rank,place_no,race_date");
+  qs.set("select", "regno,course,rank,place_no,race_date,race_no,st,is_f");
   qs.set("regno", `in.(${nums.join(",")})`);
   qs.set("race_date", `gte.${daysAgoIso(days)}`);
   qs.set("order", "race_date.desc");
@@ -1168,7 +1252,7 @@ export default function App() {
   };
 
   // 決まり手・逃げシミュレーション（枠別情報）
-  const KIMARI_PERIODS = ["直近6ヶ月", "直近1年"];
+  const KIMARI_PERIODS = ["直近6ヶ月", "直近1年", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "女子戦"];
   const [kimari, setKimari] = useState(null);       // {期間:{nige,nigashi,sasare,sashi[5],makurare,makuri[5],makuraresashi,makurizashi[5]}}
   const [kimariPeriod, setKimariPeriod] = useState("直近6ヶ月");
   const [nigeSim, setNigeSim] = useState(null);     // {win1,nigeRate,second[5],third[5],deme[5]}
@@ -2449,6 +2533,15 @@ export default function App() {
   }, [dbRacerRows, racerProfiles, courses, venue]);
 
   useEffect(() => {
+    if (!dbRacerRows.length || !Object.keys(racerProfiles || {}).length) return;
+    const dbSt = buildDbAverageStTableFromRows(dbRacerRows, racerProfiles, venue);
+    setStTable((prev) => ({ ...(prev || {}), ...dbSt }));
+    // 自動取得後は選択中の期間をDB平均STで反映。貼付がある場合も同じキーは最新DBで上書き。
+    const selected = dbSt?.[stPeriod];
+    if (selected && selected.some((v) => v != null)) applyStTable({ ...(stTable || {}), ...dbSt }, stPeriod);
+  }, [dbRacerRows, racerProfiles, venue]);
+
+  useEffect(() => {
     let alive = true;
     const placeNo = PLACE_NO_BY_VENUE[venue] || null;
     if (!placeNo) {
@@ -2476,6 +2569,12 @@ export default function App() {
       });
     return () => { alive = false; };
   }, [venue]);
+
+  useEffect(() => {
+    if (!dbNigeRows.length) return;
+    const dbKimari = buildKimariFromDbRows(dbNigeRows);
+    if (dbKimari && Object.values(dbKimari).some(Boolean)) setKimari((prev) => ({ ...(prev || {}), ...dbKimari }));
+  }, [dbNigeRows]);
 
   const result = useMemo(() => {
     if (!venue) return null;
