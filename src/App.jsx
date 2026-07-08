@@ -911,6 +911,7 @@ export default function App() {
   const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(true);
   const [autoRefreshInfo, setAutoRefreshInfo] = useState("");
   const [salesEnded, setSalesEnded] = useState(false);
+  const [reviewMode, setReviewMode] = useState(false);
   const [venueNotHeld, setVenueNotHeld] = useState(false);
   const [officialSchedule, setOfficialSchedule] = useState(null);
   const [venueStatuses, setVenueStatuses] = useState({});
@@ -1469,8 +1470,8 @@ export default function App() {
     const targetRaceNo = override.raceNo || raceNo;
     const targetDate = override.raceDate || raceDate;
     if (!targetVenue) return;
-    if (salesEnded && !override.ignoreSalesEnded) {
-      setAutoMsg(`${targetVenue}は本日の発売終了です。オッズ自動更新は停止中です。`);
+    if (salesEnded && !override.ignoreSalesEnded && override.background) {
+      setAutoMsg(`${targetVenue}は本日の発売終了です。復習用データは手動で表示できます。`);
       return;
     }
     if (!AUTO_FETCH_VENUES.includes(targetVenue)) return;
@@ -1515,8 +1516,8 @@ export default function App() {
     if (override.oddsOnly || (override.background && hasCompleteAutoStaticData(targetVenue))) {
       return fetchOfficialOddsOnly(override);
     }
-    if (salesEnded && !override.ignoreSalesEnded) {
-      setAutoMsg(`${targetVenue}は本日の発売終了です。自動取得は停止中です。`);
+    if (salesEnded && !override.ignoreSalesEnded && override.background) {
+      setAutoMsg(`${targetVenue}は本日の発売終了です。復習用データは手動で表示できます。`);
       return;
     }
     if (!override.force && autoBusyRef.current) return;
@@ -1781,10 +1782,12 @@ export default function App() {
       }
 
       if (normalized?.allClosed) {
-        setAutoRefreshInfo(`${v}は本日の全レース発売終了です（公式締切時刻で判定）`);
-        return { allClosed: true, raceNo: "", data };
+        setReviewMode(true);
+        setAutoRefreshInfo(`${v}は本日の全レース発売終了です。翌朝の朝一レース前まで復習用に閲覧できます。`);
+        return { allClosed: true, raceNo: String(raceNo || "12"), data };
       }
 
+      setReviewMode(false);
       const nextRace = String(data.nextRace || fallbackRace);
       const deadline = data.nextDeadline ? `／締切${data.nextDeadline}` : "";
       setAutoRefreshInfo(`公式締切で判定：${v}${nextRace}R${deadline}（次回も約3分後に再判定）`);
@@ -1803,6 +1806,7 @@ export default function App() {
     setVenue(v);
     setRaceDate(today);
     setSalesEnded(false);
+    setReviewMode(false);
     setVenueNotHeld(false);
     resetRaceAutoData();
     setAutoMsg(`${v}の公式締切時刻を確認中…`);
@@ -1815,9 +1819,14 @@ export default function App() {
       return;
     }
     if (resolved.allClosed) {
-      setRaceNo("12");
+      const reviewRace = raceNo && String(raceNo) !== "" ? String(raceNo) : "12";
+      setRaceNo(reviewRace);
+      setReviewMode(true);
       resetRaceAutoData();
-      setAutoMsg(`${v}は本日の全レース発売終了です`);
+      setAutoMsg(`${v}は本日の全レース発売終了です。復習用に${reviewRace}Rを表示します。`);
+      if (AUTO_FETCH_VENUES.includes(v)) {
+        window.setTimeout(() => fetchOfficialYoso({ venue: v, raceNo: reviewRace, raceDate: today, force: true, ignoreSalesEnded: true }), 80);
+      }
       return;
     }
 
@@ -1862,9 +1871,8 @@ export default function App() {
       }
       if (resolved.allClosed) {
         setRaceDate(today);
-        setRaceNo("12");
-        resetRaceAutoData();
-        setAutoMsg(`${venue}は本日の全レース発売終了です`);
+        setReviewMode(true);
+        setAutoMsg(`${venue}は本日の全レース発売終了です。復習用データは翌朝の朝一レース前まで表示できます。`);
         return;
       }
       const nextRace = resolved.raceNo || autoRaceForVenue(venue);
@@ -3896,7 +3904,7 @@ export default function App() {
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 }}>
             <div>
               <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8", marginBottom: 2 }}>開催場一覧</div>
-              <div style={{ fontSize: 12, color: "#9db5cc" }}>開催中の場だけ選択できます。公式締切時刻から次Rを自動選択します</div>
+              <div style={{ fontSize: 12, color: "#9db5cc" }}>開催中の場は次Rを自動選択。発売終了後も翌朝の朝一レース前まで復習表示できます</div>
             </div>
             <button
               onClick={() => { const v = venue || "蒲郡"; selectVenueQuick(v); }}
@@ -3919,11 +3927,11 @@ export default function App() {
               const allClosed = !!(st?.allClosed || st?.status === "発売終了");
               const loading = !st || venueStatusLoading;
               const held = !!(st && !noRace && !allClosed && st.nextRace);
-              const heldText = loading ? "確認中" : noRace ? "開催なし" : "本日開催";
+              const heldText = loading ? "確認中" : noRace ? "開催なし" : allClosed ? "復習可" : "本日開催";
               const raceLine = noRace
                 ? "未開催"
                 : allClosed
-                  ? "発売終了"
+                  ? "復習表示"
                   : held
                     ? `${st.nextRace}R / ${st.nextDeadline || "締切確認中"}`
                     : "確認中";
@@ -4028,8 +4036,20 @@ export default function App() {
           <div style={{ fontSize: 11, color: "#7da3c8", margin: "12px 0 6px" }}>レース</div>
           <select
             value={raceNo}
-            onChange={(e) => { setRaceNo(e.target.value); setSalesEnded(false); setVenueNotHeld(false); resetRaceAutoData(); }}
-            disabled={salesEnded || venueNotHeld}
+            onChange={(e) => {
+              const nr = e.target.value;
+              setRaceNo(nr);
+              setVenueNotHeld(false);
+              resetRaceAutoData();
+              if (salesEnded && venue) {
+                setReviewMode(true);
+                window.setTimeout(() => fetchOfficialYoso({ venue, raceNo: nr, raceDate, force: true, ignoreSalesEnded: true }), 80);
+              } else {
+                setSalesEnded(false);
+                setReviewMode(false);
+              }
+            }}
+            disabled={venueNotHeld}
             style={{
               width: "100%", padding: "11px 12px", fontSize: 16,
               background: "#16273c", color: "#fff",
@@ -4040,7 +4060,7 @@ export default function App() {
               <option key={n} value={String(n)}>{n}R</option>
             ))}
           </select>
-          {venue && !salesEnded && !venueNotHeld && (() => {
+          {venue && !venueNotHeld && (() => {
             const st = venueStatuses[venue];
             const sched = officialSchedule && officialSchedule.venue === venue && Array.isArray(officialSchedule.schedule) ? officialSchedule.schedule : [];
             const hit = sched.find((x) => String(x.race) === String(raceNo));
@@ -4062,7 +4082,7 @@ export default function App() {
               background: "rgba(217,75,67,0.18)", color: "#ffb3ad",
               border: "1px solid rgba(217,75,67,0.35)", fontSize: 12, fontWeight: 800,
             }}>
-              {venue}は本日の全レース発売終了です
+              {venue}は本日の全レース発売終了です。翌朝の朝一レース前まで復習用データを表示できます。
             </div>
           )}
           {venueNotHeld && venue && (

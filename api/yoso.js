@@ -2,6 +2,9 @@ const STATIC_CACHE_MS = 3 * 60 * 1000;
 const SCHEDULE_CACHE_MS = 3 * 60 * 1000;
 const ODDS_CACHE_MS = 60 * 1000;
 const STALE_CACHE_MS = 30 * 60 * 1000;
+// 復習用：発売終了後も翌朝の朝一レース前まで共有キャッシュを返す。
+// 正確な翌朝1R時刻が取れない場合に備え、JST翌日09:00まで保持する。
+const REVIEW_CACHE_STALE_MS = 18 * 60 * 60 * 1000;
 const CACHE_MS = STATIC_CACHE_MS;
 
 // Vercelの同一実行環境内で共有するキャッシュ。
@@ -30,6 +33,24 @@ function parseCacheKey(key) {
 function ymdToDate(ymd) {
   const s = String(ymd || "").replace(/\D/g, "");
   return /^\d{8}$/.test(s) ? `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}` : null;
+}
+
+function nextMorningReviewExpiryIso(ymd) {
+  const raceDate = ymdToDate(ymd);
+  if (!raceDate) return new Date(Date.now() + REVIEW_CACHE_STALE_MS).toISOString();
+  // JST翌日09:00 = UTC同日24:00相当ではなく、Date.UTCでJSTを補正
+  const [y, m, d] = raceDate.split('-').map(Number);
+  const utc = Date.UTC(y, m - 1, d + 1, 0, 0, 0); // JST翌日09:00
+  const t = Math.max(utc, Date.now() + STALE_CACHE_MS);
+  return new Date(t).toISOString();
+}
+
+function persistentStaleExpiryForKey(key, ttlMs, staleMs) {
+  const meta = parseCacheKey(key);
+  if ((meta.cacheType === 'full' || meta.cacheType === 'schedule') && meta.ymd) {
+    return nextMorningReviewExpiryIso(meta.ymd);
+  }
+  return new Date(Date.now() + staleMs).toISOString();
 }
 
 
@@ -170,7 +191,7 @@ async function writePersistentCache(key, data, ttlMs, staleMs) {
       race_no: meta.raceNo,
       payload: data,
       expires_at: new Date(now + ttlMs).toISOString(),
-      stale_expires_at: new Date(now + staleMs).toISOString(),
+      stale_expires_at: persistentStaleExpiryForKey(key, ttlMs, staleMs),
       updated_at: new Date(now).toISOString(),
     }];
     await supabaseCacheRequest("yoso_cache?on_conflict=cache_key", {
@@ -184,8 +205,6 @@ async function writePersistentCache(key, data, ttlMs, staleMs) {
 }
 
 function dataCacheNotice(source) {
-  if (source === "supabase") return "Supabase共有キャッシュから表示";
-  if (source === "memory") return "サーバー内キャッシュから表示";
   return "";
 }
 
@@ -247,7 +266,7 @@ async function withSharedCache(key, ttlMs, fetcher, options = {}) {
     const staleEntry = { savedAt: persistent.savedAt, data: persistent.data };
     cacheStore.set(key, staleEntry);
     // 古いキャッシュを即返しつつ、バックグラウンド更新は次回アクセス時に任せる。
-    return cacheDecorate(staleEntry, ttlMs, { stale: true, cacheWarning: "Supabaseの古い共有キャッシュを表示" });
+    return cacheDecorate(staleEntry, ttlMs, { stale: true, cacheWarning: "復習用キャッシュ" });
   }
 
   const promise = (async () => {
