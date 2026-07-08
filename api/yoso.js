@@ -1915,21 +1915,113 @@ function parseRaceIndexSchedule(html) {
   return schedule;
 }
 
+function normalizeRaceMetaText(s) {
+  return decodeEntities(String(s || ""))
+    .replace(/[Ｓ]/g, "S")
+    .replace(/[Ｇ]/g, "G")
+    .replace(/[ⅠＩⅡⅢ]/g, (ch) => ({ "Ⅰ": "1", "Ｉ": "1", "Ⅱ": "2", "Ⅲ": "3" }[ch] || ch))
+    .replace(/Ｇ/g, "G")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function inferGradeFromText(text) {
+  const t = normalizeRaceMetaText(text);
+  if (/(SG|S G|グランプリ|賞金王|ボートレースクラシック|笹川賞|オールスター|グランドチャンピオン|グラチャン|オーシャンカップ|メモリアル|ダービー|チャレンジカップ)/i.test(t)) return "SG";
+  if (/(PG1|P G1|プレミアムG1|BBCトーナメント|ヤングダービー|クイーンズクライマックス|レディースチャンピオン|マスターズチャンピオン)/i.test(t)) return "PG1";
+  if (/(G1|G 1|周年|地区選手権|高松宮記念|ダイヤモンドカップ|企業杯)/i.test(t)) return "G1";
+  if (/(G2|G 2|モーターボート大賞|秩父宮妃記念杯)/i.test(t)) return "G2";
+  if (/(G3|G 3|オールレディース|企業杯|マスターズリーグ)/i.test(t)) return "G3";
+  return "一般";
+}
+
+function inferLadiesFromText(text) {
+  const t = normalizeRaceMetaText(text);
+  return /(女子|レディース|ヴィーナス|クイーンズ|オールレディース|レディースチャンピオン|女子レーサー)/.test(t);
+}
+
+function inferRaceTypeFromText(text) {
+  const t = normalizeRaceMetaText(text);
+  if (/優勝戦/.test(t)) return "優勝戦";
+  if (/準優勝戦|準優/.test(t)) return "準優勝戦";
+  if (/ドリーム/.test(t)) return "ドリーム";
+  if (/選抜/.test(t)) return "選抜";
+  if (/特選/.test(t)) return "特選";
+  if (/予選/.test(t)) return "予選";
+  if (/一般/.test(t)) return "一般戦";
+  return "";
+}
+
 function parseRaceIndexMeta(html) {
-  // boatrace.jp の raceindex 全文には、他ページへのナビやグレード画像名が混ざるため、
-  // 全文から SG/G1/初日 を拾うと全場が同じ表示になりやすい。
-  // v98では誤表示防止を優先し、確実に判断できないグレード/何日目は空にする。
   const lines = textLinesFromHtml(html);
   const text = lines.join(" ");
 
   let eventName = "";
   const titleCandidates = lines.filter((l) =>
-    /(杯|選手権|競走|レース|ヴィーナス|ルーキー|周年|タイトル)/.test(l)
-    && !/(SG|G1|G2|G3|一覧|発売|締切|オッズ|結果|出走表|投票|ログイン)/.test(l)
+    /(杯|選手権|競走|レース|ヴィーナス|ルーキー|周年|タイトル|オールレディース|クイーンズ|グランプリ|ダービー)/.test(l)
+    && !/(一覧|発売|締切|オッズ|結果|出走表|投票|ログイン|更新|トップ|メニュー)/.test(l)
   );
-  if (titleCandidates.length) eventName = titleCandidates[0].slice(0, 80);
+  if (titleCandidates.length) eventName = normalizeRaceMetaText(titleCandidates[0]).slice(0, 120);
 
-  return { grade: "", eventDay: "", eventName };
+  const metaText = `${eventName} ${text.slice(0, 5000)}`;
+  const grade = inferGradeFromText(metaText);
+  const isLadies = inferLadiesFromText(metaText);
+  const raceType = inferRaceTypeFromText(metaText);
+
+  const dayMatch = metaText.match(/(初日|2日目|３日目|3日目|４日目|4日目|５日目|5日目|最終日)/);
+  const eventDay = dayMatch ? dayMatch[1].replace(/[３４５]/g, (ch) => ({ "３":"3", "４":"4", "５":"5" }[ch] || ch)) : "";
+
+  return { grade, eventDay, eventName, isLadies, raceType };
+}
+
+function raceMetaRowsFromSchedule({ venue, ymd, schedule, meta = {}, raceNo = null, racers = null, source = "BOATCAST_RACEINDEX" }) {
+  const raceDate = ymdToDate(ymd);
+  const placeNo = PLACE_NO_BY_VENUE[venue];
+  if (!raceDate || !placeNo) return [];
+
+  const allFemale = Array.isArray(racers) && racers.length >= 6 && racers.slice(0, 6).every((r) => r?.isFemale === true);
+  const races = raceNo ? [{ race: Number(raceNo) }] : (Array.isArray(schedule) ? schedule : []);
+  const rows = [];
+
+  for (const item of races) {
+    const rn = Number(item?.race || item?.race_no || item);
+    if (!rn || rn < 1 || rn > 12) continue;
+
+    const row = {
+      race_date: raceDate,
+      place_no: placeNo,
+      race_no: rn,
+      metadata_source: source,
+      metadata_captured_at: new Date().toISOString(),
+    };
+
+    if (meta.grade) row.grade = meta.grade;
+    if (meta.eventName) row.race_title = meta.eventName;
+    if (meta.raceType) row.race_type = meta.raceType;
+
+    if (typeof meta.isLadies === "boolean") row.is_ladies = meta.isLadies;
+    if (allFemale) row.is_ladies = true;
+
+    rows.push(row);
+  }
+  return rows;
+}
+
+async function saveRaceMetaRows(args) {
+  if (!ENABLE_PERSISTENT_CACHE) return { ok: false, skipped: true, reason: "SUPABASE_SERVICE_KEYなし" };
+  const rows = raceMetaRowsFromSchedule(args);
+  if (!rows.length) return { ok: false, skipped: true, reason: "保存対象なし" };
+  try {
+    await supabaseCacheRequest("races?on_conflict=race_date,place_no,race_no", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(rows),
+    });
+    return { ok: true, count: rows.length };
+  } catch (e) {
+    console.warn("race meta write skipped:", e?.message || e);
+    return { ok: false, error: e?.message || String(e) };
+  }
 }
 
 function jstNowParts() {
@@ -2018,6 +2110,7 @@ async function fetchSchedulePayload(venue, ymd) {
     });
     const schedule = parseRaceIndexSchedule(html);
     const meta = parseRaceIndexMeta(html);
+    const raceMetaSaved = await saveRaceMetaRows({ venue, ymd, schedule, meta, source: "BOATCAST_RACEINDEX" });
     const state = scheduleState(schedule, ymd);
     return {
       ok: true,
@@ -2029,6 +2122,7 @@ async function fetchSchedulePayload(venue, ymd) {
       schedule,
       scheduleCount: schedule.length,
       ...meta,
+      raceMetaSaved,
       ...state,
       fetchedAt: new Date().toISOString(),
     };
@@ -2126,6 +2220,14 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
     try {
       const bc = await fetchBoatcastPayload(venue, raceNo, ymd);
       const preRaceStatusSaved = await savePreRaceStatus({ venue, raceNo, ymd, racers: bc.racers, source: "BOATCAST" });
+      const raceMetaSaved = await saveRaceMetaRows({
+        venue,
+        ymd,
+        raceNo,
+        racers: bc.racers,
+        meta: {},
+        source: "BOATCAST_RACERS",
+      });
       return {
         ok: true,
         appVersion: "v109",
@@ -2144,6 +2246,7 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
         displayDisabled: !!bc.displayDisabled,
         racers: bc.racers,
         preRaceStatusSaved,
+        raceMetaSaved,
         motors: bc.motors,
         weather: bc.weather,
         odds: bc.odds,
