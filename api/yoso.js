@@ -9,18 +9,21 @@ const CACHE_MS = STATIC_CACHE_MS;
 
 // Vercelの同一実行環境内で共有するキャッシュ。
 // 同じ場・日付・RはTTL内ならBOATCASTへ再アクセスせず、取得中は他ユーザーへ古いキャッシュを返す。
-const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V109__ || new Map();
-globalThis.__HUNAKEN_YOSO_CACHE_V109__ = cacheStore;
-const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V109__ || new Map();
-globalThis.__HUNAKEN_YOSO_INFLIGHT_V109__ = inFlightStore;
+const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V112__ || new Map();
+globalThis.__HUNAKEN_YOSO_CACHE_V112__ = cacheStore;
+const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V112__ || new Map();
+globalThis.__HUNAKEN_YOSO_INFLIGHT_V112__ = inFlightStore;
 
 const SUPABASE_REST_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 const ENABLE_PERSISTENT_CACHE = !!(SUPABASE_REST_URL && SUPABASE_SERVICE_KEY);
 
 function parseCacheKey(key) {
-  const parts = String(key || "").split(":");
-  const cacheType = parts[0] || "unknown";
+  const rawParts = String(key || "").split(":");
+  const cacheType = rawParts[0] || "unknown";
+  const parts = /^v\d+$/i.test(rawParts[1] || "")
+    ? [rawParts[0], ...rawParts.slice(2)]
+    : rawParts;
   if (cacheType === "full" || cacheType === "odds") {
     return { cacheType, venue: parts[1] || "", raceNo: Number(parts[2]) || null, ymd: parts[3] || "" };
   }
@@ -205,7 +208,7 @@ async function fetchBoatcastPreRaceStatusPayload(venue, raceNo, ymd) {
   return {
     ok: true,
     action: "prerace",
-    appVersion: "v109",
+    appVersion: "v112",
     venue,
     race: Number(raceNo),
     date: ymd,
@@ -1191,23 +1194,29 @@ function pickBoatcastAdjustWeightToken(cols) {
 
 function pickBoatcastTiltToken(cols) {
   const arr = (cols || []).map((x) => String(x ?? "").trim());
-  // チルトは公式表では「+0.0」「-0.5」のように符号付きで出ることが多い。
-  // 調整体重 0.5/1.0/1.5 をチルトと誤認しないよう、符号付きトークンを最優先する。
+  // 根本対策：調整体重 1.0 / 1.5 をチルトと誤認しない。
+  // BOATCASTの列テキストでは「+0.0」「-0.5」のような符号付きトークンだけをチルトとして採用する。
+  // 符号なしの 0.0 / 0.5 / 1.0 は調整重量と区別できないため、自動取得ではチルト補正に使わない。
   const signed = arr.find((x) => /^[+＋\-－−ー]\s*\d+(?:\.\d+)?$/.test(x) && normalizeBoatcastTiltToken(x));
-  if (signed) return normalizeBoatcastTiltToken(signed);
+  return signed ? normalizeBoatcastTiltToken(signed) : "";
+}
 
-  const weightIdx = arr.findIndex((x) => normalizeBoatcastWeightToken(x));
-  if (weightIdx >= 0) {
-    const lowNums = arr.slice(weightIdx + 1).filter((x) => normalizeBoatcastTiltToken(x));
-    // 体重の直後に「調整重量, チルト」と並ぶ形式は2個目をチルトとして扱う。
-    // 1個しかない 1.0 などは調整体重の可能性が高いため、チルトには入れない。
-    if (lowNums.length >= 2) return normalizeBoatcastTiltToken(lowNums[1]);
-    if (lowNums.length === 1) {
-      const only = normalizeBoatcastTiltToken(lowNums[0]);
-      return ["-0.5", "0.0", "0.5"].includes(only) ? only : "";
-    }
-  }
-  return "";
+function sanitizeParsedTilt(row) {
+  const r = { ...(row || {}) };
+  const raw = String(r.tilt ?? "").trim().replace(/[＋]/g, "+").replace(/[－−ー]/g, "-");
+  if (raw === "") { r.tilt = ""; return r; }
+  const v = Number(raw.replace(/^\+/, ""));
+  if (!Number.isFinite(v)) { r.tilt = ""; return r; }
+  // 調整体重の誤反映が最も多い 1.0 / 1.5 / 2.0 などは、符号付き取得でない限り消す。
+  // API内部では符号は正規化で落ちるため、+1.0を厳密に拾えない場面より、誤警戒を出さない方を優先する。
+  if (v > 0.5) { r.tilt = ""; return r; }
+  if (v < -1 || v > 3) { r.tilt = ""; return r; }
+  r.tilt = v.toFixed(1);
+  return r;
+}
+
+function sanitizeDisplayRows(rows) {
+  return (rows || []).map((row) => sanitizeParsedTilt(row));
 }
 
 
@@ -1335,7 +1344,7 @@ function parseBoatcastTkzRows(raw) {
     if (rows.length >= 6) break;
   }
   rows.sort((a, b) => a.boat - b.boat);
-  return rows.slice(0, 6);
+  return sanitizeDisplayRows(rows.slice(0, 6));
 }
 
 function parseBoatcastOritenRows(raw) {
@@ -1451,7 +1460,7 @@ function combineBoatcastDisplayRows(tkzRaw, oritenRaw, sttRaw) {
       };
     });
   }
-  return rows;
+  return sanitizeDisplayRows(rows);
 }
 
 function classifyBoatcastDisplayIssue({ venue, racers = [], tkz = "", oriten = "", stt = "", combined = [], rowErrors = [] }) {
@@ -1583,7 +1592,7 @@ function parseBoatcastDisplay(raw) {
 
   const rows = [...rowsByBoat.values()].sort((a, b) => a.boat - b.boat);
   if (rows.length < 6) throw new Error(`展示データが6艇分ありません（${rows.length}艇分）`);
-  return rows.slice(0, 6);
+  return sanitizeDisplayRows(rows.slice(0, 6));
 }
 
 function parseBoatcastOddsTxt(raw) {
@@ -1728,9 +1737,33 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
     }
   }
 
+  // パターンC: BOATCASTのtxt分割が崩れる/一部txtだけ欠けるレース用。
+  // 公式beforeinfoにも展示・一周・まわり足・直線が出る場面があるため、全場共通の最終フォールバックにする。
+  // 大村10RのようにBOATCAST画面では出ているのにtxt結合だけ失敗するケースを救済する。
+  if (!rows) {
+    const officialUrl = buildOfficialBeforeInfoUrl(venue, raceNo, dateStr);
+    if (officialUrl) {
+      try {
+        const officialHtml = await fetchHtml(officialUrl);
+        const officialRows = parseDisplayRowsByLines(officialHtml, venue);
+        if (validRows(officialRows)) {
+          const sttRows = parseBoatcastSttRows(stt);
+          rows = sanitizeDisplayRows(officialRows.map((r) => {
+            const st = sttRows.find((x) => Number(x.boat) === Number(r.boat));
+            return st ? { ...r, course: st.course || r.course || r.boat } : r;
+          }));
+        } else {
+          rowErrors.push(`official-beforeinfo: ${officialRows?.length || 0}艇`);
+        }
+      } catch (e) {
+        rowErrors.push(`official-beforeinfo: ${e.message || e}`);
+      }
+    }
+  }
+
   let exhibitionSaved = { ok: false, skipped: true, reason: "展示未取得" };
   if (rows) {
-    rows = rows.map((r) => ({ ...r, racer: racersByBoat[r.boat] || null }));
+    rows = sanitizeDisplayRows(rows).map((r) => ({ ...r, racer: racersByBoat[r.boat] || null }));
     exhibitionSaved = await saveExhibitionRows({ venue, raceNo, ymd: dateStr, rows, source: "BOATCAST" });
   }
 
@@ -2357,7 +2390,7 @@ async function fetchSchedulePayload(venue, ymd) {
     return {
       ok: true,
       action: "schedule",
-      appVersion: "v109",
+      appVersion: "v112",
       venue,
       date: ymd,
       url,
@@ -2472,7 +2505,7 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
       });
       return {
         ok: true,
-        appVersion: "v109",
+        appVersion: "v112",
         venue,
         race: raceNo,
         date: ymd,
@@ -2606,7 +2639,7 @@ export default async function handler(req, res) {
       res.status(200).json({
         ok: true,
         action: "schedules",
-        appVersion: "v109",
+        appVersion: "v112",
         date: ymd,
         statusesByVenue,
         fetchedAt: new Date().toISOString(),
@@ -2642,7 +2675,7 @@ export default async function handler(req, res) {
         res.status(400).json({ ok: false, error: "venue を指定してください" });
         return;
       }
-      const oddsKey = `odds:${venue}:${raceNo}:${ymd}`;
+      const oddsKey = `odds:v112:${venue}:${raceNo}:${ymd}`;
       pruneCache();
       const payload = await withSharedCache(oddsKey, ODDS_CACHE_MS, async () => {
         const oddsInfo = await fetchOddsForVenue(venue, raceNo, ymd);
@@ -2650,7 +2683,7 @@ export default async function handler(req, res) {
         return {
           ok: true,
           action: "odds",
-          appVersion: "v109",
+          appVersion: "v112",
           venue,
           race: raceNo,
           date: ymd,
@@ -2665,9 +2698,9 @@ export default async function handler(req, res) {
     }
 
     res.setHeader("Cache-Control", "public, s-maxage=180, stale-while-revalidate=600");
-    const key = `full:${venue}:${raceNo}:${ymd}`;
+    const key = `full:v112:${venue}:${raceNo}:${ymd}`;
     pruneCache();
-    const payload = await withSharedCache(key, STATIC_CACHE_MS, async () => buildFullYosoPayload(venue, raceNo, ymd));
+    const payload = await withSharedCache(key, STATIC_CACHE_MS, async () => buildFullYosoPayload(venue, raceNo, ymd), { allowStale: false });
     res.status(200).json(payload);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message || String(e) });
