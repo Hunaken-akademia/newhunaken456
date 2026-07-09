@@ -16,7 +16,12 @@ const CORRECTION_TABLE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 const AUTH_SESSION_KEY = "hunaken_paid_auth_session_v1";
 const PAID_TABLE = "paid_users";
 const AUTH_REDIRECT_TO = (() => {
-  try { return `${window.location.origin}${window.location.pathname}`; } catch (e) { return ""; }
+  try {
+    const configured = String(RUNTIME_ENV.APP_URL || "").replace(/\/+$/, "");
+    return configured ? `${configured}/` : `${window.location.origin}${window.location.pathname}`;
+  } catch (e) {
+    return "https://newhunaken456.vercel.app/";
+  }
 })();
 
 function authHeaders(accessToken = "", json = false) {
