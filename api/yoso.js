@@ -341,7 +341,7 @@ async function withSharedCache(key, ttlMs, fetcher, options = {}) {
     }
   }
 
-  if (persistent?.stale) {
+  if (persistent?.stale && options.allowStale !== false) {
     const staleEntry = { savedAt: persistent.savedAt, data: persistent.data };
     cacheStore.set(key, staleEntry);
     // 古いキャッシュを即返しつつ、バックグラウンド更新は次回アクセス時に任せる。
@@ -1093,6 +1093,30 @@ function parseNumericTokens(line) {
   return (String(line || "").match(/-?\d+(?:\.\d+)?/g) || []).map((x) => String(x));
 }
 
+function findFirstInRange(tokens, a, b) {
+  for (const x of tokens || []) {
+    if (inRange(x, a, b)) return normNum(x);
+  }
+  return "";
+}
+
+function pickSequentialBoatcastTimes(nums, opts = {}) {
+  const cleaned = (nums || []).map((x) => String(x).replace(/kg$/i, "")).filter(isNumText);
+  const hasHalfLap = !!opts.hasHalfLap;
+  for (let i = 0; i < cleaned.length; i++) {
+    const lapOk = inRange(cleaned[i], 30, 45) || (hasHalfLap && inRange(cleaned[i], 15, 25));
+    if (!lapOk) continue;
+    if (inRange(cleaned[i + 1], 4, 15)) {
+      return {
+        isshu: normNum(cleaned[i]),
+        mawari: normNum(cleaned[i + 1]),
+        chokusen: inRange(cleaned[i + 2], 4, 15) ? normNum(cleaned[i + 2]) : "",
+      };
+    }
+  }
+  return null;
+}
+
 function numberOrNull(x) {
   const v = Number(String(x ?? "").replace(/,/g, ""));
   return Number.isFinite(v) ? v : null;
@@ -1211,28 +1235,34 @@ function parseBoatcastTkzRows(raw) {
   const rows = [];
   const lines = boatcastPlainLines(raw);
   for (const line of lines) {
-    if (!line.includes("\t")) continue;
-    const c = line.split("\t").map((x) => String(x || "").trim());
-    if (c.length < 6 || /^\d+\t/.test(line)) continue;
+    const hasTab = line.includes("\t");
+    const c = hasTab ? line.split("\t").map((x) => String(x || "").trim()) : line.split(/[ 　]+/).map((x) => String(x || "").trim()).filter(Boolean);
+    if (c.length < 3) continue;
 
-    // BOATCAST tkzのタブ区切りは概ね
-    // 選手名, 展示タイム, フラグ, 部品/展示記号, 体重, 調整, チルト, ...
-    // 後半には前走成績や連番が入ることがあり、末尾から数値を探すとチルトを誤取得する。
-    // そのため、まず固定列 c[6] を最優先にし、必要な時だけ近傍列へフォールバックする。
-    const tenji = normNum(c[1]);
-    if (!inRange(tenji, 5.5, 7.8)) continue;
-    const boat = rows.length + 1;
-    if (boat > 6) break;
+    let boat = Number(c[0]);
+    if (!(boat >= 1 && boat <= 6)) {
+      // BOATCASTの一部txtは艇番を列で持たないため、行順で1〜6号艇として扱う。
+      boat = rows.length + 1;
+    }
+    if (!(boat >= 1 && boat <= 6) || rows.some((r) => r.boat === boat)) continue;
 
-    const weight = normalizeBoatcastWeightToken(c[4]) || c.slice(2, 7).map(normalizeBoatcastWeightToken).find(Boolean) || "";
-    const tilt = normalizeBoatcastTiltToken(c[6])
-      || normalizeBoatcastTiltToken(c[7])
-      || normalizeBoatcastTiltToken(c[5])
-      || "";
+    let tenji = "";
+    // 従来形式: 選手名, 展示タイム, ...
+    if (inRange(c[1], 5.5, 7.8)) tenji = normNum(c[1]);
+    // 鳴門など: 艇番/登録番号/年齢/チルト/展示... のように列位置が違う形式。
+    if (!tenji) tenji = findFirstInRange(c.slice(1), 5.5, 7.8);
+    if (!tenji) continue;
 
-    rows.push({ boat, course: boat, name: c[0] || "", tenji, weight, tilt });
+    const weight = c.map(normalizeBoatcastWeightToken).find(Boolean) || "";
+    // チルトは -0.5〜3.0 付近。艇番や年齢を避けるため、展示タイムより前後の小数を広めに拾う。
+    const tilt = c.map(normalizeBoatcastTiltToken).find(Boolean) || "";
+    const name = c.find((x) => /[一-龠ぁ-んァ-ヶ]/.test(x) && !/展示|チルト|体重|級別|登録/.test(x)) || "";
+
+    rows.push({ boat, course: boat, name, tenji, weight, tilt });
+    if (rows.length >= 6) break;
   }
-  return rows;
+  rows.sort((a, b) => a.boat - b.boat);
+  return rows.slice(0, 6);
 }
 
 function parseBoatcastOritenRows(raw) {
@@ -1243,8 +1273,6 @@ function parseBoatcastOritenRows(raw) {
 
   const normalizeLapValue = (v) => {
     const n = normNum(v);
-    // 通常場は「一周」30〜45秒、桐生などは「半周ラップ」15〜25秒。
-    // 内部計算では同じ isshu 枠へ入れる。
     if (inRange(n, 30, 45)) return n;
     if (hasHalfLap && inRange(n, 15, 25)) return n;
     return "";
@@ -1257,6 +1285,7 @@ function parseBoatcastOritenRows(raw) {
     let mawari = "";
     let chokusen = "";
 
+    const nums = parseNumericTokens(line);
     if (/^\d\t/.test(line)) {
       const c = line.split("\t").map((x) => String(x || "").trim());
       boat = Number(c[0]);
@@ -1264,20 +1293,21 @@ function parseBoatcastOritenRows(raw) {
       isshu = normalizeLapValue(c[2]);
       mawari = normNum(c[3]);
       chokusen = normNum(c[4]);
+      // 鳴門など、登録番号や年齢が先に入り、タイム列が後ろへずれる形式の保険。
+      if (!isshu || !inRange(mawari, 4, 15)) {
+        const picked = pickSequentialBoatcastTimes(nums.slice(1), { hasHalfLap });
+        if (picked) ({ isshu, mawari, chokusen } = picked);
+      }
     } else {
-      // 画面本文に近い空白区切りでも拾える保険。
-      // 例: 1  川合 理司  38.00  7.84  7.82
-      // 例: 1  下河 誉史  18.74  4.68  7.70（半周ラップ）
-      const nums = parseNumericTokens(line);
       boat = Number(nums[0]);
       if (boat >= 1 && boat <= 6) {
-        isshu = normalizeLapValue(nums[1]);
-        mawari = normNum(nums[2]);
-        chokusen = normNum(nums[3]);
+        const picked = pickSequentialBoatcastTimes(nums.slice(1), { hasHalfLap });
+        if (picked) ({ isshu, mawari, chokusen } = picked);
       }
     }
 
     if (!(boat >= 1 && boat <= 6) || !isshu || !inRange(mawari, 4, 15)) continue;
+    if (rows.some((r) => r.boat === boat)) continue;
     rows.push({
       boat,
       course: boat,
@@ -2169,13 +2199,14 @@ function scheduleState(schedule, ymd) {
   if (ymd > now.ymd) {
     next = list[0] || null;
   } else if (ymd === now.ymd) {
-    next = list.find((r) => Number(r.deadlineMinutes) >= now.minutes) || null;
+    next = list.find((r) => Number(r.deadlineMinutes) > now.minutes) || null;
   }
   const allClosed = !next;
   return {
     now,
     nextRace: next ? String(next.race) : "",
     nextDeadline: next ? next.deadline : "",
+    nextDeadlineMinutes: next ? Number(next.deadlineMinutes) : null,
     allClosed,
     noRace: false,
     status: next ? "発売中" : "発売終了",
@@ -2192,6 +2223,7 @@ function scheduleSummary(payload) {
     allClosed: !!payload.allClosed,
     nextRace: payload.nextRace || "",
     nextDeadline: payload.nextDeadline || "",
+    nextDeadlineMinutes: payload.nextDeadlineMinutes ?? null,
     scheduleCount: Array.isArray(payload.schedule) ? payload.schedule.length : (payload.scheduleCount || 0),
     grade: payload.grade || "",
     eventDay: payload.eventDay || "",
@@ -2229,7 +2261,7 @@ async function fetchSchedulePayload(venue, ymd) {
       ...state,
       fetchedAt: new Date().toISOString(),
     };
-  });
+  }, { staleMs: SCHEDULE_CACHE_MS, allowStale: false });
 }
 
 

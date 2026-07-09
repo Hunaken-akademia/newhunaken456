@@ -85,7 +85,7 @@ function buildRacerCourseStatsFromDb(rawRows, profiles, courses, venueName) {
 }
 
 
-function buildDbAverageStTableFromRows(rawRows, profiles, venueName) {
+function buildDbAverageStTableFromRows(rawRows, profiles, venueName, courses) {
   const placeNo = PLACE_NO_BY_VENUE[venueName] || null;
   const periods = [
     { label: "直近6ヶ月", days: 180 },
@@ -93,7 +93,7 @@ function buildDbAverageStTableFromRows(rawRows, profiles, venueName) {
     { label: "直近3ヶ月", days: 90 },
     { label: "直近1ヶ月", days: 30 },
     { label: "当地", days: 365, local: true },
-    // 以下は大会区分データが貯まるまで自動では空になり得る。貼付データがあればそちらを優先。
+    // 以下は大会区分データが貯まるまで自動では空になり得る。
     { label: "一般戦", days: 365, grade: "一般" },
     { label: "SG/G1", days: 365, gradeSet: ["SG", "PG1", "G1"] },
     { label: "女子戦", days: 365, ladies: true },
@@ -103,19 +103,26 @@ function buildDbAverageStTableFromRows(rawRows, profiles, venueName) {
     { label: "F持", days: 365, fhold: true },
   ];
   const out = {};
-  for (const p of periods) out[p.label] = Array(6).fill(null);
+  const meta = {};
+  for (const p of periods) {
+    out[p.label] = Array(6).fill(null);
+    meta[p.label] = Array(6).fill(null);
+  }
+
+  const MIN_COURSE_ST_ROWS = 3;
 
   for (let b = 1; b <= 6; b++) {
     const regno = Number(profiles?.[b]?.regNo || profiles?.[b]?.regno || profiles?.[b]?.registerNo || 0);
+    const currentCourse = Number(courses?.[b] || b);
     if (!regno) continue;
+
     for (const p of periods) {
       const from = daysAgoIso(p.days);
-      const filtered = (rawRows || []).filter((r) => {
+      const baseRows = (rawRows || []).filter((r) => {
         const rd = String(r.race_date || "").slice(0, 10);
         const st = Number(r.st);
         if (Number(r.regno) !== regno || !Number.isFinite(st) || st < 0 || st > 0.6 || rd < from) return false;
         if (p.local && placeNo && Number(r.place_no) !== placeNo) return false;
-        // category metadata may be absent on historical K data. If absent, keep this category empty rather than faking it.
         if (p.grade && String(r.grade || "") !== p.grade) return false;
         if (p.gradeSet && !p.gradeSet.includes(String(r.grade || ""))) return false;
         if (p.ladies && r.is_ladies !== true) return false;
@@ -123,12 +130,37 @@ function buildDbAverageStTableFromRows(rawRows, profiles, venueName) {
         if (p.fhold && r.f_hold !== true) return false;
         return true;
       });
-      if (filtered.length) {
-        const avg = filtered.reduce((a, r) => a + Number(r.st), 0) / filtered.length;
+
+      const courseRows = currentCourse
+        ? baseRows.filter((r) => Number(r.course) === currentCourse)
+        : [];
+      const useCourse = courseRows.length >= MIN_COURSE_ST_ROWS;
+      const targetRows = useCourse ? courseRows : baseRows;
+
+      if (targetRows.length) {
+        const avg = targetRows.reduce((a, r) => a + Number(r.st), 0) / targetRows.length;
         out[p.label][b - 1] = avg;
+        meta[p.label][b - 1] = {
+          course: currentCourse || b,
+          source: useCourse ? "course" : "all",
+          nCourse: courseRows.length,
+          nAll: baseRows.length,
+          minCourseRows: MIN_COURSE_ST_ROWS,
+        };
+      } else {
+        meta[p.label][b - 1] = {
+          course: currentCourse || b,
+          source: "none",
+          nCourse: courseRows.length,
+          nAll: baseRows.length,
+          minCourseRows: MIN_COURSE_ST_ROWS,
+        };
       }
     }
   }
+
+  // UI側で「1C平均 / 全C平均」などを表示するための補助情報。
+  out._meta = meta;
   return out;
 }
 
@@ -848,12 +880,55 @@ function autoRaceForVenue(venueName, now = new Date()) {
 // ライブ中は基本的に公式締切の次Rを使う。
 // ただし、公式スケジュール取得失敗/古いキャッシュ/1R固定の事故が起きた時は、
 // 場ごとの概算時刻で「今より前のR」に戻らないように補正する。
-function chooseLiveRaceNo(venueName, resolvedRaceNo) {
+function deadlineMinutesFromText(deadline) {
+  const m = String(deadline || "").match(/([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)/);
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+function jstMinutesNowClient(now = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat("ja-JP", {
+      timeZone: "Asia/Tokyo", hour: "2-digit", minute: "2-digit", hour12: false,
+    }).formatToParts(now).reduce((acc, p) => { if (p.type !== "literal") acc[p.type] = p.value; return acc; }, {});
+    const h = Number(parts.hour === "24" ? "0" : parts.hour);
+    return h * 60 + Number(parts.minute || 0);
+  } catch (e) {
+    return now.getHours() * 60 + now.getMinutes();
+  }
+}
+
+function isDeadlineStillLive(deadline, now = new Date()) {
+  const m = deadlineMinutesFromText(deadline);
+  if (m == null) return null;
+  // 締切直後に公式側の表示が数十秒ズレることがあるため、2分だけ猶予。
+  return m >= jstMinutesNowClient(now) - 2;
+}
+
+// 公式締切が取れている時は公式の次Rを最優先。
+// 以前の版は「概算時刻の方が進んでいたら概算を優先」していたため、
+// 多摩川のように1R開始が遅い場で 8Rなのに11Rへ飛ぶ事故が起きていた。
+function chooseLiveRaceNo(venueName, resolvedRaceNo, resolvedDeadline = "") {
   const fallback = Number(autoRaceForVenue(venueName));
   const official = Number(resolvedRaceNo || 0);
-  if (!official || official < 1 || official > 12) return String(fallback || 1);
-  if (fallback > official) return String(Math.min(fallback, 12));
-  return String(official);
+  const live = isDeadlineStillLive(resolvedDeadline);
+
+  if (official >= 1 && official <= 12) {
+    // 公式締切が未来なら絶対に公式を使う。
+    if (live === true) return String(official);
+    // 締切文字列が無い場合も、公式が2R以降なら公式を信用。
+    if (live === null && official > 1) return String(official);
+    // 1R固定かつ締切が過ぎている/不明な時だけ概算で救済。
+    if (official === 1 && fallback > 1 && live !== true) return String(Math.min(fallback, 12));
+    return String(official);
+  }
+  return String(fallback || 1);
+}
+
+function displayRaceForVenueCard(venueName, status) {
+  const officialRace = status?.nextRace ? String(status.nextRace) : "";
+  if (!officialRace) return "";
+  return chooseLiveRaceNo(venueName, officialRace, status?.nextDeadline || "");
 }
 
 function todayDateValue() {
@@ -1015,6 +1090,7 @@ export default function App() {
   const autoBusyRef = useRef(false);
   const lastAutoFetchKeyRef = useRef("");
   const lastAutoFetchAtRef = useRef(0);
+  const manualRaceSelectUntilRef = useRef(0);
   const prefetchBusyKeysRef = useRef(new Set());
   const lastPrefetchAtByKeyRef = useRef({});
   const autoRefreshEnabledRef = useRef(autoRefreshEnabled);
@@ -1256,7 +1332,7 @@ export default function App() {
     setDbRacerRows([]);
     setDbRacerStatus("DB選手成績：未取得");
     setOdds(null);
-    setKimari(null); setNigeSim(null); setDbNigeRows([]); setNigeStatus("逃げシミュ：未取得"); setRacerStats(null); setStTable(null);
+    setKimari(null); setNigeSim(null); setDbNigeRows([]); setNigeStatus("逃げシミュ：未取得"); setRacerStats(null); setStTable(null); setStMeta(null);
     setResultDigits({ first: "", second: "", third: "" });
     setAutoMsg("");
     setSaveMsg("");
@@ -1280,8 +1356,9 @@ export default function App() {
   const [cmpMode, setCmpMode] = useState("all"); // "all"=全部反映 / "overlap"=被りのみ反映
 
   // ── 平均ST表（基本情報ページ）の期間選択 ──
-  const ST_PERIODS = ["直近6ヶ月", "直近1年", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "初日", "最終日", "ナイター", "F持"];
+  const ST_PERIODS = ["直近6ヶ月", "直近1年", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "女子戦", "初日", "最終日", "ナイター", "F持"];
   const [stTable, setStTable] = useState(null);
+  const [stMeta, setStMeta] = useState(null);
   const [stPeriod, setStPeriod] = useState("直近6ヶ月");
 
   const applyStTable = (table, period) => {
@@ -1293,6 +1370,9 @@ export default function App() {
         ns[b] = (v != null && v >= 0 && v <= 0.6) ? Math.min(0.4, v).toFixed(2) : "";
       }
       setSts((p) => ({ ...p, ...ns }));
+      setStMeta(table?._meta?.[period] || null);
+    } else {
+      setStMeta(null);
     }
     // F持: F持ち時の平均STとして保存（F持ちスイッチは手動）
     const f = table["F持"];
@@ -1702,6 +1782,7 @@ export default function App() {
       allClosed: !!data.allClosed || status === "発売終了",
       nextRace: data.nextRace ? String(data.nextRace) : "",
       nextDeadline: data.nextDeadline || "",
+      nextDeadlineMinutes: data.nextDeadlineMinutes ?? null,
       scheduleCount: data.scheduleCount ?? (Array.isArray(data.schedule) ? data.schedule.length : 0),
       grade: data.grade || data.rank || "",
       eventDay: data.eventDay || data.dayText || "",
@@ -1898,6 +1979,7 @@ export default function App() {
 
   const selectVenueQuick = async (v) => {
     const today = todayDateValue();
+    manualRaceSelectUntilRef.current = 0;
     setVenue(v);
     setRaceDate(today);
     setSalesEnded(false);
@@ -1925,7 +2007,7 @@ export default function App() {
       return;
     }
 
-    const nextRace = chooseLiveRaceNo(v, resolved.raceNo);
+    const nextRace = chooseLiveRaceNo(v, resolved.raceNo, resolved.deadline);
     setRaceNo(nextRace);
     resetRaceAutoData();
     if (AUTO_FETCH_VENUES.includes(v)) {
@@ -1970,13 +2052,15 @@ export default function App() {
         setAutoMsg(`${venue}は本日の全レース発売終了です。復習用データは翌朝の朝一レース前まで表示できます。`);
         return;
       }
-      const nextRace = chooseLiveRaceNo(venue, resolved.raceNo);
-      if (raceNo !== nextRace) {
+      const nextRace = chooseLiveRaceNo(venue, resolved.raceNo, resolved.deadline);
+      const manualHold = manualRaceSelectUntilRef.current && manualRaceSelectUntilRef.current > Date.now();
+      const targetRace = manualHold ? String(raceNo || nextRace) : nextRace;
+      if (!manualHold && raceNo !== nextRace) {
         setRaceNo(nextRace);
         resetRaceAutoData();
       }
       if (raceDate !== today) setRaceDate(today);
-      fetchOfficialYoso({ venue, raceNo: nextRace, raceDate: today, background: true, force, ignoreSalesEnded: true, oddsOnly: hasCompleteAutoStaticData() });
+      fetchOfficialYoso({ venue, raceNo: targetRace, raceDate: today, background: true, force, ignoreSalesEnded: true, oddsOnly: hasCompleteAutoStaticData() });
     };
     run(true);
     const id = window.setInterval(() => run(false), 180000);
@@ -2546,12 +2630,12 @@ export default function App() {
 
   useEffect(() => {
     if (!dbRacerRows.length || !Object.keys(racerProfiles || {}).length) return;
-    const dbSt = buildDbAverageStTableFromRows(dbRacerRows, racerProfiles, venue);
+    const dbSt = buildDbAverageStTableFromRows(dbRacerRows, racerProfiles, venue, courses);
     setStTable((prev) => ({ ...(prev || {}), ...dbSt }));
     // 自動取得後は選択中の期間をDB平均STで反映。貼付がある場合も同じキーは最新DBで上書き。
     const selected = dbSt?.[stPeriod];
     if (selected && selected.some((v) => v != null)) applyStTable({ ...(stTable || {}), ...dbSt }, stPeriod);
-  }, [dbRacerRows, racerProfiles, venue]);
+  }, [dbRacerRows, racerProfiles, venue, courses, stPeriod]);
 
   useEffect(() => {
     let alive = true;
@@ -4021,6 +4105,14 @@ export default function App() {
     }}>{sign(v)}%</span>
   );
 
+  const systemErrors = [
+    correctionStatus && /失敗|failed|error|エラー/i.test(correctionStatus) ? `補正: ${correctionStatus}` : null,
+    dbRacerStatus && /失敗|ENVなし|エラー|error/i.test(dbRacerStatus) ? dbRacerStatus : null,
+    nigeStatus && /失敗|ENVなし|エラー|error/i.test(nigeStatus) ? nigeStatus : null,
+    autoMsg && /エラー|不足|失敗|failed|error/i.test(autoMsg) ? autoMsg : null,
+  ].filter(Boolean);
+  const systemReady = !!venue && !systemErrors.length && (stTable || racerStats || kimari || nigeSim || result);
+
   return (
     <div style={{
       minHeight: "100vh", background: "#0e1b2c", color: "#e8eef5",
@@ -4070,14 +4162,15 @@ export default function App() {
               const noRace = !!(st?.noRace || st?.status === "未開催");
               const allClosed = !!(st?.allClosed || st?.status === "発売終了");
               const loading = !st || venueStatusLoading;
-              const held = !!(st && !noRace && !allClosed && st.nextRace);
+              const cardRace = st ? displayRaceForVenueCard(v, st) : "";
+              const held = !!(st && !noRace && !allClosed && cardRace);
               const heldText = loading ? "確認中" : noRace ? "開催なし" : allClosed ? "復習可" : "本日開催";
               const raceLine = noRace
                 ? "未開催"
                 : allClosed
                   ? "復習表示"
                   : held
-                    ? `${st.nextRace}R / ${st.nextDeadline || "締切確認中"}`
+                    ? `${cardRace}R / ${st.nextDeadline || "締切確認中"}`
                     : "確認中";
               const disabled = noRace;
               return (
@@ -4177,23 +4270,28 @@ export default function App() {
             ))}
           </select>
 
-          <div style={{ fontSize: 11, color: "#7da3c8", margin: "12px 0 6px" }}>レース（開催中は次Rを自動選択／復習時だけ手動変更）</div>
+          <div style={{ fontSize: 11, color: "#7da3c8", margin: "12px 0 6px" }}>レース（自動で次Rを選択／手動変更も可）</div>
           <select
             value={raceNo}
             onChange={(e) => {
               const nr = e.target.value;
+              manualRaceSelectUntilRef.current = Date.now() + 10 * 60 * 1000;
               setRaceNo(nr);
               setVenueNotHeld(false);
               resetRaceAutoData();
               if (salesEnded && venue) {
                 setReviewMode(true);
-                window.setTimeout(() => fetchOfficialYoso({ venue, raceNo: nr, raceDate, force: true, ignoreSalesEnded: true }), 80);
+                window.setTimeout(() => fetchOfficialYoso({ venue, raceNo: nr, raceDate: raceDate || todayDateValue(), force: true, ignoreSalesEnded: true }), 80);
               } else {
                 setSalesEnded(false);
                 setReviewMode(false);
+                if (venue && AUTO_FETCH_VENUES.includes(venue)) {
+                  setAutoMsg(`${venue}${nr}Rを手動選択しました。取得します…`);
+                  window.setTimeout(() => fetchOfficialYoso({ venue, raceNo: nr, raceDate: raceDate || todayDateValue(), force: true, ignoreSalesEnded: true }), 80);
+                }
               }
             }}
-            disabled={venueNotHeld || (!reviewMode && !salesEnded)}
+            disabled={venueNotHeld}
             style={{
               width: "100%", padding: "11px 12px", fontSize: 16,
               background: "#16273c", color: "#fff",
@@ -4249,22 +4347,7 @@ export default function App() {
               {venue && (() => {
                 const info = getVenueBaseWithCorrections(venue, raceDate, correctionCache);
                 const { season, seasonal, dynamic } = info;
-                if (dynamic) {
-                  return (
-                    <span style={{ fontSize: 10, fontWeight: 600, color: "#7fc8a8", marginLeft: 8 }}>
-                      DB補正・直近{correctionTable?.days || 365}日
-                    </span>
-                  );
-                }
-                return seasonal ? (
-                  <span style={{ fontSize: 10, fontWeight: 600, color: "#7fc8a8", marginLeft: 8 }}>
-                    {season}季 <span style={{ color: "#5e9a82" }}>{SEASON_PERIOD[season]}</span>
-                  </span>
-                ) : (
-                  <span style={{ fontSize: 10, fontWeight: 600, color: "#7da3c8", marginLeft: 8 }}>
-                    （通年／{season}季データ未登録）
-                  </span>
-                );
+                return null;
               })()}
             </div>
           )}
@@ -4302,11 +4385,6 @@ export default function App() {
             ))}
           </select>
 
-          <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 8 }}>
-            補正状態：{correctionStatus}
-            {correctionTable?.updated_at ? ` ／ 更新 ${String(correctionTable.updated_at).slice(0, 10)}` : ""}
-          </div>
-
           {/* 風による増減値は内部計算のみ。画面には直接表示しない。 */}
         </div>
 
@@ -4334,14 +4412,16 @@ export default function App() {
             🗑 オールクリア
           </button>
         </div>
-        {autoMsg && (
+        {(autoMsg || systemReady || systemErrors.length > 0) && (
           <div style={{
             margin: "-2px 0 10px", padding: "8px 10px", borderRadius: 8,
-            background: autoMsg.startsWith("✓") ? "#123326" : "#3a2030",
-            color: autoMsg.startsWith("✓") ? "#7ee2aa" : "#ff8a80",
-            border: autoMsg.startsWith("✓") ? "1px solid #1c7047" : "1px solid #5e2d3a",
+            background: systemErrors.length ? "#3a2030" : "#123326",
+            color: systemErrors.length ? "#ff8a80" : "#7ee2aa",
+            border: systemErrors.length ? "1px solid #5e2d3a" : "1px solid #1c7047",
             fontSize: 12, fontWeight: 700,
-          }}>{autoMsg}</div>
+          }}>
+            {systemErrors.length ? systemErrors.join(" ／ ") : `✓ ${venue || ""}${raceNo || ""}R 取得済`}
+          </div>
         )}
 
         {/* 平均STの期間切替 */}
@@ -4367,9 +4447,9 @@ export default function App() {
             ))}
           </select>
           {stTable ? (
-            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ ST表 読込済（切替で自動反映）</span>
-          ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>※自動取得後にDB平均STを反映</span>
+            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 取得済</span>
+          ) : systemErrors.length ? null : (
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>取得待ち</span>
           )}
         </div>
 
@@ -4393,9 +4473,11 @@ export default function App() {
             ))}
           </select>
           {racerStats ? (
-            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 選手成績 DB自動反映中（{dbRacerStatus}）</span>
+            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 取得済</span>
+          ) : systemErrors.length ? (
+            <span style={{ fontSize: 11, color: "#ff8a80" }}>{systemErrors.find((x) => String(x).includes("選手成績")) || "取得エラー"}</span>
           ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>{dbRacerStatus}</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>取得待ち</span>
           )}
         </div>
 
@@ -4419,14 +4501,16 @@ export default function App() {
             ))}
           </select>
           {kimari ? (
-            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 決まり手 読込済</span>
-          ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>決まり手はDB成績を使用</span>
+            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 取得済</span>
+          ) : systemErrors.length ? null : (
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>取得待ち</span>
           )}
           {nigeSim ? (
-            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ {nigeStatus}</span>
+            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 取得済</span>
+          ) : systemErrors.length ? (
+            <span style={{ fontSize: 11, color: "#ff8a80" }}>{systemErrors.find((x) => String(x).includes("逃げ")) || "取得エラー"}</span>
           ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>{nigeStatus}</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>取得待ち</span>
           )}
         </div>
 
@@ -4541,8 +4625,10 @@ export default function App() {
                   }}>⚡伸び警戒</span>
                 )}
 
-                <div style={{ minWidth: 90 }}>
-                  <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 2 }}>平均ST</div>
+                <div style={{ minWidth: 112 }}>
+                  <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 2 }}>
+                    平均ST{stMeta?.[b - 1]?.source === "course" ? `（${stMeta[b - 1].course}C）` : stMeta?.[b - 1]?.source === "all" ? "（全C）" : ""}
+                  </div>
                   <select
                     value={sts[b]}
                     onChange={(e) => setSt(b, e.target.value)}
@@ -4557,6 +4643,13 @@ export default function App() {
                       <option key={s} value={s}>{s}</option>
                     ))}
                   </select>
+                  {stMeta?.[b - 1] && stMeta[b - 1].source !== "none" && (
+                    <div style={{ fontSize: 9, color: "#7da3c8", marginTop: 3, lineHeight: 1.35 }}>
+                      {stMeta[b - 1].source === "course"
+                        ? `${stMeta[b - 1].course}C平均 n=${stMeta[b - 1].nCourse}`
+                        : `全C平均 n=${stMeta[b - 1].nAll}（${stMeta[b - 1].course}C n=${stMeta[b - 1].nCourse}不足）`}
+                    </div>
+                  )}
                 </div>
 
                 <button
@@ -5067,6 +5160,18 @@ export default function App() {
                             {nigeSim.stAdv != null && <span>ST優位 <b style={{ color: nigeSim.stAdv > 0 ? "#5dd39e" : "#ff7b7b" }}>{nigeSim.stAdv > 0 ? "+" : ""}{nigeSim.stAdv.toFixed(2)}</b></span>}
                             {nigeSim.wall2 != null && <span>2C壁性能 <b style={{ color: nigeSim.wall2 >= 55 ? "#5dd39e" : nigeSim.wall2 <= 35 ? "#ff7b7b" : "#fff" }}>{nigeSim.wall2}</b></span>}
                             {nigeSim.attack3 != null && <span>3C攻撃警戒 <b style={{ color: nigeSim.attack3 >= 45 ? "#ff7b7b" : "#fff" }}>{nigeSim.attack3}</b></span>}
+                          </div>
+                          <div style={{
+                            marginTop: 2, padding: "8px 9px", borderRadius: 8,
+                            background: "rgba(22,39,60,0.78)", border: "1px solid #223c58",
+                            fontSize: 10.5, lineHeight: 1.65, color: "#9db5cc",
+                          }}>
+                            <div><b style={{ color: "#dbe8f5" }}>上の「1着・逃げ」</b>：その開催場全体の1コース成績です。例：逃げ52%なら「この場で1コースが逃げた割合」。</div>
+                            <div><b style={{ color: "#dbe8f5" }}>1C本人1着</b>：今日1号艇に入っている選手本人が、DB上で1コースに入った時の1着率です。場全体ではなく本人成績なので、上の逃げ率とズレます。</div>
+                            <div><b style={{ color: "#dbe8f5" }}>イン逃げ信頼度</b>：場全体の逃げ率だけではなく、本人1C成績・ST優位・展示評価・風・2C壁性能・3C攻撃警戒を加味した総合評価です。単純な逃げ率ではありません。</div>
+                            <div><b style={{ color: "#dbe8f5" }}>ST優位</b>：1号艇の平均STが他艇よりどれだけ先行しやすいか。プラスが大きいほど逃げに追い風、マイナスは遅れ警戒。</div>
+                            <div><b style={{ color: "#dbe8f5" }}>2C壁性能</b>：2コース艇が壁になって1号艇を逃がしやすい度合い。100点満点目安の内部指数で、標準は50点前後。55点以上は壁として優秀、35点以下は壁が弱く差し・まくりを許しやすい。</div>
+                            <div><b style={{ color: "#dbe8f5" }}>3C攻撃警戒</b>：3コース艇のまくり・まくり差し等の攻撃力。100点満点目安の内部指数で、標準は35点前後。45点以上は攻撃警戒、55点以上は強警戒。高いほどイン逃げ失敗リスクとして見る。</div>
                           </div>
                           {nigeSim.failKimarite && (
                             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", fontSize: 11 }}>
