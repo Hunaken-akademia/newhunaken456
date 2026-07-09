@@ -1138,6 +1138,42 @@ function normalizeBoatcastWeightToken(x) {
   return inRange(v, 40, 70) ? v : "";
 }
 
+function normalizeBoatcastAdjustWeightToken(x) {
+  const v = normNum(String(x ?? "").replace(/[＋]/g, "+").replace(/[－−ー]/g, "-").replace(/\s+/g, ""));
+  // 調整体重は 0.5 / 1.0 / 1.5 / 2.0 付近。チルト評価には絶対に使わない。
+  return inRange(v, 0, 3) ? Number(v).toFixed(1) : "";
+}
+
+function pickBoatcastAdjustWeightToken(cols) {
+  const arr = (cols || []).map((x) => String(x ?? "").trim());
+  const weightIdx = arr.findIndex((x) => normalizeBoatcastWeightToken(x));
+  if (weightIdx < 0) return "";
+  const afterWeight = arr.slice(weightIdx + 1);
+  const firstLowNum = afterWeight.find((x) => normalizeBoatcastAdjustWeightToken(x));
+  return firstLowNum ? normalizeBoatcastAdjustWeightToken(firstLowNum) : "";
+}
+
+function pickBoatcastTiltToken(cols) {
+  const arr = (cols || []).map((x) => String(x ?? "").trim());
+  // チルトは公式表では「+0.0」「-0.5」のように符号付きで出ることが多い。
+  // 調整体重 0.5/1.0/1.5 をチルトと誤認しないよう、符号付きトークンを最優先する。
+  const signed = arr.find((x) => /^[+＋\-－−ー]\s*\d+(?:\.\d+)?$/.test(x) && normalizeBoatcastTiltToken(x));
+  if (signed) return normalizeBoatcastTiltToken(signed);
+
+  const weightIdx = arr.findIndex((x) => normalizeBoatcastWeightToken(x));
+  if (weightIdx >= 0) {
+    const lowNums = arr.slice(weightIdx + 1).filter((x) => normalizeBoatcastTiltToken(x));
+    // 体重の直後に「調整重量, チルト」と並ぶ形式は2個目をチルトとして扱う。
+    // 1個しかない 1.0 などは調整体重の可能性が高いため、チルトには入れない。
+    if (lowNums.length >= 2) return normalizeBoatcastTiltToken(lowNums[1]);
+    if (lowNums.length === 1) {
+      const only = normalizeBoatcastTiltToken(lowNums[0]);
+      return ["-0.5", "0.0", "0.5"].includes(only) ? only : "";
+    }
+  }
+  return "";
+}
+
 
 function boatcastPlainLines(raw) {
   return decodeEntities(String(raw || ""))
@@ -1254,11 +1290,12 @@ function parseBoatcastTkzRows(raw) {
     if (!tenji) continue;
 
     const weight = c.map(normalizeBoatcastWeightToken).find(Boolean) || "";
-    // チルトは -0.5〜3.0 付近。艇番や年齢を避けるため、展示タイムより前後の小数を広めに拾う。
-    const tilt = c.map(normalizeBoatcastTiltToken).find(Boolean) || "";
+    const adjust_weight = pickBoatcastAdjustWeightToken(c);
+    // チルトは調整体重と誤認しやすいので、符号付き表示や体重列の並びを見て拾う。
+    const tilt = pickBoatcastTiltToken(c);
     const name = c.find((x) => /[一-龠ぁ-んァ-ヶ]/.test(x) && !/展示|チルト|体重|級別|登録/.test(x)) || "";
 
-    rows.push({ boat, course: boat, name, tenji, weight, tilt });
+    rows.push({ boat, course: boat, name, tenji, weight, adjust_weight, tilt });
     if (rows.length >= 6) break;
   }
   rows.sort((a, b) => a.boat - b.boat);
@@ -1286,24 +1323,33 @@ function parseBoatcastOritenRows(raw) {
     let chokusen = "";
 
     const nums = parseNumericTokens(line);
-    if (/^\d\t/.test(line)) {
-      const c = line.split("\t").map((x) => String(x || "").trim());
-      boat = Number(c[0]);
+    const hasTab = line.includes("\t");
+    const c = hasTab ? line.split("\t").map((x) => String(x || "").trim()) : line.split(/[ 　]+/).map((x) => String(x || "").trim()).filter(Boolean);
+
+    // BOATCASTのoritenは場・レースにより、
+    // 1) 艇番,選手名,一周,まわり足,直線
+    // 2) 登録番号,選手名,一周,まわり足,直線（艇番なし）
+    // 3) 選手名,一周,まわり足,直線（艇番なし）
+    // のように列が揺れる。艇番が無い時は行順を1〜6号艇として扱う。
+    const firstNum = Number(nums[0]);
+    const firstCol = Number(c[0]);
+    if (firstCol >= 1 && firstCol <= 6) {
+      boat = firstCol;
       name = c[1] || "";
       isshu = normalizeLapValue(c[2]);
       mawari = normNum(c[3]);
       chokusen = normNum(c[4]);
-      // 鳴門など、登録番号や年齢が先に入り、タイム列が後ろへずれる形式の保険。
       if (!isshu || !inRange(mawari, 4, 15)) {
         const picked = pickSequentialBoatcastTimes(nums.slice(1), { hasHalfLap });
         if (picked) ({ isshu, mawari, chokusen } = picked);
       }
     } else {
-      boat = Number(nums[0]);
-      if (boat >= 1 && boat <= 6) {
-        const picked = pickSequentialBoatcastTimes(nums.slice(1), { hasHalfLap });
-        if (picked) ({ isshu, mawari, chokusen } = picked);
-      }
+      // 先頭が登録番号(例:4096)や選手名の場合。数値列全体からタイム連番を探す。
+      // 登録番号・年齢・級別の数字は pickSequentialBoatcastTimes 側の範囲判定で無視される。
+      const picked = pickSequentialBoatcastTimes(nums, { hasHalfLap });
+      if (picked) ({ isshu, mawari, chokusen } = picked);
+      boat = firstNum >= 1 && firstNum <= 6 ? firstNum : rows.length + 1;
+      name = c.find((x) => /[一-龠ぁ-んァ-ヶ]/.test(x) && !/一周|まわり|直線|展示|半周/.test(x)) || "";
     }
 
     if (!(boat >= 1 && boat <= 6) || !isshu || !inRange(mawari, 4, 15)) continue;
@@ -1317,6 +1363,7 @@ function parseBoatcastOritenRows(raw) {
       chokusen: inRange(chokusen, 4, 15) ? chokusen : "",
       lapKind: hasHalfLap ? "half" : "one",
     });
+    if (rows.length >= 6) break;
   }
   rows.sort((a, b) => a.boat - b.boat);
   return rows.slice(0, 6);

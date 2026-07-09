@@ -668,6 +668,8 @@ async function fetchLatestCorrectionTables() {
 function buildCorrectionCache(table) {
   const venueBaseByPlace = {};
   const venueCountsByPlace = {};
+  const venueBaseSeasonByPlace = {};
+  const venueSeasonCountsByPlace = {};
 
   for (const row of Array.isArray(table?.venue_base) ? table.venue_base : []) {
     const placeNo = Number(row.place_no);
@@ -679,6 +681,31 @@ function buildCorrectionCache(table) {
     if (!venueCountsByPlace[placeNo]) venueCountsByPlace[placeNo] = Array(6).fill(null);
     venueBaseByPlace[placeNo][course - 1] = win1;
     venueCountsByPlace[placeNo][course - 1] = n;
+  }
+
+  // DB補正の季節別場平均。行形式は {place_no, season, course, win1, n} を想定。
+  // seasonが 1〜4 / spring,summer,autumn,winter / 春夏秋冬 のどれでも拾う。
+  const normalizeSeason = (v) => {
+    const x = String(v ?? "").trim().toLowerCase();
+    if (["春", "spring", "spr", "1", "3-5", "3〜5"].includes(x)) return "春";
+    if (["夏", "summer", "sum", "2", "6-8", "6〜8"].includes(x)) return "夏";
+    if (["秋", "autumn", "fall", "aut", "3", "9-11", "9〜11"].includes(x)) return "秋";
+    if (["冬", "winter", "win", "4", "12-2", "12〜2"].includes(x)) return "冬";
+    return null;
+  };
+  for (const row of Array.isArray(table?.venue_base_season) ? table.venue_base_season : []) {
+    const placeNo = Number(row.place_no);
+    const season = normalizeSeason(row.season ?? row.season_name ?? row.season_key ?? row.season_no);
+    const course = Number(row.course);
+    const win1 = toFiniteNumber(row.win1);
+    const n = toFiniteNumber(row.n);
+    if (!placeNo || !season || course < 1 || course > 6 || win1 == null) continue;
+    if (!venueBaseSeasonByPlace[placeNo]) venueBaseSeasonByPlace[placeNo] = {};
+    if (!venueSeasonCountsByPlace[placeNo]) venueSeasonCountsByPlace[placeNo] = {};
+    if (!venueBaseSeasonByPlace[placeNo][season]) venueBaseSeasonByPlace[placeNo][season] = Array(6).fill(null);
+    if (!venueSeasonCountsByPlace[placeNo][season]) venueSeasonCountsByPlace[placeNo][season] = Array(6).fill(null);
+    venueBaseSeasonByPlace[placeNo][season][course - 1] = win1;
+    venueSeasonCountsByPlace[placeNo][season][course - 1] = n;
   }
 
   const windAgg = {};
@@ -709,6 +736,8 @@ function buildCorrectionCache(table) {
     windK: table?.wind_k || null,
     venueBaseByPlace,
     venueCountsByPlace,
+    venueBaseSeasonByPlace,
+    venueSeasonCountsByPlace,
     windByPlaceBin,
   };
 }
@@ -730,11 +759,25 @@ function windBinFromLabel(label) {
 function getVenueBaseWithCorrections(venue, dateStr, correctionCache) {
   const fallback = getVenueBase(venue, dateStr);
   const placeNo = PLACE_NO_BY_VENUE[venue];
+  const curSeason = fallback.season;
+
+  // 優先順位: DB季節別 → DB通年 → 固定季節別 → 固定通年
+  const dbSeasonBase = placeNo && curSeason ? correctionCache?.venueBaseSeasonByPlace?.[placeNo]?.[curSeason] : null;
+  if (Array.isArray(dbSeasonBase) && dbSeasonBase.filter((v) => v != null).length === 6) {
+    return {
+      ...fallback,
+      base: dbSeasonBase.map((v) => +Number(v).toFixed(1)),
+      seasonal: true,
+      dynamic: true,
+      sourceLabel: `DB季節別・${curSeason}`,
+    };
+  }
+
   const dbBase = placeNo ? correctionCache?.venueBaseByPlace?.[placeNo] : null;
   if (Array.isArray(dbBase) && dbBase.filter((v) => v != null).length === 6) {
-    return { ...fallback, base: dbBase.map((v) => +Number(v).toFixed(1)), seasonal: false, dynamic: true };
+    return { ...fallback, base: dbBase.map((v) => +Number(v).toFixed(1)), seasonal: false, dynamic: true, sourceLabel: "DB通年" };
   }
-  return { ...fallback, dynamic: false };
+  return { ...fallback, dynamic: false, sourceLabel: fallback.seasonal ? `固定季節別・${curSeason}` : "固定通年" };
 }
 
 function getWindAdjWithCorrections(venue, windLabel, course, correctionCache) {
@@ -1630,7 +1673,8 @@ export default function App() {
       const b = Number(r.boat);
       if (!b || b < 1 || b > 6) return;
       nextWeights[b] = r.weight || "";
-      nextTilts[b] = r.tilt || "";
+      const tiltNum = Number(String(r.tilt ?? "").replace(/[＋]/g, "+").replace(/[－−ー]/g, "-"));
+      nextTilts[b] = Number.isFinite(tiltNum) && tiltNum >= -0.5 && tiltNum <= 3.0 ? tiltNum.toFixed(1) : "";
       if (r.course && Number(r.course) >= 1 && Number(r.course) <= 6) nextCourses[b] = Number(r.course);
     });
     setWeights(nextWeights);
@@ -2785,13 +2829,13 @@ export default function App() {
     const stVals = Object.values(effSt);
     const stAvg = stVals.length >= 2 ? stVals.reduce((a, c) => a + c, 0) / stVals.length : null;
 
-    const motorVals = Object.values(motors).filter((m) => m && m.ren2 != null).map((m) => m.ren2);
+    const motorVals = Object.values(motors).filter((m) => m && (m.ren3 != null || m.ren2 != null)).map((m) => m.ren3 ?? m.ren2);
     const motorAvg = motorVals.length >= 2 ? motorVals.reduce((a, c) => a + c, 0) / motorVals.length : null;
-    // モーター上位2機（2連対率順）
+    // モーター上位2機（3連対率順）。3連対率がない場合だけ2連対率で補完。
     const motorTop2 = new Set(
       Object.entries(motors)
-        .filter(([, m]) => m && m.ren2 != null)
-        .sort((a, b) => b[1].ren2 - a[1].ren2)
+        .filter(([, m]) => m && (m.ren3 != null || m.ren2 != null))
+        .sort((a, b) => (b[1].ren3 ?? b[1].ren2 ?? -Infinity) - (a[1].ren3 ?? a[1].ren2 ?? -Infinity))
         .slice(0, 2)
         .map(([b]) => Number(b))
     );
@@ -3010,7 +3054,7 @@ export default function App() {
 
       const ptSeisek = rankPoints((r) => (r.racerR1final ?? -Infinity), 4); // 補正込み1着率
       const ptTenji  = rankPoints(tenjiVal, 4);                              // 展示（段階ベース）
-      const ptMotor  = rankPoints((r) => (motors[r.boat]?.ren2 ?? -Infinity), 4); // モーター2連対率
+      const ptMotor  = rankPoints((r) => (motors[r.boat]?.ren3 ?? motors[r.boat]?.ren2 ?? -Infinity), 4); // モーター3連対率優先
       const ptWaku   = rankPoints((r) => (r.final1 ?? -Infinity), 2);        // 枠基準（基本場平均＋展示補正／風なし）10点満点
       const ptSt     = rankPoints((r) => (r.stDiff ?? -Infinity), 4);        // ST（速いほど＋）20点満点
       const ptKaze   = rankPoints((r) => (r.windAdj ?? -Infinity), 2);       // 風補正
@@ -3735,6 +3779,114 @@ export default function App() {
     return { judged: judged.length, per, comboHit };
   }, [statFilter]);
 
+
+  // ── 見送りAI ──
+  //   「買わないレースを買わない」ための判定。自信度×荒れ度×期待値から
+  //   勝負 / 慎重 / 見送り推奨 を明示する。
+  const miokuri = useMemo(() => {
+    if (!aiEval || !aiEval.confidence) return null;
+    const conf = aiEval.confidence.total;
+    const bestEv = aiEval.evList && aiEval.evList.length ? aiEval.evList[0].ev : null;
+    const rough = aiEval.badge === "混戦" || aiEval.badge === "大混戦・波乱含み";
+    const reasons = [];
+    let verdict = "慎重";
+    let color = "#f9c513";
+    if (conf < 45) reasons.push(`自信度${conf}と低く根拠が弱い`);
+    if (rough && bestEv != null && bestEv < 0.9) reasons.push("荒れ模様なのに妙味のある目が無い");
+    if (aiEval.badge === "大混戦・波乱含み" && conf < 60) reasons.push("大混戦で評価が割れている");
+    if (reasons.length) {
+      verdict = "見送り推奨";
+      color = "#e08a8a";
+    } else if (conf >= 70 && (bestEv == null || bestEv >= 1.0)) {
+      verdict = "勝負";
+      color = "#5dd39e";
+      reasons.push(`自信度${conf}で評価が明確`);
+      if (bestEv != null && bestEv >= 1.0) reasons.push(`期待値${bestEv.toFixed(2)}の妙味あり`);
+    } else {
+      if (conf < 70) reasons.push(`自信度${conf}`);
+      if (bestEv != null && bestEv < 1.0) reasons.push("オッズ妙味は薄め");
+      if (rough) reasons.push("荒れ模様");
+      if (!reasons.length) reasons.push("決め手不足");
+    }
+    return { verdict, color, reasons };
+  }, [aiEval]);
+
+  // ── 展開リハーサル（スタート隊形のモンテカルロ試走） ──
+  //   平均ST・進入・当日評価スコアから、スタート隊形を1000回試走して決まり手の出現分布を出す。
+  const tenkaiRehearsal = useMemo(() => {
+    if (!aiEval || !slit || !Array.isArray(slit) || slit.length !== 6) return null;
+    let seed = 0;
+    const key = `${raceDate}_${venue}_${raceNo}`;
+    for (let i = 0; i < key.length; i++) seed = (seed * 31 + key.charCodeAt(i)) >>> 0;
+    const mulberry32 = (a) => () => {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const rnd = mulberry32(seed || 1);
+    const gauss = () => {
+      let u = 0, v = 0;
+      while (u === 0) u = rnd();
+      while (v === 0) v = rnd();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    };
+    const byCourse = {};
+    slit.forEach((e) => { byCourse[e.course] = e; });
+    if (!byCourse[1]) return null;
+    const scores = {};
+    aiEval.ranked.forEach((r) => { scores[r.boat] = r.score || 0; });
+    const vals = slit.map((e) => scores[e.boat] ?? 0);
+    const mn = Math.min(...vals), mx = Math.max(...vals);
+    const pow = {};
+    slit.forEach((e) => { pow[e.boat] = mx === mn ? 0.5 : ((scores[e.boat] ?? 0) - mn) / (mx - mn); });
+    const ITERS = 1000;
+    const tally = {};
+    const winCount = {};
+    slit.forEach((e) => { winCount[e.boat] = 0; });
+    const addResult = (kind, boat) => {
+      const k = `${kind}(${boat})`;
+      tally[k] = (tally[k] || 0) + 1;
+      winCount[boat] += 1;
+    };
+    for (let i = 0; i < ITERS; i++) {
+      const s = {};
+      slit.forEach((e) => { s[e.course] = Math.abs(e.st) + gauss() * 0.05 - (e.course >= 4 ? 0.01 : 0); });
+      const c1 = byCourse[1];
+      let attacker = null, attackKind = null;
+      for (const c of [4, 3, 5, 6]) {
+        const e = byCourse[c];
+        if (!e) continue;
+        const adv = s[1] - s[c];
+        const th = 0.055 - 0.05 * pow[e.boat];
+        if (adv > th + rnd() * 0.03) {
+          attacker = e;
+          attackKind = (c === 3 || c === 4) && adv < th + 0.05 && rnd() < 0.45 ? "まくり差し" : "まくり";
+          break;
+        }
+      }
+      if (attacker) { addResult(attackKind, attacker.boat); continue; }
+      const c2 = byCourse[2];
+      if (c2) {
+        const gap = s[2] - s[1];
+        const sashiP = Math.max(0, 0.30 - gap * 3) * (0.4 + 0.8 * pow[c2.boat]) * (1 - 0.5 * pow[c1.boat]);
+        if (rnd() < sashiP) { addResult("差し", c2.boat); continue; }
+      }
+      if (rnd() < 0.04) {
+        const cand = slit.filter((e) => e.course >= 3).sort((a, b) => pow[b.boat] - pow[a.boat])[0];
+        if (cand && rnd() < pow[cand.boat] * 0.6) { addResult("抜き", cand.boat); continue; }
+      }
+      addResult("逃げ", c1.boat);
+    }
+    const patterns = Object.entries(tally)
+      .map(([k, n]) => ({ k, pct: (n / ITERS) * 100 }))
+      .sort((a, b) => b.pct - a.pct);
+    const winPct = slit
+      .map((e) => ({ boat: e.boat, course: e.course, pct: (winCount[e.boat] / ITERS) * 100 }))
+      .sort((a, b) => b.pct - a.pct);
+    return { iters: ITERS, patterns, winPct };
+  }, [aiEval, slit, raceDate, venue, raceNo]);
+
   // ── AI予想の収支（もし機械的に買っていたら・1点100円固定） ──
   const aiLedger = useMemo(() => {
     const PER = 100; // 1点100円
@@ -4399,7 +4551,7 @@ export default function App() {
             fontSize: 12, fontWeight: 700,
             border: "1px solid #1c7047",
           }}>
-            ✓ コピペ不要：自動取得＋DB成績で反映
+            ✓ 取得済
           </div>
           <button
             onClick={allClear}
@@ -4898,6 +5050,26 @@ export default function App() {
               </div>
             )}
 
+
+            {/* 見送りAI: 勝負／慎重／見送り推奨 の明示 */}
+            {miokuri && (
+              <div style={{
+                border: `1px solid ${miokuri.color}`, background: "#0e1b2c",
+                borderRadius: 10, padding: "10px 14px", marginBottom: 12,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontSize: 10, color: "#7da3c8", letterSpacing: "0.18em" }}>見送りAI</span>
+                  <span style={{ fontSize: 16, fontWeight: 800, color: miokuri.color }}>{miokuri.verdict}</span>
+                </div>
+                <div style={{ fontSize: 11, color: "#9db5cc", marginTop: 4, lineHeight: 1.6 }}>
+                  {miokuri.reasons.join("・")}
+                </div>
+                <div style={{ fontSize: 9, color: "#5e7a92", marginTop: 4 }}>
+                  ※「買わない」も戦略のひとつ。判定は目安です。最終判断はご自身で。
+                </div>
+              </div>
+            )}
+
             {result.dup && (
               <div style={{
                 fontSize: 12, color: "#f9c513", background: "#2e2710",
@@ -5114,6 +5286,36 @@ export default function App() {
                 );
               })}
             </div>
+
+
+            {/* 展開リハーサル（当日気配ベースのモンテカルロ試走・固定シード） */}
+            {tenkaiRehearsal && (
+              <div style={{ background: "#16273c", borderRadius: 10, padding: "10px 14px", marginBottom: 12 }}>
+                <div style={{ fontSize: 12, fontWeight: 800, color: "#fff", marginBottom: 2 }}>
+                  展開リハーサル（AIが{tenkaiRehearsal.iters}回試走した展開分布）
+                </div>
+                <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 8, lineHeight: 1.6 }}>
+                  各艇の平均ST・F持ち・進入・当日評価から、スタート隊形を{tenkaiRehearsal.iters}回シミュレート。
+                  「レースがどう動きやすいか」の出現率です。
+                </div>
+                <div style={{ display: "grid", gap: 4 }}>
+                  {tenkaiRehearsal.patterns.slice(0, 6).map((p) => (
+                    <div key={p.k} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 11, color: "#cfe0f0", fontWeight: 700, minWidth: 100 }}>{p.k.replace("(", "（").replace(")", "号艇）")}</span>
+                      <div style={{ flex: 1, height: 8, background: "#0e1b2c", borderRadius: 4, overflow: "hidden" }}>
+                        <div style={{ width: `${Math.min(100, p.pct)}%`, height: "100%", background: "#7ac8e8" }} />
+                      </div>
+                      <span style={{ fontSize: 11, color: "#f5c518", fontVariantNumeric: "tabular-nums", minWidth: 46, textAlign: "right" }}>
+                        {p.pct.toFixed(1)}%
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontSize: 9, color: "#5e7a92", marginTop: 6, lineHeight: 1.5 }}>
+                  ※ DB逃げシミュレーションとは別物の、当日気配ベースの試走です。参考指標としてご利用ください。
+                </div>
+              </div>
+            )}
 
             {/* 逃げシミュレーション */}
             {nigeSim && (
