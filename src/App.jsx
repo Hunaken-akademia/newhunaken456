@@ -1395,7 +1395,7 @@ export default function App() {
   const [racerCat, setRacerCat] = useState("直近6ヶ月");
   // 期間比較（買い目の被りを見る）
   const [cmpA, setCmpA] = useState("直近6ヶ月");
-  const [cmpB, setCmpB] = useState("直近6ヶ月");
+  const [cmpB, setCmpB] = useState("直近3ヶ月");
   const [cmpMode, setCmpMode] = useState("all"); // "all"=全部反映 / "overlap"=被りのみ反映
 
   // ── 平均ST表（基本情報ページ）の期間選択 ──
