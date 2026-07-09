@@ -6,7 +6,7 @@ on:
       days:
         description: '補正に使う日数'
         required: true
-        default: '365'
+        default: '180'
       wind_k:
         description: '風補正の縮小推定K'
         required: true
