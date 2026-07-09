@@ -11,6 +11,175 @@ const SUPABASE_URL = String(import.meta.env?.VITE_SUPABASE_URL || "").replace(/\
 const SUPABASE_ANON_KEY = String(import.meta.env?.VITE_SUPABASE_ANON_KEY || "");
 const CORRECTION_TABLE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 
+
+const AUTH_SESSION_KEY = "hunaken_paid_auth_session_v1";
+const PAID_TABLE = "paid_users";
+const AUTH_REDIRECT_TO = (() => {
+  try { return `${window.location.origin}${window.location.pathname}`; } catch (e) { return ""; }
+})();
+
+function authHeaders(accessToken = "", json = false) {
+  const h = { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${accessToken || SUPABASE_ANON_KEY}` };
+  if (json) h["Content-Type"] = "application/json";
+  return h;
+}
+
+function saveAuthSession(session) {
+  try { localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(session || null)); } catch (e) { /* noop */ }
+}
+
+function loadAuthSession() {
+  try {
+    const raw = localStorage.getItem(AUTH_SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+
+function clearAuthSession() {
+  try { localStorage.removeItem(AUTH_SESSION_KEY); } catch (e) { /* noop */ }
+}
+
+function sessionFromHash() {
+  try {
+    const hash = String(window.location.hash || "").replace(/^#/, "");
+    if (!hash) return null;
+    const sp = new URLSearchParams(hash);
+    const access_token = sp.get("access_token");
+    const refresh_token = sp.get("refresh_token");
+    if (!access_token) return null;
+    const expires_in = Number(sp.get("expires_in") || 3600);
+    return {
+      access_token,
+      refresh_token,
+      token_type: sp.get("token_type") || "bearer",
+      expires_at: Date.now() + Math.max(60, expires_in - 60) * 1000,
+    };
+  } catch (e) { return null; }
+}
+
+async function refreshAuthSession(session) {
+  if (!session?.refresh_token || !SUPABASE_URL || !SUPABASE_ANON_KEY) return session;
+  if (session.expires_at && Date.now() < Number(session.expires_at)) return session;
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: authHeaders("", true),
+    body: JSON.stringify({ refresh_token: session.refresh_token }),
+  });
+  if (!res.ok) throw new Error("ログイン期限が切れました。もう一度ログインしてください。");
+  const data = await res.json();
+  const next = {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || session.refresh_token,
+    token_type: data.token_type || "bearer",
+    expires_at: Date.now() + Math.max(60, Number(data.expires_in || 3600) - 60) * 1000,
+  };
+  saveAuthSession(next);
+  return next;
+}
+
+async function fetchAuthUser(session) {
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, { headers: authHeaders(session.access_token, false) });
+  if (!res.ok) throw new Error("ログイン情報を確認できませんでした。");
+  return await res.json();
+}
+
+async function fetchPaidEntitlement(session, email) {
+  const normalized = String(email || "").trim().toLowerCase();
+  if (!normalized) return { ok: false, reason: "メールアドレスを確認できませんでした。" };
+  const qs = new URLSearchParams();
+  qs.set("select", "email,plan,purchased_at,expires_at,note");
+  qs.set("email", `eq.${normalized}`);
+  qs.set("limit", "1");
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${PAID_TABLE}?${qs.toString()}`, {
+    headers: authHeaders(session.access_token, false),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`購入者判定に失敗しました。paid_usersのSQL/RLSを確認してください。${txt ? ` (${txt.slice(0, 120)})` : ""}`);
+  }
+  const rows = await res.json();
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row) return { ok: false, reason: "このGoogleメールは購入者リストに未登録です。", row: null };
+  if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {
+    return { ok: false, reason: "利用期限が切れています。", row };
+  }
+  return { ok: true, reason: "購入者確認済み", row };
+}
+
+
+async function createStripeCheckoutSession(email) {
+  const normalized = String(email || "").trim().toLowerCase();
+  if (!normalized) throw new Error("Googleメールを確認できませんでした。先にGoogleログインしてください。");
+  const res = await fetch("/api/create-checkout-session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: normalized }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.url) {
+    throw new Error(data?.error || "決済ページを作成できませんでした。Vercel環境変数とStripe設定を確認してください。");
+  }
+  window.location.href = data.url;
+}
+
+function startGoogleLogin() {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    alert("Supabase環境変数が未設定です。VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY を確認してください。");
+    return;
+  }
+  const qs = new URLSearchParams();
+  qs.set("provider", "google");
+  qs.set("redirect_to", AUTH_REDIRECT_TO);
+  window.location.href = `${SUPABASE_URL}/auth/v1/authorize?${qs.toString()}`;
+}
+
+function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, onRetry, onPurchase }) {
+  const email = user?.email || user?.user_metadata?.email || "";
+  const card = {
+    minHeight: "100vh", background: "#0e1b2c", color: "#e8eef5",
+    fontFamily: "'Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif",
+    padding: "28px 16px", display: "flex", alignItems: "center", justifyContent: "center",
+  };
+  const box = { width: "100%", maxWidth: 520, background: "#13243a", border: "1px solid #284766", borderRadius: 18, padding: 22, boxShadow: "0 16px 50px rgba(0,0,0,.25)" };
+  const btn = { width: "100%", border: "none", borderRadius: 12, padding: "13px 16px", fontSize: 15, fontWeight: 900, cursor: "pointer", background: "#4ea1ff", color: "#061425", marginTop: 14 };
+  const buyBtn = { ...btn, background: "#ffd166", color: "#1a2433" };
+  if (mode === "loading") {
+    return <div style={card}><div style={box}><div style={{ fontSize: 22, fontWeight: 900 }}>舟券アカデミア</div><p style={{ color: "#9db5cc" }}>ログイン状態と購入者情報を確認中…</p></div></div>;
+  }
+  if (mode === "config") {
+    return <div style={card}><div style={box}><div style={{ fontSize: 22, fontWeight: 900 }}>設定が必要です</div><p style={{ color: "#ffb4a8", lineHeight: 1.7 }}>Vercel環境変数の VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY が未設定です。</p></div></div>;
+  }
+  if (mode === "login") {
+    return (
+      <div style={card}><div style={box}>
+        <div style={{ fontSize: 11, letterSpacing: ".18em", color: "#7da3c8", marginBottom: 6 }}>購入者専用</div>
+        <div style={{ fontSize: 24, fontWeight: 900 }}>舟券アカデミア 有料自動取得版</div>
+        <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 13 }}>Googleログイン後、購入済みのメールだけツールを表示します。販売期間は2026/7/13〜2026/8/13、利用期限は2026/12/31 23:59までです。</p>
+        <button onClick={onLogin} style={btn}>Googleでログイン</button>
+        {authMsg ? <p style={{ color: "#ffb4a8", fontSize: 12, lineHeight: 1.7 }}>{authMsg}</p> : null}
+        <p style={{ color: "#5f7f9f", fontSize: 11, lineHeight: 1.7, marginTop: 16 }}>本ツールは予想補助であり、的中や利益を保証するものではありません。</p>
+      </div></div>
+    );
+  }
+  return (
+    <div style={card}><div style={box}>
+      <div style={{ fontSize: 11, letterSpacing: ".18em", color: "#7da3c8", marginBottom: 6 }}>購入者判定</div>
+      <div style={{ fontSize: 22, fontWeight: 900 }}>購入者専用です</div>
+      <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 13 }}>ログイン中のGoogleメール：</p>
+      <div style={{ background: "#0e1b2c", border: "1px solid #284766", borderRadius: 10, padding: 12, fontWeight: 800, wordBreak: "break-all" }}>{email || "不明"}</div>
+      <p style={{ color: "#ffb4a8", lineHeight: 1.8, fontSize: 13 }}>{entitlement?.reason || authMsg || "購入者リストに登録されていません。"}</p>
+      <button onClick={onPurchase} style={buyBtn}>購入して利用開始</button>
+      <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 12 }}>
+        決済完了後、Stripe Webhook が <b>paid_users</b> にこのGoogleメールを自動追加します。購入は1人1回まで、利用期限は2026/12/31 23:59までです。古参クーポンはStripe決済画面で入力できます。
+      </p>
+      <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+        <button onClick={onRetry} style={{ ...btn, marginTop: 0, background: "#5dd39e" }}>再確認</button>
+        <button onClick={onLogout} style={{ ...btn, marginTop: 0, background: "#263b56", color: "#d9e8f7" }}>ログアウト</button>
+      </div>
+    </div></div>
+  );
+}
+
 function publicSupabaseHeaders(json = false) {
   const h = { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` };
   if (json) h["Content-Type"] = "application/json";
@@ -1178,6 +1347,83 @@ export default function App() {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   });
+
+
+  // ── Googleログイン＋購入者判定（paid_users） ──
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authSession, setAuthSession] = useState(null);
+  const [authUser, setAuthUser] = useState(null);
+  const [paidEntitlement, setPaidEntitlement] = useState(null);
+  const [authMsg, setAuthMsg] = useState("");
+
+  const logoutPaidUser = () => {
+    clearAuthSession();
+    setAuthSession(null);
+    setAuthUser(null);
+    setPaidEntitlement(null);
+    setAuthMsg("");
+  };
+
+  const startPurchase = async () => {
+    const email = String(authUser?.email || authUser?.user_metadata?.email || "").trim().toLowerCase();
+    try {
+      setAuthMsg("決済ページを作成中です…");
+      await createStripeCheckoutSession(email);
+    } catch (e) {
+      console.error(e);
+      setAuthMsg(e?.message || "決済ページを開けませんでした。");
+    }
+  };
+
+  const checkPaidLogin = async (baseSession = null) => {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      setAuthMsg("Supabase環境変数が未設定です。");
+      setAuthLoading(false);
+      return;
+    }
+    setAuthLoading(true);
+    let checkoutNotice = "";
+    try {
+      const sp = new URLSearchParams(window.location.search || "");
+      if (sp.get("checkout") === "success") checkoutNotice = "決済完了を確認中です。数秒後に再確認してください。";
+      if (sp.get("checkout") === "cancelled") checkoutNotice = "決済がキャンセルされました。";
+      if (sp.has("checkout")) window.history.replaceState(null, document.title, window.location.pathname + window.location.hash);
+    } catch (e) { /* noop */ }
+    setAuthMsg(checkoutNotice);
+    try {
+      let session = baseSession || sessionFromHash() || loadAuthSession();
+      if (sessionFromHash()) {
+        window.history.replaceState(null, document.title, window.location.pathname + window.location.search);
+      }
+      if (!session?.access_token) {
+        setAuthSession(null);
+        setAuthUser(null);
+        setPaidEntitlement(null);
+        return;
+      }
+      session = await refreshAuthSession(session);
+      saveAuthSession(session);
+      setAuthSession(session);
+      const user = await fetchAuthUser(session);
+      setAuthUser(user);
+      const email = String(user?.email || user?.user_metadata?.email || "").trim().toLowerCase();
+      const ent = await fetchPaidEntitlement(session, email);
+      setPaidEntitlement(ent);
+    } catch (e) {
+      console.error(e);
+      clearAuthSession();
+      setAuthSession(null);
+      setAuthUser(null);
+      setPaidEntitlement(null);
+      setAuthMsg(e?.message || "ログイン確認に失敗しました。");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    checkPaidLogin();
+  }, []);
   const [wind, setWind] = useState("無風");
   const [correctionTable, setCorrectionTable] = useState(null);
   const [correctionStatus, setCorrectionStatus] = useState("固定補正");
@@ -4351,6 +4597,19 @@ export default function App() {
   ].filter(Boolean);
   const systemReady = !!venue && !systemErrors.length && (stTable || racerStats || kimari || nigeSim || result);
 
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    return <AuthGateScreen mode="config" authMsg={authMsg} />;
+  }
+  if (authLoading) {
+    return <AuthGateScreen mode="loading" authMsg={authMsg} />;
+  }
+  if (!authUser) {
+    return <AuthGateScreen mode="login" authMsg={authMsg} onLogin={startGoogleLogin} />;
+  }
+  if (!paidEntitlement?.ok) {
+    return <AuthGateScreen mode="unpaid" user={authUser} entitlement={paidEntitlement} authMsg={authMsg} onLogout={logoutPaidUser} onRetry={() => checkPaidLogin(authSession)} onPurchase={startPurchase} />;
+  }
+
   return (
     <div style={{
       minHeight: "100vh", background: "#0e1b2c", color: "#e8eef5",
@@ -4372,6 +4631,20 @@ export default function App() {
           </p>
         </header>
 
+        <div style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10,
+          background: "#13243a", border: "1px solid #284766", borderRadius: 12,
+          padding: "9px 11px", marginBottom: 14, fontSize: 12, color: "#9db5cc",
+        }}>
+          <div>
+            <span style={{ color: "#5dd39e", fontWeight: 900 }}>✓ 購入者確認済み</span>
+            <span style={{ marginLeft: 8, wordBreak: "break-all" }}>{authUser?.email || authUser?.user_metadata?.email || ""}</span>
+          </div>
+          <button onClick={logoutPaidUser} style={{
+            border: "1px solid #2c4762", background: "#0e1b2c", color: "#d9e8f7",
+            borderRadius: 999, padding: "6px 10px", fontSize: 11, fontWeight: 800, cursor: "pointer",
+          }}>ログアウト</button>
+        </div>
 
         {/* 初期画面：開催場一覧 */}
         <section style={{ marginBottom: 16 }}>
