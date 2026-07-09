@@ -7,8 +7,9 @@ const PLACE_NO_BY_VENUE = {
   "下関": 19, "若松": 20, "芦屋": 21, "福岡": 22, "唐津": 23, "大村": 24,
 };
 
-const SUPABASE_URL = String(import.meta.env?.VITE_SUPABASE_URL || "").replace(/\/+$/, "");
-const SUPABASE_ANON_KEY = String(import.meta.env?.VITE_SUPABASE_ANON_KEY || "");
+const RUNTIME_ENV = typeof window !== "undefined" ? (window.__HUNAKEN_ENV__ || {}) : {};
+const SUPABASE_URL = String(import.meta.env?.VITE_SUPABASE_URL || RUNTIME_ENV.VITE_SUPABASE_URL || "").replace(/\/+$/, "");
+const SUPABASE_ANON_KEY = String(import.meta.env?.VITE_SUPABASE_ANON_KEY || RUNTIME_ENV.VITE_SUPABASE_ANON_KEY || "");
 const CORRECTION_TABLE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 
 
