@@ -40,11 +40,16 @@ grant select on public.exhibition to anon, authenticated;
 -- service_role/APIからのupsert用。service_roleはRLSをバイパスするが、権限も明示しておく。
 grant select, insert, update, delete on public.exhibition to service_role;
 
+-- 既に途中まで作成された古いシグネチャがある場合に備えて削除
+drop function if exists public.racer_exhibition_sensitivity(integer, timestamp without time zone, date);
+drop function if exists public.racer_exhibition_sensitivity(integer, timestamp with time zone, date);
+drop function if exists public.racer_exhibition_sensitivity_bulk(integer[], integer);
+
 -- 1選手の展示感応度を集計するRPC
 -- ex_diff/total_diff は「平均との差 = 平均 - 自艇値」。プラスほど展示・合算が良い。
 create or replace function public.racer_exhibition_sensitivity(
   p_regno integer,
-  p_from date default current_date - interval '180 days',
+  p_from date default (current_date - 180),
   p_to date default current_date
 )
 returns table (
@@ -151,7 +156,7 @@ as $$
   from unnest(p_regnos) as r(regno)
   cross join lateral public.racer_exhibition_sensitivity(
     r.regno,
-    current_date - make_interval(days => greatest(coalesce(p_days, 180), 1)),
+    (current_date - greatest(coalesce(p_days, 180), 1))::date,
     current_date
   ) as s;
 $$;

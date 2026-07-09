@@ -845,6 +845,17 @@ function autoRaceForVenue(venueName, now = new Date()) {
   return "12";
 }
 
+// ライブ中は基本的に公式締切の次Rを使う。
+// ただし、公式スケジュール取得失敗/古いキャッシュ/1R固定の事故が起きた時は、
+// 場ごとの概算時刻で「今より前のR」に戻らないように補正する。
+function chooseLiveRaceNo(venueName, resolvedRaceNo) {
+  const fallback = Number(autoRaceForVenue(venueName));
+  const official = Number(resolvedRaceNo || 0);
+  if (!official || official < 1 || official > 12) return String(fallback || 1);
+  if (fallback > official) return String(Math.min(fallback, 12));
+  return String(official);
+}
+
 function todayDateValue() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -1914,7 +1925,7 @@ export default function App() {
       return;
     }
 
-    const nextRace = resolved.raceNo || autoRaceForVenue(v);
+    const nextRace = chooseLiveRaceNo(v, resolved.raceNo);
     setRaceNo(nextRace);
     resetRaceAutoData();
     if (AUTO_FETCH_VENUES.includes(v)) {
@@ -1959,7 +1970,7 @@ export default function App() {
         setAutoMsg(`${venue}は本日の全レース発売終了です。復習用データは翌朝の朝一レース前まで表示できます。`);
         return;
       }
-      const nextRace = resolved.raceNo || autoRaceForVenue(venue);
+      const nextRace = chooseLiveRaceNo(venue, resolved.raceNo);
       if (raceNo !== nextRace) {
         setRaceNo(nextRace);
         resetRaceAutoData();
@@ -1967,6 +1978,7 @@ export default function App() {
       if (raceDate !== today) setRaceDate(today);
       fetchOfficialYoso({ venue, raceNo: nextRace, raceDate: today, background: true, force, ignoreSalesEnded: true, oddsOnly: hasCompleteAutoStaticData() });
     };
+    run(true);
     const id = window.setInterval(() => run(false), 180000);
     const onFocus = () => run(false);
     const onVisibility = () => { if (!document.hidden) run(false); };
@@ -4165,7 +4177,7 @@ export default function App() {
             ))}
           </select>
 
-          <div style={{ fontSize: 11, color: "#7da3c8", margin: "12px 0 6px" }}>レース</div>
+          <div style={{ fontSize: 11, color: "#7da3c8", margin: "12px 0 6px" }}>レース（開催中は次Rを自動選択／復習時だけ手動変更）</div>
           <select
             value={raceNo}
             onChange={(e) => {
@@ -4181,7 +4193,7 @@ export default function App() {
                 setReviewMode(false);
               }
             }}
-            disabled={venueNotHeld}
+            disabled={venueNotHeld || (!reviewMode && !salesEnded)}
             style={{
               width: "100%", padding: "11px 12px", fontSize: 16,
               background: "#16273c", color: "#fff",
