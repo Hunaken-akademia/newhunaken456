@@ -1,6 +1,6 @@
 {
   "name": "hunaken-academia-v109-kiryu-half-lap",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -18,5 +18,6 @@
   "devDependencies": {},
   "engines": {
     "node": "22.x"
-  }
+  },
+  "packageManager": "pnpm@9.15.9"
 }

@@ -2019,7 +2019,7 @@ export default function App() {
     const targetDate = override.raceDate || raceDate;
     if (!targetVenue) return;
     if (salesEnded && !override.ignoreSalesEnded && override.background) {
-      setAutoMsg(`${targetVenue}は本日の発売終了です。復習用データは手動で表示できます。`);
+      setAutoMsg(`${targetVenue}は本日の発売終了です。復習用データは当日中のみ手動で表示できます。`);
       return;
     }
     if (!AUTO_FETCH_VENUES.includes(targetVenue)) return;
@@ -2065,7 +2065,7 @@ export default function App() {
       return fetchOfficialOddsOnly(override);
     }
     if (salesEnded && !override.ignoreSalesEnded && override.background) {
-      setAutoMsg(`${targetVenue}は本日の発売終了です。復習用データは手動で表示できます。`);
+      setAutoMsg(`${targetVenue}は本日の発売終了です。復習用データは当日中のみ手動で表示できます。`);
       return;
     }
     if (!override.force && autoBusyRef.current) return;
@@ -2332,7 +2332,7 @@ export default function App() {
 
       if (normalized?.allClosed) {
         setReviewMode(true);
-        setAutoRefreshInfo(`${v}は本日の全レース発売終了です。翌朝の朝一レース前まで復習用に閲覧できます。`);
+        setAutoRefreshInfo(`${v}は本日の全レース発売終了です。当日中のみ復習用に閲覧できます。`);
         return { allClosed: true, raceNo: String(raceNo || "12"), data };
       }
 
@@ -2373,7 +2373,7 @@ export default function App() {
       setRaceNo(reviewRace);
       setReviewMode(true);
       resetRaceAutoData();
-      setAutoMsg(`${v}は本日の全レース発売終了です。復習用に${reviewRace}Rを表示します。`);
+      setAutoMsg(`${v}は本日の全レース発売終了です。当日中の復習用に${reviewRace}Rを表示します。`);
       if (AUTO_FETCH_VENUES.includes(v)) {
         window.setTimeout(() => fetchOfficialYoso({ venue: v, raceNo: reviewRace, raceDate: today, force: true, ignoreSalesEnded: true }), 80);
       }
@@ -2422,7 +2422,7 @@ export default function App() {
       if (resolved.allClosed) {
         setRaceDate(today);
         setReviewMode(true);
-        setAutoMsg(`${venue}は本日の全レース発売終了です。復習用データは翌朝の朝一レース前まで表示できます。`);
+        setAutoMsg(`${venue}は本日の全レース発売終了です。復習用データは当日中のみ表示できます。`);
         return;
       }
       const nextRace = chooseLiveRaceNo(venue, resolved.raceNo, resolved.deadline);
@@ -4651,7 +4651,7 @@ export default function App() {
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 }}>
             <div>
               <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8", marginBottom: 2 }}>開催場一覧</div>
-              <div style={{ fontSize: 12, color: "#9db5cc" }}>開催中の場は次Rを自動選択。発売終了後も翌朝の朝一レース前まで復習表示できます</div>
+              <div style={{ fontSize: 12, color: "#9db5cc" }}>開催中の場は次Rを自動選択。発売終了後は当日中のみ復習表示できます</div>
             </div>
             <button
               onClick={() => { const v = venue || "蒲郡"; selectVenueQuick(v); }}
@@ -4835,7 +4835,7 @@ export default function App() {
               background: "rgba(217,75,67,0.18)", color: "#ffb3ad",
               border: "1px solid rgba(217,75,67,0.35)", fontSize: 12, fontWeight: 800,
             }}>
-              {venue}は本日の全レース発売終了です。翌朝の朝一レース前まで復習用データを表示できます。
+              {venue}は本日の全レース発売終了です。当日中のみ復習用データを表示できます。
             </div>
           )}
           {venueNotHeld && venue && (
@@ -7096,8 +7096,8 @@ export default function App() {
             【ご利用にあたって】
           </div>
           本ツール「舟券アカデミア評価」の著作権は舟券アカデミアに帰属します。<br />
-          ・個人で利用する範囲でのカスタマイズ（改変）は自由です。<br />
-          ・本ツールおよびその改変版を、自身が考案したものとして公開・配布する行為を禁じます。<br />
+          ・本ツールのコード改変、複製、再配布、転売、貸与を禁止します。<br />
+          ・本ツールの内容・画面・ロジックを無断で公開、配布、販売する行為を禁じます。<br />
           ・舟券アカデミアに無断での商用利用（販売・有料配布・収益目的での再公開など）を固く禁じます。<br />
           ・本ツールは的中を保証するものではありません。舟券の購入は自己責任でお願いします。<br />
           <div style={{ marginTop: 6, textAlign: "right", color: "#4a5d70" }}>
