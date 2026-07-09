@@ -36,6 +36,6 @@ jobs:
       - name: Build correction tables
         working-directory: pipeline
         run: |
-          DAYS="${{ github.event.inputs.days || '365' }}"
+          DAYS="${{ github.event.inputs.days || '180' }}"
           WIND_K="${{ github.event.inputs.wind_k || '20' }}"
           node build_corrections.mjs "$DAYS" "$WIND_K"
