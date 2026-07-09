@@ -1541,10 +1541,10 @@ export default function App() {
         if (tokens[idx + 3] != null && tokens[idx + 3] >= 5.5 && tokens[idx + 3] <= 7.8) {
           tenji = tokens[idx + 3];
         }
+        // 近くにある 1.0 / 1.5 は調整体重の可能性が高いため、
+        // フォールバック解析ではチルトを推測しない。
+        // チルトは「チルト」行またはAPIの明示列からだけ反映する。
         let tilt = null;
-        for (let j = idx - 1; j >= Math.max(0, idx - 4); j--) {
-          if (tiltSet.includes(tokens[j])) { tilt = tokens[j]; break; }
-        }
         newInputs[b] = {
           tenji: tenji != null ? String(tenji) : "",
           isshu: String(isshu),
@@ -1673,8 +1673,10 @@ export default function App() {
       const b = Number(r.boat);
       if (!b || b < 1 || b > 6) return;
       nextWeights[b] = r.weight || "";
-      const tiltNum = Number(String(r.tilt ?? "").replace(/[＋]/g, "+").replace(/[－−ー]/g, "-"));
-      nextTilts[b] = Number.isFinite(tiltNum) && tiltNum >= -0.5 && tiltNum <= 3.0 ? tiltNum.toFixed(1) : "";
+      const rawTilt = String(r.tilt ?? "").trim().replace(/[＋]/g, "+").replace(/[－−ー]/g, "-");
+      const tiltNum = Number(rawTilt);
+      // API側で調整体重との分離済み。念のため、空/不正値は反映しない。
+      nextTilts[b] = rawTilt !== "" && Number.isFinite(tiltNum) && tiltNum >= -0.5 && tiltNum <= 3.0 ? tiltNum.toFixed(1) : "";
       if (r.course && Number(r.course) >= 1 && Number(r.course) <= 6) nextCourses[b] = Number(r.course);
     });
     setWeights(nextWeights);

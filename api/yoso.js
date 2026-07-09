@@ -747,15 +747,18 @@ function pickDisplayValues(nums) {
     // 基本: 体重, チルト, 展示, 一周, まわり足 [, 直線]
     // BOATCASTの一部場では「まわり足」が11秒台になるため、15秒まで許容する。
     if (inRange(cleaned[i], 40, 70) && inRange(cleaned[i + 1], -1, 3.5) && inRange(cleaned[i + 2], 5.5, 7.8) && inRange(cleaned[i + 3], 30, 45) && inRange(cleaned[i + 4], 4, 15)) {
-      return { weight: cleaned[i], tilt: cleaned[i + 1], tenji: cleaned[i + 2], isshu: cleaned[i + 3], mawari: cleaned[i + 4], chokusen: inRange(cleaned[i + 5], 4, 15) ? cleaned[i + 5] : "" };
+      const t = Number(cleaned[i + 1]);
+      return { weight: cleaned[i], tilt: (t <= 0.5 ? Number(t).toFixed(1) : ""), tenji: cleaned[i + 2], isshu: cleaned[i + 3], mawari: cleaned[i + 4], chokusen: inRange(cleaned[i + 5], 4, 15) ? cleaned[i + 5] : "" };
     }
     // 調整が体重とチルトの間にある場合: 体重, 調整, チルト, 展示, 一周, まわり足 [, 直線]
     if (inRange(cleaned[i], 40, 70) && inRange(cleaned[i + 1], 0, 5) && inRange(cleaned[i + 2], -1, 3.5) && inRange(cleaned[i + 3], 5.5, 7.8) && inRange(cleaned[i + 4], 30, 45) && inRange(cleaned[i + 5], 4, 15)) {
-      return { weight: cleaned[i], tilt: cleaned[i + 2], tenji: cleaned[i + 3], isshu: cleaned[i + 4], mawari: cleaned[i + 5], chokusen: inRange(cleaned[i + 6], 4, 15) ? cleaned[i + 6] : "" };
+      const t = Number(cleaned[i + 2]);
+      return { weight: cleaned[i], adjust_weight: cleaned[i + 1], tilt: (t <= 0.5 ? Number(t).toFixed(1) : ""), tenji: cleaned[i + 3], isshu: cleaned[i + 4], mawari: cleaned[i + 5], chokusen: inRange(cleaned[i + 6], 4, 15) ? cleaned[i + 6] : "" };
     }
     // 調整が展示と一周の間にある場合: 体重, チルト, 展示, 調整, 一周, まわり足 [, 直線]
     if (inRange(cleaned[i], 40, 70) && inRange(cleaned[i + 1], -1, 3.5) && inRange(cleaned[i + 2], 5.5, 7.8) && inRange(cleaned[i + 3], 0, 5) && inRange(cleaned[i + 4], 30, 45) && inRange(cleaned[i + 5], 4, 15)) {
-      return { weight: cleaned[i], tilt: cleaned[i + 1], tenji: cleaned[i + 2], isshu: cleaned[i + 4], mawari: cleaned[i + 5], chokusen: inRange(cleaned[i + 6], 4, 15) ? cleaned[i + 6] : "" };
+      const t = Number(cleaned[i + 1]);
+      return { weight: cleaned[i], tilt: (t <= 0.5 ? Number(t).toFixed(1) : ""), tenji: cleaned[i + 2], adjust_weight: cleaned[i + 3], isshu: cleaned[i + 4], mawari: cleaned[i + 5], chokusen: inRange(cleaned[i + 6], 4, 15) ? cleaned[i + 6] : "" };
     }
   }
   return null;
@@ -1093,6 +1096,39 @@ function parseNumericTokens(line) {
   return (String(line || "").match(/-?\d+(?:\.\d+)?/g) || []).map((x) => String(x));
 }
 
+function nextMissingBoat(rows) {
+  const used = new Set((rows || []).map((r) => Number(r.boat)).filter((b) => b >= 1 && b <= 6));
+  for (let b = 1; b <= 6; b++) {
+    if (!used.has(b)) return b;
+  }
+  return 7;
+}
+
+function startsWithStandaloneBoatNo(line, cells = null) {
+  const s = String(line || "").trim();
+  const c = cells || (s.includes("\t") ? s.split("\t").map((x) => String(x || "").trim()) : s.split(/[ 　]+/).map((x) => String(x || "").trim()).filter(Boolean));
+  return /^[1-6]$/.test(String(c[0] || "").trim()) || /^[1-6](?:\t|[ 　])/.test(s);
+}
+
+function findSignedTiltToken(tokens) {
+  for (const x of tokens || []) {
+    const raw = String(x ?? "").trim();
+    if (/^[+＋\-－−ー]\s*\d+(?:\.\d+)?$/.test(raw)) {
+      const v = normalizeBoatcastTiltToken(raw);
+      if (v) return v;
+    }
+  }
+  return "";
+}
+
+function findSafeUnsignedTiltToken(tokens) {
+  for (const x of tokens || []) {
+    const v = normalizeBoatcastTiltToken(x);
+    if (["-0.5", "0.0", "0.5"].includes(v)) return v;
+  }
+  return "";
+}
+
 function findFirstInRange(tokens, a, b) {
   for (const x of tokens || []) {
     if (inRange(x, a, b)) return normNum(x);
@@ -1278,7 +1314,7 @@ function parseBoatcastTkzRows(raw) {
     let boat = Number(c[0]);
     if (!(boat >= 1 && boat <= 6)) {
       // BOATCASTの一部txtは艇番を列で持たないため、行順で1〜6号艇として扱う。
-      boat = rows.length + 1;
+      boat = nextMissingBoat(rows);
     }
     if (!(boat >= 1 && boat <= 6) || rows.some((r) => r.boat === boat)) continue;
 
@@ -1348,7 +1384,8 @@ function parseBoatcastOritenRows(raw) {
       // 登録番号・年齢・級別の数字は pickSequentialBoatcastTimes 側の範囲判定で無視される。
       const picked = pickSequentialBoatcastTimes(nums, { hasHalfLap });
       if (picked) ({ isshu, mawari, chokusen } = picked);
-      boat = firstNum >= 1 && firstNum <= 6 ? firstNum : rows.length + 1;
+      // A1/A2の「1」「2」を艇番と誤認しない。艇番列が無い形式は行順で割り当てる。
+      boat = nextMissingBoat(rows);
       name = c.find((x) => /[一-龠ぁ-んァ-ヶ]/.test(x) && !/一周|まわり|直線|展示|半周/.test(x)) || "";
     }
 
@@ -1397,7 +1434,23 @@ function combineBoatcastDisplayRows(tkzRaw, oritenRaw, sttRaw) {
       byBoat.set(b, { ...byBoat.get(b), ...Object.fromEntries(Object.entries(row).filter(([, v]) => v !== "" && v != null)) });
     }
   }
-  const rows = [...byBoat.values()].sort((a, b) => a.boat - b.boat);
+  let rows = [...byBoat.values()].sort((a, b) => a.boat - b.boat);
+
+  // 艇番列が無いtxtではA1/A2などの級別数字で艇番がズレることがある。
+  // その場合は、tkz/oriten/sttの行順を1〜6号艇として再結合する。
+  if (!validRows(rows) && tkzRows.length >= 6 && oritenRows.length >= 6) {
+    rows = Array.from({ length: 6 }, (_, i) => {
+      const boat = i + 1;
+      const tk = tkzRows[i] || {};
+      const ori = oritenRows[i] || {};
+      const st = sttRows.find((r) => Number(r.boat) === boat) || sttRows[i] || {};
+      return {
+        boat,
+        course: Number(st.course) >= 1 && Number(st.course) <= 6 ? Number(st.course) : boat,
+        ...Object.fromEntries(Object.entries({ ...tk, ...ori }).filter(([k, v]) => k !== "boat" && k !== "course" && v !== "" && v != null)),
+      };
+    });
+  }
   return rows;
 }
 
@@ -1492,12 +1545,16 @@ function parseBoatcastDisplay(raw) {
     return null;
   };
 
-  // 1行に1艇分が入っている形式
+  // 1行に1艇分が入っている形式。
+  // A1/A2の級別数字を艇番と誤認しないよう、先頭セルが単独の1〜6の時だけ艇番扱い。
   for (const line of lines) {
     const nums = parseNumericTokens(line);
     if (nums.length < 4) continue;
-    const first = Number(nums[0]);
-    if (first >= 1 && first <= 6) setRow(first, pickFromNumbers(nums.slice(1)));
+    const cells = line.includes("\t") ? line.split("\t").map((x) => String(x || "").trim()) : line.split(/[ 　]+/).map((x) => String(x || "").trim()).filter(Boolean);
+    if (startsWithStandaloneBoatNo(line, cells)) {
+      const first = Number(cells[0]);
+      setRow(first, pickFromNumbers(nums.slice(1)));
+    }
   }
 
   // 行をまたいでいる形式。艇番の後ろ一定範囲から拾う。
@@ -1517,7 +1574,10 @@ function parseBoatcastDisplay(raw) {
       const nums = parseNumericTokens(line);
       if (nums.length < 3) continue;
       const picked = pickFromNumbers(nums);
-      if (picked && !rowsByBoat.has(nextBoat)) setRow(nextBoat++, picked);
+      if (picked) {
+        const b = nextMissingBoat([...rowsByBoat.values()]);
+        if (b <= 6) setRow(b, picked);
+      }
     }
   }
 
