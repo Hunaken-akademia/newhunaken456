@@ -1,6 +1,5 @@
-import Stripe from "stripe";
-
-const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+// Vercel Functions用：外部npm依存なしでStripe Checkout Sessionを作成
+// npm install がVercelで落ちる問題を避けるため、Stripe SDKではなくStripe REST APIを直接使用します。
 
 // 販売期間・利用期限はJST基準で固定
 // 販売開始: 2026/7/13 00:00 JST = 2026-07-12T15:00:00.000Z
@@ -79,13 +78,50 @@ async function getExistingEntitlement(email) {
   return Array.isArray(rows) ? rows[0] : null;
 }
 
+function appendCheckoutParams(params, obj, prefix = "") {
+  for (const [key, value] of Object.entries(obj)) {
+    if (value === undefined || value === null) continue;
+    const name = prefix ? `${prefix}[${key}]` : key;
+    if (Array.isArray(value)) {
+      value.forEach((item, idx) => appendCheckoutParams(params, item, `${name}[${idx}]`));
+    } else if (typeof value === "object") {
+      appendCheckoutParams(params, value, name);
+    } else {
+      params.append(name, String(value));
+    }
+  }
+}
+
+async function createStripeCheckoutSession(payload) {
+  const secret = process.env.STRIPE_SECRET_KEY;
+  if (!secret) throw new Error("STRIPE_SECRET_KEY が未設定です。");
+
+  const params = new URLSearchParams();
+  appendCheckoutParams(params, payload);
+
+  const stripeRes = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${secret}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params.toString(),
+  });
+
+  const data = await stripeRes.json().catch(() => null);
+  if (!stripeRes.ok) {
+    const message = data?.error?.message || `Stripe error ${stripeRes.status}`;
+    throw new Error(message);
+  }
+  return data;
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
     return res.status(405).json({ error: "Method Not Allowed" });
   }
   try {
-    if (!stripe) throw new Error("STRIPE_SECRET_KEY が未設定です。");
     const priceId = process.env.STRIPE_PRICE_ID_HUNAKEN_2026 || process.env.STRIPE_PRICE_ID;
     if (!priceId) throw new Error("STRIPE_PRICE_ID_HUNAKEN_2026 が未設定です。");
 
@@ -93,6 +129,7 @@ export default async function handler(req, res) {
 
     const body = readJsonBody(req);
     const email = String(body.email || "").trim().toLowerCase();
+    const sessionId = String(body.session_id || body.sessionId || "").trim();
     if (!email || !email.includes("@")) throw new Error("購入者メールを確認できませんでした。Googleログイン後に購入してください。");
 
     const existing = await getExistingEntitlement(email);
@@ -105,16 +142,18 @@ export default async function handler(req, res) {
     const origin = getOrigin(req);
     if (!origin) throw new Error("APP_URL またはリクエストURLを確認できませんでした。");
 
-    const session = await stripe.checkout.sessions.create({
+    const session = await createStripeCheckoutSession({
       mode: "payment",
       customer_email: email,
       client_reference_id: email,
-      line_items: [{ price: priceId, quantity: 1 }],
+      "line_items": [{ price: priceId, quantity: 1 }],
       allow_promotion_codes: true,
       success_url: `${origin}/?checkout=success`,
       cancel_url: `${origin}/?checkout=cancelled`,
       metadata: {
         email,
+        session_id: sessionId,
+        plan: "2026",
         product: "hunaken_paid_auto",
         sale_start_jst: DISPLAY_SALE_START,
         sale_end_jst: DISPLAY_SALE_END,

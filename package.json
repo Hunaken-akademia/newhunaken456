@@ -1,23 +1,14 @@
 {
-  "name": "hunaken-academia-v109-kiryu-half-lap",
-  "version": "1.3.5",
+  "name": "hunaken-academia-paid-auto",
+  "version": "1.3.8-noinstall",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "build": "echo prebuilt-dist"
   },
-  "dependencies": {
-    "@vitejs/plugin-react": "4.3.1",
-    "vite": "5.4.10",
-    "react": "18.3.1",
-    "react-dom": "18.3.1",
-    "stripe": "^17.5.0"
-  },
+  "dependencies": {},
   "devDependencies": {},
   "engines": {
     "node": "24.x"
-  },
-  "packageManager": "npm@11.5.1"
+  }
 }

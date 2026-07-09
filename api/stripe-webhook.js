@@ -1,12 +1,12 @@
-import Stripe from "stripe";
+// Vercel Functions用：外部npm依存なしでStripe Webhookを検証
+// npm install がVercelで落ちる問題を避けるため、Stripe SDKではなくHMACで署名検証します。
+import crypto from "node:crypto";
 
 export const config = {
   api: {
     bodyParser: false,
   },
 };
-
-const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 // 販売期間・利用期限はJST基準で固定
 // 販売開始: 2026/7/13 00:00 JST = 2026-07-12T15:00:00.000Z
@@ -23,6 +23,35 @@ async function rawBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   return Buffer.concat(chunks);
+}
+
+function timingSafeEqual(a, b) {
+  const ba = Buffer.from(a || "", "utf8");
+  const bb = Buffer.from(b || "", "utf8");
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+function verifyStripeSignature(payloadBuffer, signatureHeader, secret) {
+  if (!signatureHeader) throw new Error("stripe-signature header がありません。");
+  if (!secret) throw new Error("STRIPE_WEBHOOK_SECRET が未設定です。");
+
+  const parts = Object.fromEntries(
+    String(signatureHeader).split(",").map((p) => {
+      const i = p.indexOf("=");
+      return i >= 0 ? [p.slice(0, i), p.slice(i + 1)] : [p, ""];
+    })
+  );
+  const timestamp = parts.t;
+  const signature = parts.v1;
+  if (!timestamp || !signature) throw new Error("Stripe署名ヘッダーの形式が不正です。");
+
+  const signedPayload = `${timestamp}.${payloadBuffer.toString("utf8")}`;
+  const expected = crypto.createHmac("sha256", secret).update(signedPayload, "utf8").digest("hex");
+  if (!timingSafeEqual(expected, signature)) throw new Error("Stripe署名検証に失敗しました。");
+
+  const ageSec = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (Number.isFinite(ageSec) && ageSec > 300) throw new Error("Stripe署名のタイムスタンプが古すぎます。");
 }
 
 function supabaseHeaders(json = false) {
@@ -119,12 +148,10 @@ export default async function handler(req, res) {
   }
 
   try {
-    if (!stripe) throw new Error("STRIPE_SECRET_KEY が未設定です。");
-    if (!process.env.STRIPE_WEBHOOK_SECRET) throw new Error("STRIPE_WEBHOOK_SECRET が未設定です。");
-
     const sig = req.headers["stripe-signature"];
     const body = await rawBody(req);
-    const event = stripe.webhooks.constructEvent(body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    verifyStripeSignature(body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    const event = JSON.parse(body.toString("utf8"));
 
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;

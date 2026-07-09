@@ -1,5 +1,5 @@
 {
-  "installCommand": "npm install --legacy-peer-deps --no-audit --no-fund",
-  "buildCommand": "npm run build",
+  "installCommand": "echo skip-install",
+  "buildCommand": "echo prebuilt-dist",
   "outputDirectory": "dist"
 }
