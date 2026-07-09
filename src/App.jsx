@@ -28,6 +28,34 @@ function todayIso() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function normalizeRaceGrade(v) {
+  const s = String(v || "").trim().toUpperCase();
+  if (!s) return "";
+  if (s === "PG1") return "PG1";
+  if (["SG", "G1", "G2", "G3"].includes(s)) return s;
+  if (s.includes("SG")) return "SG";
+  if (s.includes("PG1")) return "PG1";
+  if (s.includes("G1")) return "G1";
+  if (s.includes("G2")) return "G2";
+  if (s.includes("G3")) return "G3";
+  if (s.includes("一般")) return "一般";
+  return s;
+}
+
+function raceRowMatchesCategory(r, p) {
+  const grade = normalizeRaceGrade(r?.grade);
+  if (p.grade && grade !== p.grade) return false;
+  if (p.gradeSet && !p.gradeSet.includes(grade)) return false;
+  if (p.ladies && r?.is_ladies !== true) return false;
+  if (p.raceTypeIncludes && !String(r?.race_type || "").includes(p.raceTypeIncludes)) return false;
+  if (p.night && r?.is_nighter !== true && !String(r?.race_title || "").includes("ナイター")) return false;
+  if (p.fhold && r?.f_hold !== true) return false;
+  return true;
+}
+
+const CORE_CATEGORY_PERIOD_LABELS = ["直近6ヶ月", "直近1年", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG", "G1", "G2", "G3", "女子戦"];
+const ST_PERIOD_LABELS = [...CORE_CATEGORY_PERIOD_LABELS, "初日", "最終日", "ナイター", "F持"];
+
 function round1(v) {
   return Math.round(Number(v || 0) * 10) / 10;
 }
@@ -51,6 +79,12 @@ function buildRacerCourseStatsFromDb(rawRows, profiles, courses, venueName) {
     { label: "直近3ヶ月", days: 90 },
     { label: "直近1ヶ月", days: 30 },
     { label: "当地", days: 365, local: true },
+    { label: "一般戦", days: 365, grade: "一般" },
+    { label: "SG", days: 365, grade: "SG" },
+    { label: "G1", days: 365, gradeSet: ["PG1", "G1"] },
+    { label: "G2", days: 365, grade: "G2" },
+    { label: "G3", days: 365, grade: "G3" },
+    { label: "女子戦", days: 365, ladies: true },
   ];
 
   for (const c of cats) {
@@ -73,6 +107,7 @@ function buildRacerCourseStatsFromDb(rawRows, profiles, courses, venueName) {
           && Number(r.course) === course
           && rd >= from
           && (!c.local || !placeNo || Number(r.place_no) === placeNo)
+          && raceRowMatchesCategory(r, c)
           && r.rank != null;
       });
       stats.n[c.label][b - 1] = filtered.length;
@@ -95,7 +130,10 @@ function buildDbAverageStTableFromRows(rawRows, profiles, venueName, courses) {
     { label: "当地", days: 365, local: true },
     // 以下は大会区分データが貯まるまで自動では空になり得る。
     { label: "一般戦", days: 365, grade: "一般" },
-    { label: "SG/G1", days: 365, gradeSet: ["SG", "PG1", "G1"] },
+    { label: "SG", days: 365, grade: "SG" },
+    { label: "G1", days: 365, gradeSet: ["PG1", "G1"] },
+    { label: "G2", days: 365, grade: "G2" },
+    { label: "G3", days: 365, grade: "G3" },
     { label: "女子戦", days: 365, ladies: true },
     { label: "初日", days: 365, raceTypeIncludes: "初日" },
     { label: "最終日", days: 365, raceTypeIncludes: "最終日" },
@@ -123,11 +161,7 @@ function buildDbAverageStTableFromRows(rawRows, profiles, venueName, courses) {
         const st = Number(r.st);
         if (Number(r.regno) !== regno || !Number.isFinite(st) || st < 0 || st > 0.6 || rd < from) return false;
         if (p.local && placeNo && Number(r.place_no) !== placeNo) return false;
-        if (p.grade && String(r.grade || "") !== p.grade) return false;
-        if (p.gradeSet && !p.gradeSet.includes(String(r.grade || ""))) return false;
-        if (p.ladies && r.is_ladies !== true) return false;
-        if (p.raceTypeIncludes && !String(r.race_type || "").includes(p.raceTypeIncludes)) return false;
-        if (p.fhold && r.f_hold !== true) return false;
+        if (!raceRowMatchesCategory(r, p)) return false;
         return true;
       });
 
@@ -165,9 +199,12 @@ function buildDbAverageStTableFromRows(rawRows, profiles, venueName, courses) {
 }
 
 function buildKimariFromDbRows(rows) {
-  const mk = (days) => {
+  const mk = (days, opt = {}) => {
     const from = daysAgoIso(days);
-    const target = (rows || []).filter((r) => String(r.race_date || "").slice(0, 10) >= from && Number(r.rank) === 1);
+    const target = (rows || []).filter((r) => {
+      if (String(r.race_date || "").slice(0, 10) < from || Number(r.rank) !== 1) return false;
+      return raceRowMatchesCategory(r, opt);
+    });
     if (!target.length) return null;
     const total = target.length;
     const pct = (n) => round1((n / total) * 100);
@@ -197,7 +234,18 @@ function buildKimariFromDbRows(rows) {
       source: "DB",
     };
   };
-  return { "直近6ヶ月": mk(180), "直近1年": mk(365), "直近3ヶ月": mk(90), "直近1ヶ月": mk(30) };
+  return {
+    "直近6ヶ月": mk(180),
+    "直近1年": mk(365),
+    "直近3ヶ月": mk(90),
+    "直近1ヶ月": mk(30),
+    "一般戦": mk(365, { grade: "一般" }),
+    "SG": mk(365, { grade: "SG" }),
+    "G1": mk(365, { gradeSet: ["PG1", "G1"] }),
+    "G2": mk(365, { grade: "G2" }),
+    "G3": mk(365, { grade: "G3" }),
+    "女子戦": mk(365, { ladies: true }),
+  };
 }
 
 async function fetchRestPages(table, baseQs, maxRows = 50000) {
@@ -218,6 +266,35 @@ async function fetchRestPages(table, baseQs, maxRows = 50000) {
   return all;
 }
 
+async function fetchRaceMetaRows(days = 365, placeNo = null) {
+  if (!CORRECTION_TABLE_ENABLED) return [];
+  const qs = new URLSearchParams();
+  qs.set("select", "race_date,place_no,race_no,grade,is_ladies,race_title,race_type");
+  qs.set("race_date", `gte.${daysAgoIso(days)}`);
+  if (placeNo) qs.set("place_no", `eq.${Number(placeNo)}`);
+  qs.set("order", "race_date.desc");
+  try {
+    return await fetchRestPages("races", qs, 50000);
+  } catch (e) {
+    console.warn("race metadata load skipped", e);
+    return [];
+  }
+}
+
+function attachRaceMeta(resultRows, metaRows) {
+  if (!Array.isArray(resultRows) || !resultRows.length || !Array.isArray(metaRows) || !metaRows.length) return resultRows || [];
+  const meta = new Map();
+  for (const r of metaRows) {
+    const key = `${String(r.race_date || "").slice(0,10)}|${Number(r.place_no)}|${Number(r.race_no)}`;
+    meta.set(key, r);
+  }
+  return resultRows.map((r) => {
+    const key = `${String(r.race_date || "").slice(0,10)}|${Number(r.place_no)}|${Number(r.race_no)}`;
+    const m = meta.get(key);
+    return m ? { ...r, grade: m.grade || "", is_ladies: m.is_ladies === true, race_title: m.race_title || "", race_type: m.race_type || "" } : r;
+  });
+}
+
 async function fetchRaceResultsForRacers(regnos, days = 365) {
   if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
   const nums = [...new Set((regnos || []).map((v) => Number(v)).filter(Boolean))];
@@ -227,7 +304,9 @@ async function fetchRaceResultsForRacers(regnos, days = 365) {
   qs.set("regno", `in.(${nums.join(",")})`);
   qs.set("race_date", `gte.${daysAgoIso(days)}`);
   qs.set("order", "race_date.desc");
-  return await fetchRestPages("race_results", qs, 50000);
+  const rows = await fetchRestPages("race_results", qs, 50000);
+  const metas = await fetchRaceMetaRows(days, null);
+  return attachRaceMeta(rows, metas);
 }
 
 
@@ -239,7 +318,9 @@ async function fetchRaceResultsForVenue(placeNo, days = 365) {
   qs.set("place_no", `eq.${Number(placeNo)}`);
   qs.set("race_date", `gte.${daysAgoIso(days)}`);
   qs.set("order", "race_date.desc");
-  return await fetchRestPages("race_results", qs, 50000);
+  const rows = await fetchRestPages("race_results", qs, 50000);
+  const metas = await fetchRaceMetaRows(days, placeNo);
+  return attachRaceMeta(rows, metas);
 }
 
 function buildEscapeSimulationFromDb(rows, currentCourses = {}, currentRows = null, racerStats = null, racerCat = "直近6ヶ月", sts = {}, fHold = {}, fSts = {}, wind = "無風") {
@@ -1382,7 +1463,7 @@ export default function App() {
   };
 
   // 決まり手・逃げシミュレーション（枠別情報）
-  const KIMARI_PERIODS = ["直近6ヶ月", "直近1年", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "女子戦"];
+  const KIMARI_PERIODS = CORE_CATEGORY_PERIOD_LABELS;
   const [kimari, setKimari] = useState(null);       // {期間:{nige,nigashi,sasare,sashi[5],makurare,makuri[5],makuraresashi,makurizashi[5]}}
   const [kimariPeriod, setKimariPeriod] = useState("直近6ヶ月");
   const [nigeSim, setNigeSim] = useState(null);     // {win1,nigeRate,second[5],third[5],deme[5]}
@@ -1390,7 +1471,7 @@ export default function App() {
   const [nigeStatus, setNigeStatus] = useState("逃げシミュ：未取得");
 
   // 選手成績 {win:{区分:[6]}, ren2:{区分:[6]}, ren3:{区分:[6]}}
-  const RACER_CATS = ["直近6ヶ月", "直近1年", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "女子戦"];
+  const RACER_CATS = CORE_CATEGORY_PERIOD_LABELS;
   const [racerStats, setRacerStats] = useState(null);
   const [racerCat, setRacerCat] = useState("直近6ヶ月");
   // 期間比較（買い目の被りを見る）
@@ -1399,10 +1480,10 @@ export default function App() {
   const [cmpMode, setCmpMode] = useState("all"); // "all"=全部反映 / "overlap"=被りのみ反映
 
   // ── 平均ST表（基本情報ページ）の期間選択 ──
-  const ST_PERIODS = ["直近6ヶ月", "直近1年", "直近3ヶ月", "直近1ヶ月", "当地", "一般戦", "SG/G1", "女子戦", "初日", "最終日", "ナイター", "F持"];
+  const ST_PERIODS = ST_PERIOD_LABELS;
   const [stTable, setStTable] = useState(null);
   const [stMeta, setStMeta] = useState(null);
-  const [stPeriod, setStPeriod] = useState("直近6ヶ月");
+  const [stPeriod, setStPeriod] = useState("直近3ヶ月");
 
   const applyStTable = (table, period) => {
     const row = table[period];
@@ -2255,7 +2336,10 @@ export default function App() {
           "直近1ヶ月": recentRow(1),
           "当地": row(["当地"]),
           "一般戦": row(["一般戦"]),
-          "SG/G1": row(["SG"]),
+          "SG": row(["SG"]),
+          "G1": row(["G1"]),
+          "G2": row(["G2"]),
+          "G3": row(["G3"]),
           "女子戦": row(["女子戦"]),
         };
       };
