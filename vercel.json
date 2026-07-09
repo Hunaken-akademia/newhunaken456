@@ -1,5 +1,5 @@
 {
-  "installCommand": "curl -fsSL https://bun.sh/install | bash && ~/.bun/bin/bun install",
-  "buildCommand": "~/.bun/bin/bun run build",
+  "installCommand": "npm install --no-audit --no-fund",
+  "buildCommand": "npm run build",
   "outputDirectory": "dist"
 }
