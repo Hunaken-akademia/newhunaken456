@@ -9,8 +9,8 @@ const CACHE_MS = STATIC_CACHE_MS;
 
 // Vercelの同一実行環境内で共有するキャッシュ。
 // 同じ場・日付・RはTTL内ならBOATCASTへ再アクセスせず、取得中は他ユーザーへ古いキャッシュを返す。
-const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V112__ || new Map();
-globalThis.__HUNAKEN_YOSO_CACHE_V112__ = cacheStore;
+const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V113__ || new Map();
+globalThis.__HUNAKEN_YOSO_CACHE_V113__ = cacheStore;
 const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V112__ || new Map();
 globalThis.__HUNAKEN_YOSO_INFLIGHT_V112__ = inFlightStore;
 
@@ -208,7 +208,7 @@ async function fetchBoatcastPreRaceStatusPayload(venue, raceNo, ymd) {
   return {
     ok: true,
     action: "prerace",
-    appVersion: "v112",
+    appVersion: "v113",
     venue,
     race: Number(raceNo),
     date: ymd,
@@ -610,8 +610,8 @@ function directionFromImgToken(html) {
   })();
   const m = around.match(/(?:wind|kaze|weather|direction|dir)[-_]?(?:no|num|icon|arrow|image)?[-_]?0?([1-8])\b/i)
     || around.match(/0?([1-8])[-_](?:wind|kaze|weather|direction|dir|arrow)/i)
-    || around.match(/is-wind([1-8])\b/i)
-    || around.match(/weather1_([1-8])\b/i);
+    || around.match(/(?:is[-_ ]?wind|wind|kaze|weather1|weather)[-_ ]?0?([1-8])\b/i)
+    || around.match(/(?:class|src|data-[^=]+)=['"][^'"]*(?:wind|kaze|weather)[^'"]*?0?([1-8])[^'"]*['"]/i);
   if (m) {
     const n = Number(m[1]);
     // 8方向画像を4分類に丸める。ずれがある場合は windRaw に番号が出るので後で調整可能。
@@ -1679,6 +1679,15 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
   const weatherPrev = weatherPrevRes.status === "fulfilled" ? weatherPrevRes.value : "";
   const weatherCurrent = weatherCurrentRes.status === "fulfilled" ? weatherCurrentRes.value : "";
 
+  // 公式beforeinfoは展示公開前から最新の水面気象を持っていることが多い。
+  // 風は点数に直結するため、BOATCASTの前レース結果txtよりこちらを優先する。
+  const officialBeforeInfoUrl = buildOfficialBeforeInfoUrl(venue, raceNo, dateStr);
+  let officialBeforeInfoHtml = "";
+  if (officialBeforeInfoUrl) {
+    try { officialBeforeInfoHtml = await fetchHtml(officialBeforeInfoUrl); }
+    catch (e) { officialBeforeInfoHtml = ""; }
+  }
+
   const racers = parseBoatcastRacerInfo(str3);
   const racersByBoat = {};
   for (const r of racers) racersByBoat[r.boat] = r;
@@ -1741,10 +1750,10 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
   // 公式beforeinfoにも展示・一周・まわり足・直線が出る場面があるため、全場共通の最終フォールバックにする。
   // 大村10RのようにBOATCAST画面では出ているのにtxt結合だけ失敗するケースを救済する。
   if (!rows) {
-    const officialUrl = buildOfficialBeforeInfoUrl(venue, raceNo, dateStr);
-    if (officialUrl) {
+    const officialUrl = officialBeforeInfoUrl;
+    if (officialUrl && officialBeforeInfoHtml) {
       try {
-        const officialHtml = await fetchHtml(officialUrl);
+        const officialHtml = officialBeforeInfoHtml;
         const officialRows = parseDisplayRowsByLines(officialHtml, venue);
         if (validRows(officialRows)) {
           const sttRows = parseBoatcastSttRows(stt);
@@ -1767,9 +1776,14 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
     exhibitionSaved = await saveExhibitionRows({ venue, raceNo, ymd: dateStr, rows, source: "BOATCAST" });
   }
 
-  let weather = parseBoatcastResultWeather(weatherPrev);
+  // 風は「現在選択しているレースの公式beforeinfo」を最優先。
+  // 以前は前レースのBOATCAST結果txtを先に見ていたため、展示公開前の次Rで古い風/無風が残ることがあった。
+  // 優先順: 公式beforeinfo(現在R) → BOATCAST現在R → 直前情報txt → 前R結果txt(最終フォールバック)。
+  const officialWeather = officialBeforeInfoHtml ? parseWeather(officialBeforeInfoHtml) : {};
+  let weather = (officialWeather.windKey || officialWeather.windSpeed || officialWeather.windDirection) ? officialWeather : {};
   if (!weather.windKey) weather = parseBoatcastResultWeather(weatherCurrent);
-  if (!weather.windKey) weather = parseWeather(stt || tkz || str3);
+  if (!weather.windKey) weather = parseWeather(tkz || stt || str3);
+  if (!weather.windKey) weather = parseBoatcastResultWeather(weatherPrev);
   if (!weather.windDirection && tkz) weather = mergeWeatherPreferReliable(weather, parseWeather(tkz));
 
   let oddsInfo = null;
@@ -1795,7 +1809,7 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
     racers,
     motors: racersToMotorMap(racers),
     weather,
-    weatherUrl: weather.windKey ? (weatherPrev ? urls.weatherPrev : urls.weatherCurrent) : null,
+    weatherUrl: weather.windKey ? (officialBeforeInfoUrl || urls.weatherCurrent || urls.weatherPrev) : null,
     odds: oddsInfo?.ok ? oddsInfo.odds : null,
     oddsCount: oddsInfo?.ok ? oddsInfo.count : 0,
     oddsUrl: oddsInfo?.ok ? oddsInfo.url : null,
@@ -2390,7 +2404,7 @@ async function fetchSchedulePayload(venue, ymd) {
     return {
       ok: true,
       action: "schedule",
-      appVersion: "v112",
+      appVersion: "v113",
       venue,
       date: ymd,
       url,
@@ -2505,7 +2519,7 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
       });
       return {
         ok: true,
-        appVersion: "v112",
+        appVersion: "v113",
         venue,
         race: raceNo,
         date: ymd,
@@ -2639,7 +2653,7 @@ export default async function handler(req, res) {
       res.status(200).json({
         ok: true,
         action: "schedules",
-        appVersion: "v112",
+        appVersion: "v113",
         date: ymd,
         statusesByVenue,
         fetchedAt: new Date().toISOString(),
@@ -2675,7 +2689,7 @@ export default async function handler(req, res) {
         res.status(400).json({ ok: false, error: "venue を指定してください" });
         return;
       }
-      const oddsKey = `odds:v112:${venue}:${raceNo}:${ymd}`;
+      const oddsKey = `odds:v113:${venue}:${raceNo}:${ymd}`;
       pruneCache();
       const payload = await withSharedCache(oddsKey, ODDS_CACHE_MS, async () => {
         const oddsInfo = await fetchOddsForVenue(venue, raceNo, ymd);
@@ -2683,7 +2697,7 @@ export default async function handler(req, res) {
         return {
           ok: true,
           action: "odds",
-          appVersion: "v112",
+          appVersion: "v113",
           venue,
           race: raceNo,
           date: ymd,
@@ -2698,7 +2712,7 @@ export default async function handler(req, res) {
     }
 
     res.setHeader("Cache-Control", "public, s-maxage=180, stale-while-revalidate=600");
-    const key = `full:v112:${venue}:${raceNo}:${ymd}`;
+    const key = `full:v113:${venue}:${raceNo}:${ymd}`;
     pruneCache();
     const payload = await withSharedCache(key, STATIC_CACHE_MS, async () => buildFullYosoPayload(venue, raceNo, ymd), { allowStale: false });
     res.status(200).json(payload);

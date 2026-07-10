@@ -160,7 +160,7 @@ function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, o
       <div style={card}><div style={box}>
         <div style={{ fontSize: 11, letterSpacing: ".18em", color: "#7da3c8", marginBottom: 6 }}>購入者専用</div>
         <div style={{ fontSize: 24, fontWeight: 900 }}>舟券アカデミア 有料自動取得版</div>
-        <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 13 }}>Googleログイン後、購入済みのメールだけツールを表示します。販売期間は2026/7/13〜2026/8/13、利用期限は2026/12/31 23:59までです。</p>
+        <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 13 }}>Googleログイン後、購入済みのメールだけツールを表示します。販売期間は2026/7/10〜2026/8/13、利用期限は2026/12/31 23:59までです。</p>
         <button onClick={onLogin} style={btn}>Googleでログイン</button>
         {authMsg ? <p style={{ color: "#ffb4a8", fontSize: 12, lineHeight: 1.7 }}>{authMsg}</p> : null}
         <p style={{ color: "#5f7f9f", fontSize: 11, lineHeight: 1.7, marginTop: 16 }}>本ツールは予想補助であり、的中や利益を保証するものではありません。</p>
@@ -3856,9 +3856,21 @@ export default function App() {
         return { ...c, score: c.rate * kehai };
       }).sort((a, b) => b.score - a.score);
 
-      // 上位2〜3シナリオ（rateが一定以上のもの優先、最低2つ）
+      // 本命頭候補の艇は必ずシナリオ候補に含める。
+      // 例：4号艇が本命なら、4号艇のまくり/差し/まくり差しで一番現実味のある展開を表示する。
       const picked = weighted.filter((c) => c.rate >= 10).slice(0, 3);
-      const top = picked.length >= 2 ? picked : weighted.slice(0, 2);
+      const headPicked = heads
+        .map((h) => weighted.filter((c) => c.boat === h).sort((a, b) => b.score - a.score)[0])
+        .filter(Boolean);
+      const seenScenario = new Set();
+      const top = [...headPicked, ...picked, ...weighted.slice(0, 3)]
+        .filter((c) => {
+          const key = `${c.type}-${c.boat}`;
+          if (seenScenario.has(key)) return false;
+          seenScenario.add(key);
+          return true;
+        })
+        .slice(0, 3);
 
       scenarios = top.map((c) => {
         const head = c.boat;
@@ -4631,9 +4643,9 @@ export default function App() {
             場別コース率 × タイム補正
           </h1>
           <p style={{ fontSize: 12, color: "#9db5cc", margin: "6px 0 0", lineHeight: 1.6 }}>
-            場ごとの基本場平均1着率を基準に、展示タイム＋1周（桐生は半周ラップ）＋まわり足の
-            差（平均−合計）を内部計算に使います。風はAI評価内の風項目で1回だけ反映します。
-            進入・風向きが変わる場合は各艇のコースや風プルダウンを変更してください。
+            場ごとの季節別場平均1着率を優先し、展示タイム＋1周（桐生は半周ラップ）＋まわり足の
+            差（平均−合計）を内部計算に使います。季節別データが不足する場合は通年平均へ自動で切り替えます。
+            風はAI評価内の風項目で1回だけ反映します。進入・風向きが変わる場合は各艇のコースや風プルダウンを変更してください。
           </p>
         </header>
 
@@ -4854,35 +4866,47 @@ export default function App() {
             </div>
           )}
 
-          {venue && (
-            <div style={{
-              fontSize: 12, fontWeight: 700, color: "#e8eef5",
-              marginTop: 12, marginBottom: 6,
-              paddingLeft: 8, borderLeft: "3px solid #3d7ab8",
-            }}>
-              基本場平均1着率
-              {venue && (() => {
-                const info = getVenueBaseWithCorrections(venue, raceDate, correctionCache);
-                const { season, seasonal, dynamic } = info;
-                return null;
-              })()}
-            </div>
-          )}
-
-          {venue && (
-            <div style={{
-              display: "flex", gap: 4, fontSize: 11,
-              color: "#9db5cc", flexWrap: "wrap",
-            }}>
-              {getVenueBaseWithCorrections(venue, raceDate, correctionCache).base.map((r, i) => (
-                <span key={i} style={{
-                  background: "#16273c", borderRadius: 6, padding: "4px 8px",
+          {venue && (() => {
+            const info = getVenueBaseWithCorrections(venue, raceDate, correctionCache);
+            const season = info?.season || seasonOf(raceDate);
+            const period = SEASON_PERIOD[season] || "";
+            const source = String(info?.sourceLabel || "");
+            const sourceText = source.includes("季節別")
+              ? `季節別場平均1着率（${season}：${period}）`
+              : "通年場平均1着率";
+            const desc = source.includes("季節別")
+              ? `過去データの${season}（${period}）の傾向を優先して表示しています。季節別データが不足する場・コースは通年平均に自動で切り替えます。`
+              : "季節別データが不足しているため、通年の場平均1着率を表示しています。";
+            return (
+              <>
+                <div style={{
+                  fontSize: 12, fontWeight: 700, color: "#e8eef5",
+                  marginTop: 12, marginBottom: 6,
+                  paddingLeft: 8, borderLeft: "3px solid #3d7ab8",
                 }}>
-                  {i + 1}C <b style={{ color: "#fff" }}>{r}%</b>
-                </span>
-              ))}
-            </div>
-          )}
+                  {sourceText}
+                </div>
+                <div style={{
+                  fontSize: 11, color: "#9db5cc", lineHeight: 1.55,
+                  margin: "-2px 0 7px", paddingLeft: 11,
+                }}>
+                  {desc}
+                </div>
+                <div style={{
+                  display: "flex", gap: 4, fontSize: 11,
+                  color: "#9db5cc", flexWrap: "wrap",
+                }}>
+                  {info.base.map((r, i) => (
+                    <span key={i} style={{
+                      background: "#16273c", borderRadius: 6, padding: "4px 8px",
+                    }}>
+                      {i + 1}C <b style={{ color: "#fff" }}>{r}%</b>
+                    </span>
+                  ))}
+                </div>
+              </>
+            );
+          })()}
 
           {/* 風の選択 */}
           <div style={{ fontSize: 11, color: "#7da3c8", marginTop: 16, marginBottom: 6 }}>
@@ -4902,7 +4926,6 @@ export default function App() {
             ))}
           </select>
 
-          {/* 風による増減値は内部計算のみ。画面には直接表示しない。 */}
         </div>
 
         {/* コピペ欄は廃止。自動取得・DB成績・共有キャッシュで反映する。 */}
@@ -4916,7 +4939,7 @@ export default function App() {
             fontSize: 12, fontWeight: 700,
             border: "1px solid #1c7047",
           }}>
-            ✓ 取得済
+            ✓ データ取得済
           </div>
           <button
             onClick={allClear}
@@ -4937,7 +4960,7 @@ export default function App() {
             border: systemErrors.length ? "1px solid #5e2d3a" : "1px solid #1c7047",
             fontSize: 12, fontWeight: 700,
           }}>
-            {systemErrors.length ? systemErrors.join(" ／ ") : `✓ ${venue || ""}${raceNo || ""}R 取得済`}
+            {systemErrors.length ? systemErrors.join(" ／ ") : `✓ ${venue || ""}${raceNo || ""}R データ取得済`}
           </div>
         )}
 
@@ -4964,7 +4987,7 @@ export default function App() {
             ))}
           </select>
           {stTable ? (
-            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 取得済</span>
+            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ データ取得済</span>
           ) : systemErrors.length ? null : (
             <span style={{ fontSize: 11, color: "#7da3c8" }}>取得待ち</span>
           )}
@@ -4990,7 +5013,7 @@ export default function App() {
             ))}
           </select>
           {racerStats ? (
-            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 取得済</span>
+            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ データ取得済</span>
           ) : systemErrors.length ? (
             <span style={{ fontSize: 11, color: "#ff8a80" }}>{systemErrors.find((x) => String(x).includes("選手成績")) || "取得エラー"}</span>
           ) : (
@@ -5018,12 +5041,12 @@ export default function App() {
             ))}
           </select>
           {kimari ? (
-            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 取得済</span>
+            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ データ取得済</span>
           ) : systemErrors.length ? null : (
             <span style={{ fontSize: 11, color: "#7da3c8" }}>取得待ち</span>
           )}
           {nigeSim ? (
-            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ 取得済</span>
+            <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ データ取得済</span>
           ) : systemErrors.length ? (
             <span style={{ fontSize: 11, color: "#ff8a80" }}>{systemErrors.find((x) => String(x).includes("逃げ")) || "取得エラー"}</span>
           ) : (
@@ -5099,12 +5122,9 @@ export default function App() {
                   background: noOriginalDisplay ? "#233044" : hasHiddenTiming ? "#143125" : "#2a2230",
                   color: noOriginalDisplay ? "#9db5cc" : hasHiddenTiming ? "#5dd39e" : "#d3a9cf",
                   border: noOriginalDisplay ? "1px solid #344b68" : hasHiddenTiming ? "1px solid #245740" : "1px solid #5b4257",
-                  fontSize: 12, fontWeight: 700,
+                  fontSize: 12, fontWeight: 700, whiteSpace: "nowrap",
                 }}>
-                  {noOriginalDisplay ? "なし" : hasHiddenTiming ? "✓ 取得済" : "未取得"}
-                </div>
-                <div style={{ fontSize: 10, color: "#5e7a92", marginTop: 4, lineHeight: 1.4 }}>
-                  {noOriginalDisplay ? "江戸川はオリジナル展示なし。内部補正にも使いません" : "展示・1周・回り足・直線は内部計算のみに使用"}
+                  {noOriginalDisplay ? "なし" : hasHiddenTiming ? "✓ 取得済" : "展示公開待ちです。"}
                 </div>
               </div>
 
@@ -5144,7 +5164,7 @@ export default function App() {
 
                 <div style={{ minWidth: 112 }}>
                   <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 2 }}>
-                    平均ST{stMeta?.[b - 1]?.source === "course" ? `（${stMeta[b - 1].course}C）` : stMeta?.[b - 1]?.source === "all" ? "（全C）" : ""}
+                    平均ST
                   </div>
                   <select
                     value={sts[b]}
@@ -5160,13 +5180,7 @@ export default function App() {
                       <option key={s} value={s}>{s}</option>
                     ))}
                   </select>
-                  {stMeta?.[b - 1] && stMeta[b - 1].source !== "none" && (
-                    <div style={{ fontSize: 9, color: "#7da3c8", marginTop: 3, lineHeight: 1.35 }}>
-                      {stMeta[b - 1].source === "course"
-                        ? `${stMeta[b - 1].course}C平均 n=${stMeta[b - 1].nCourse}`
-                        : `全C平均 n=${stMeta[b - 1].nAll}（${stMeta[b - 1].course}C n=${stMeta[b - 1].nCourse}不足）`}
-                    </div>
-                  )}
+                  {/* 平均STの母数表示は非表示。内部計算には反映。 */}
                 </div>
 
                 <button
@@ -5262,7 +5276,7 @@ export default function App() {
                   <span style={{
                     background: "#0e1b2c", borderRadius: 5, padding: "3px 7px",
                     fontWeight: 800, color: "#7da3c8",
-                  }}>枠別DB（{racerCat}・{courses[b]}コース{racerStats.n?.[racerCat]?.[b - 1] ? ` n=${racerStats.n[racerCat][b - 1]}` : ""}）</span>
+                  }}>枠別成績（{racerCat}・{courses[b]}コース）</span>
                   {racerStats.win1?.[racerCat]?.[b - 1] != null && (
                     <span>1着 <b style={{ color: "#fff" }}>{racerStats.win1[racerCat][b - 1]}%</b></span>
                   )}
@@ -5677,7 +5691,7 @@ export default function App() {
                   ))}
                 </div>
                 <div style={{ fontSize: 9, color: "#5e7a92", marginTop: 6, lineHeight: 1.5 }}>
-                  ※ DB逃げシミュレーションとは別物の、当日気配ベースの試走です。参考指標としてご利用ください。
+                  ※ 当日気配ベースの試走です。参考指標としてご利用ください。
                 </div>
               </div>
             )}
@@ -5686,7 +5700,7 @@ export default function App() {
             {nigeSim && (
               <div style={{ marginBottom: 20 }}>
                 <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8", marginBottom: 8 }}>
-                  逃げシミュレーション（DB強化版・進入変更対応）
+                  逃げシミュレーション（進入変更対応）
                 </div>
                 {(() => {
                   const byBoat = Object.fromEntries(result.rows.map((r) => [r.boat, r]));

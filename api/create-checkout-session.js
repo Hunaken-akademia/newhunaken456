@@ -2,13 +2,13 @@
 // npm install がVercelで落ちる問題を避けるため、Stripe SDKではなくStripe REST APIを直接使用します。
 
 // 販売期間・利用期限はJST基準で固定
-// 販売開始: 2026/7/13 00:00 JST = 2026-07-12T15:00:00.000Z
+// 販売開始: 2026/7/10 00:00 JST = 2026-07-09T15:00:00.000Z
 // 販売終了: 2026/8/13 23:59 JST = 2026-08-13T14:59:59.999Z
 // 利用期限: 2026/12/31 23:59 JST = 2026-12-31T14:59:00.000Z
-const SALE_START_MS = Date.parse("2026-07-12T15:00:00.000Z");
+const SALE_START_MS = Date.parse("2026-07-09T15:00:00.000Z");
 const SALE_END_MS = Date.parse("2026-08-13T14:59:59.999Z");
 const FIXED_EXPIRES_AT = "2026-12-31T14:59:00.000Z";
-const DISPLAY_SALE_START = "2026/7/13 00:00";
+const DISPLAY_SALE_START = "2026/7/10 00:00";
 const DISPLAY_SALE_END = "2026/8/13 23:59";
 const DISPLAY_EXPIRES = "2026/12/31 23:59";
 
