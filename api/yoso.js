@@ -9,10 +9,10 @@ const CACHE_MS = STATIC_CACHE_MS;
 
 // Vercelの同一実行環境内で共有するキャッシュ。
 // 同じ場・日付・RはTTL内ならBOATCASTへ再アクセスせず、取得中は他ユーザーへ古いキャッシュを返す。
-const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V114__ || new Map();
-globalThis.__HUNAKEN_YOSO_CACHE_V114__ = cacheStore;
-const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V114__ || new Map();
-globalThis.__HUNAKEN_YOSO_INFLIGHT_V114__ = inFlightStore;
+const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V115__ || new Map();
+globalThis.__HUNAKEN_YOSO_CACHE_V115__ = cacheStore;
+const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V115__ || new Map();
+globalThis.__HUNAKEN_YOSO_INFLIGHT_V115__ = inFlightStore;
 
 const SUPABASE_REST_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -208,7 +208,7 @@ async function fetchBoatcastPreRaceStatusPayload(venue, raceNo, ymd) {
   return {
     ok: true,
     action: "prerace",
-    appVersion: "v113",
+    appVersion: "v115",
     venue,
     race: Number(raceNo),
     date: ymd,
@@ -592,52 +592,76 @@ function directionFromText(raw) {
   return "";
 }
 
-// 公式beforeinfoの風向き画像番号は、場によって「スタート方向」と画面上の矢印の対応が逆になることがある。
-// 文字で「向かい風/追い風」が取れる場合はそれを最優先し、画像番号しか取れない場合だけこの場別補正表を使う。
-// 根本対策: 全場共通の矢印判定で決め打ちせず、場別に補正できる構造にする。
+// 見えている本文に複数の風向き語が混在する場合は、説明文・凡例・隠し要素の可能性がある。
+// その場合は「文字判定」として採用せず、実際の風アイコンへフォールバックする。
+function uniqueDirectionFromVisibleText(raw) {
+  const t = pickText(raw);
+  const found = new Set();
+  if (/左\s*横\s*風/.test(t)) found.add("左横風");
+  if (/右\s*横\s*風/.test(t)) found.add("右横風");
+  if (/向\s*(?:かい)?\s*風|向い風/.test(t)) found.add("向かい風");
+  if (/追\s*い?\s*風/.test(t)) found.add("追い風");
+  return found.size === 1 ? [...found][0] : "";
+}
+
+// BOAT RACE公式 beforeinfo の is-windN は、現在の水面気象欄に表示される実アイコン。
+// 以前の実装は generic な "weather1" まで方向番号1として拾ってしまい、
+// 実際の is-windN と無関係に追い風/向かい風が固定・反転することがあった。
+// 根本対策として、方向番号は明示的な風アイコン属性・ファイル名からだけ取得する。
 const DEFAULT_WIND_IMAGE_DIRECTION_MAP = {
   1: "追い風", 2: "右横風", 3: "右横風", 4: "向かい風",
   5: "向かい風", 6: "左横風", 7: "左横風", 8: "追い風",
 };
 
-const WIND_IMAGE_DIRECTION_MAP_BY_VENUE = {
-  // 鳴門は公式画面の矢印番号を全場共通で読むと、追い風/向かい風が逆になるケースがあるため反転。
-  // 横風は左右も入れ替わる可能性があるため、同じく左右を反転しておく。
-  "鳴門": {
-    1: "向かい風", 2: "左横風", 3: "左横風", 4: "追い風",
-    5: "追い風", 6: "右横風", 7: "右横風", 8: "向かい風",
-  },
-};
+function windImageDirectionFromNumber(n) {
+  return DEFAULT_WIND_IMAGE_DIRECTION_MAP[Number(n)] || "";
+}
 
-function windImageDirectionFromNumber(n, venue) {
-  const map = WIND_IMAGE_DIRECTION_MAP_BY_VENUE[String(venue || "")] || DEFAULT_WIND_IMAGE_DIRECTION_MAP;
-  return map[Number(n)] || "";
+function stripNonWeatherMarkup(raw) {
+  return String(raw || "")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<template[\s\S]*?<\/template>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
+}
+
+function exactWindIconNumber(raw) {
+  const html = stripNonWeatherMarkup(raw);
+  const patterns = [
+    // 公式の代表例: class="... is-wind3 ..."
+    /\bis[-_]?wind(?:--|-|_)?0?([1-8])\b/i,
+    // data-wind="3" / data-wind-direction="3"
+    /\bdata-(?:wind|wind-direction|wind-dir|wind-icon|wind-arrow)=["']0?([1-8])["']/i,
+    // wind-direction-3 / wind_icon_3 など、方向用途が明示されたトークン
+    /\bwind(?:-direction|-dir|-icon|-arrow|_direction|_dir|_icon|_arrow)[-_]?0?([1-8])\b/i,
+    // 画像ファイル名: /wind3.png, /kaze_3.svg
+    /\/(?:wind|kaze)[-_]?0?([1-8])\.(?:png|svg|gif|webp)(?:[?"']|$)/i,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m) return Number(m[1]);
+  }
+  return null;
 }
 
 function directionFromImgToken(html, venue = "") {
-  const raw = String(html || "");
+  const raw = stripNonWeatherMarkup(html);
   const low = raw.toLowerCase();
 
-  const direct = directionFromText(raw);
+  // 文字は、現在の水面気象ブロック内で1種類だけ確認できた時のみ信頼する。
+  const direct = uniqueDirectionFromVisibleText(raw);
   if (direct) return { direction: direct, raw: direct, confidence: "text" };
+
+  // 明示的な属性名は番号より優先。
   if (/left[-_\s]?cross|cross[-_\s]?left|hidari|leftside|wind[_-]?l/.test(low)) return { direction: "左横風", raw: "left-cross", confidence: "attr" };
   if (/right[-_\s]?cross|cross[-_\s]?right|migi|rightside|wind[_-]?r/.test(low)) return { direction: "右横風", raw: "right-cross", confidence: "attr" };
   if (/head[-_\s]?wind|mukai|against|wind[_-]?u/.test(low)) return { direction: "向かい風", raw: "headwind", confidence: "attr" };
   if (/tail[-_\s]?wind|oi[-_\s]?kaze|oikaze|following|wind[_-]?d/.test(low)) return { direction: "追い風", raw: "tailwind", confidence: "attr" };
 
-  const around = (() => {
-    const i = raw.search(/風速|weather1|水面気象|is-wind|wind|kaze/i);
-    if (i < 0) return raw;
-    return raw.slice(Math.max(0, i - 3500), i + 6500);
-  })();
-  const m = around.match(/(?:wind|kaze|weather|direction|dir)[-_]?(?:no|num|icon|arrow|image)?[-_]?0?([1-8])\b/i)
-    || around.match(/0?([1-8])[-_](?:wind|kaze|weather|direction|dir|arrow)/i)
-    || around.match(/(?:is[-_ ]?wind|wind|kaze|weather1|weather)[-_ ]?0?([1-8])\b/i)
-    || around.match(/(?:class|src|data-[^=]+)=['"][^'"]*(?:wind|kaze|weather)[^'"]*?0?([1-8])[^'"]*['"]/i);
-  if (m) {
-    const n = Number(m[1]);
-    // 8方向画像を4分類に丸める。場によって追い/向かいが逆になるため、場別補正を通す。
-    return { direction: windImageDirectionFromNumber(n, venue), raw: `wind-${n}@${venue || "default"}`, confidence: "number" };
+  const n = exactWindIconNumber(raw);
+  if (n != null) {
+    return { direction: windImageDirectionFromNumber(n), raw: `is-wind-${n}@${venue || "default"}`, confidence: "number" };
   }
   return { direction: "", raw: "", confidence: "none" };
 }
@@ -1797,12 +1821,36 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
   // 風は「現在選択しているレースの公式beforeinfo」を最優先。
   // 以前は前レースのBOATCAST結果txtを先に見ていたため、展示公開前の次Rで古い風/無風が残ることがあった。
   // 優先順: 公式beforeinfo(現在R) → BOATCAST現在R → 直前情報txt → 前R結果txt(最終フォールバック)。
-  const officialWeather = officialBeforeInfoHtml ? parseWeather(officialBeforeInfoHtml, venue) : {};
-  let weather = (officialWeather.windKey || officialWeather.windSpeed || officialWeather.windDirection) ? officialWeather : {};
-  if (!weather.windKey) weather = parseBoatcastResultWeather(weatherCurrent);
-  if (!weather.windKey) weather = parseWeather(tkz || stt || str3, venue);
-  if (!weather.windKey) weather = parseBoatcastResultWeather(weatherPrev);
-  if (!weather.windDirection && tkz) weather = mergeWeatherPreferReliable(weather, parseWeather(tkz, venue));
+  const officialWeather = officialBeforeInfoHtml ? { ...parseWeather(officialBeforeInfoHtml, venue), windSource: "official-beforeinfo" } : {};
+  const currentResultWeather = weatherCurrent ? { ...parseBoatcastResultWeather(weatherCurrent), windSource: "boatcast-current-result" } : {};
+  const currentTextWeather = (tkz || stt || str3) ? { ...parseWeather(tkz || stt || str3, venue), windSource: "boatcast-current-info" } : {};
+
+  // 現在Rの候補を信頼度順で統合する。
+  // 明示文字(text) > 明示属性(attr) > 正確な is-windN(number)。
+  // 公式beforeinfoを先に採っただけで、より信頼できるBOATCAST文字情報を無視しない。
+  let weather = {};
+  for (const candidate of [officialWeather, currentResultWeather, currentTextWeather]) {
+    if (!candidate || (!candidate.windDirection && candidate.windSpeed === "" && !candidate.windKey)) continue;
+    if (!weather.windDirection && weather.windSpeed === undefined) {
+      weather = { ...candidate };
+    } else {
+      const before = { ...weather };
+      weather = mergeWeatherPreferReliable(weather, candidate);
+      const beforeRank = weatherConfidenceRank(before.windConfidence);
+      const candidateRank = weatherConfidenceRank(candidate.windConfidence);
+      if (candidate.windSource && (candidateRank > beforeRank || (!before.windDirection && candidate.windDirection))) {
+        weather.windSource = candidate.windSource;
+      }
+      if (!weather.windSource) weather.windSource = before.windSource || candidate.windSource || "";
+    }
+  }
+
+  // 前R結果は現在Rの風がまったく取れない場合だけ使用。現在Rの方向を上書きしない。
+  if (!weather.windDirection && (weather.windSpeed === "" || weather.windSpeed == null)) {
+    const prev = parseBoatcastResultWeather(weatherPrev);
+    if (prev.windDirection || prev.windKey) weather = { ...prev, windSource: "boatcast-previous-result-fallback" };
+  }
+  weather.windKey = windKeyFromDirectionAndSpeed(weather.windDirection, weather.windSpeed);
 
   let oddsInfo = null;
   try { oddsInfo = await fetchBoatcastOddsForVenue(venue, raceNo, dateStr); }
@@ -2232,17 +2280,28 @@ function normalizeRaceMetaText(s) {
 
 function inferGradeFromText(text) {
   const t = normalizeRaceMetaText(text);
-  if (/(SG|S G|グランプリ|賞金王|ボートレースクラシック|笹川賞|オールスター|グランドチャンピオン|グラチャン|オーシャンカップ|メモリアル|ダービー|チャレンジカップ)/i.test(t)) return "SG";
-  if (/(PG1|P G1|プレミアムG1|BBCトーナメント|ヤングダービー|クイーンズクライマックス|レディースチャンピオン|マスターズチャンピオン)/i.test(t)) return "PG1";
-  if (/(G1|G 1|周年|地区選手権|高松宮記念|ダイヤモンドカップ|企業杯)/i.test(t)) return "G1";
-  if (/(G2|G 2|モーターボート大賞|秩父宮妃記念杯)/i.test(t)) return "G2";
-  if (/(G3|G 3|オールレディース|企業杯|マスターズリーグ)/i.test(t)) return "G3";
+
+  // 固有大会名を一般的な語（オールスター/ダービー等）より先に判定する。
+  // 例: レディースオールスターをSG、ヤングダービーをSGと誤判定しない。
+  if (/(レディースオールスター|女子オールスター)/i.test(t)) return "G2";
+  if (/(PG1|P G1|プレミアムG1|BBCトーナメント|バトルチャンピオントーナメント|ヤングダービー|クイーンズクライマックス|レディースチャンピオン|女子王座(?:決定戦)?|賞金女王(?:決定戦)?|スピードクイーンメモリアル|マスターズチャンピオン)/i.test(t)) return "PG1";
+  if (/(G3|G 3|オールレディース|企業杯|マスターズリーグ|イースタンヤング|ウエスタンヤング)/i.test(t)) return "G3";
+  if (/(G2|G 2|モーターボート大賞|秩父宮妃記念杯|全国ボートレース甲子園)/i.test(t)) return "G2";
+  if (/(SG|S G|グランプリ|賞金王|ボートレースクラシック|総理大臣杯|ボートレースオールスター|笹川賞|グランドチャンピオン|グラチャン|オーシャンカップ|ボートレースメモリアル|モーターボート記念|ボートレースダービー|全日本選手権|チャレンジカップ)/i.test(t)) return "SG";
+  if (/(G1|G 1|周年|地区選手権|高松宮記念|ダイヤモンドカップ)/i.test(t)) return "G1";
   return "一般";
 }
 
 function inferLadiesFromText(text) {
   const t = normalizeRaceMetaText(text);
-  return /(女子|レディース|ヴィーナス|クイーンズ|オールレディース|レディースチャンピオン|女子レーサー)/.test(t);
+
+  // 男女混合企画は大会名だけで全レースを女子戦扱いしない。
+  // そのレースの6艇が全員女子選手の時だけ、後段の allFemale 判定で女子戦にする。
+  if (/(レディース\s*(?:VS|対)\s*ルーキーズ|男女W優勝戦|男女ダブル優勝戦|男女混合)/i.test(t)) return null;
+
+  if (/(オールレディース|レディースチャンピオン|レディースオールスター|クイーンズクライマックス|ヴィーナス(?:シリーズ)?|女子リーグ|女子王座(?:決定戦)?|賞金女王(?:決定戦)?|スピードクイーンメモリアル|女子レーサー)/i.test(t)) return true;
+  if (/(女子|レディース|クイーンズ)/i.test(t)) return true;
+  return false;
 }
 
 function inferRaceTypeFromText(text) {
@@ -2422,7 +2481,7 @@ async function fetchSchedulePayload(venue, ymd) {
     return {
       ok: true,
       action: "schedule",
-      appVersion: "v113",
+      appVersion: "v115",
       venue,
       date: ymd,
       url,
@@ -2537,7 +2596,7 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
       });
       return {
         ok: true,
-        appVersion: "v113",
+        appVersion: "v115",
         venue,
         race: raceNo,
         date: ymd,
@@ -2671,7 +2730,7 @@ export default async function handler(req, res) {
       res.status(200).json({
         ok: true,
         action: "schedules",
-        appVersion: "v113",
+        appVersion: "v115",
         date: ymd,
         statusesByVenue,
         fetchedAt: new Date().toISOString(),
@@ -2707,7 +2766,7 @@ export default async function handler(req, res) {
         res.status(400).json({ ok: false, error: "venue を指定してください" });
         return;
       }
-      const oddsKey = `odds:v113:${venue}:${raceNo}:${ymd}`;
+      const oddsKey = `odds:v115:${venue}:${raceNo}:${ymd}`;
       pruneCache();
       const payload = await withSharedCache(oddsKey, ODDS_CACHE_MS, async () => {
         const oddsInfo = await fetchOddsForVenue(venue, raceNo, ymd);
@@ -2715,7 +2774,7 @@ export default async function handler(req, res) {
         return {
           ok: true,
           action: "odds",
-          appVersion: "v113",
+          appVersion: "v115",
           venue,
           race: raceNo,
           date: ymd,
@@ -2730,7 +2789,7 @@ export default async function handler(req, res) {
     }
 
     res.setHeader("Cache-Control", "public, s-maxage=180, stale-while-revalidate=600");
-    const key = `full:v113:${venue}:${raceNo}:${ymd}`;
+    const key = `full:v115:${venue}:${raceNo}:${ymd}`;
     pruneCache();
     const payload = await withSharedCache(key, STATIC_CACHE_MS, async () => buildFullYosoPayload(venue, raceNo, ymd), { allowStale: false });
     res.status(200).json(payload);
