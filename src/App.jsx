@@ -1430,7 +1430,17 @@ export default function App() {
   useEffect(() => {
     checkPaidLogin();
   }, []);
-  const [wind, setWind] = useState("無風");
+  const [wind, setWind] = useState(() => {
+    try {
+      const saved = localStorage.getItem("hunaken_manual_wind_v1");
+      return saved && WIND[saved] ? saved : "無風";
+    } catch {
+      return "無風";
+    }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("hunaken_manual_wind_v1", wind); } catch { /* noop */ }
+  }, [wind]);
   const [correctionTable, setCorrectionTable] = useState(null);
   const [correctionStatus, setCorrectionStatus] = useState("固定補正");
   const [courses, setCourses] = useState({ 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6 });
@@ -2098,20 +2108,10 @@ export default function App() {
       if (data.venue && String(data.venue) !== String(targetVenue)) throw new Error("別場のキャッシュ応答を検出しました");
       if (data.race && String(data.race) !== String(targetRaceNo)) throw new Error("別レースのキャッシュ応答を検出しました");
 
-      // 選手/モーター/F持ち/平均ST/風/オッズは、展示公開前でも反映できるものは先に反映する。
-      const meta = applyBoatcastMeta(data);
-      const w = data.weather || {};
-      const windKey = w.windKey && WIND[w.windKey] ? w.windKey : "";
-      if (windKey) setWind(windKey);
-      const windNote = windKey
-        ? `／風も自動入力：${windKey}`
-        : w.windSpeed
-          ? `／風速${w.windSpeed}m取得（風向きは手動確認）`
-          : "";
+      // 選手/モーター/F持ち/平均ST/オッズは、展示公開前でも反映できるものは先に反映する。
+      // 風は完全手動。APIが気象情報を返しても、画面の選択値は一切上書きしない。
+      applyBoatcastMeta(data);
       const cacheNote = apiCacheNote(data, "BOATCAST共有キャッシュ");
-      const metaNote = meta.racerCount || meta.motorCount || meta.fCount
-        ? `／選手${meta.racerCount}名・モーター${meta.motorCount}艇・F持ち${meta.fCount}艇も自動反映`
-        : "";
       let oddsNote = "";
       if (data.odds && Object.keys(data.odds).length >= 10) {
         setOdds(data.odds);
@@ -2199,18 +2199,13 @@ export default function App() {
 
     applyBoatcastRows(rows, { displayDisabled: !!data?.displayDisabled || !usesDisplayCorrection(targetVenue) });
 
-    const meta = applyBoatcastMeta(data);
+    applyBoatcastMeta(data);
 
-    const w = data.weather || {};
-    const windKey = w.windKey && WIND[w.windKey] ? w.windKey : "";
-    if (windKey) setWind(windKey);
+    // 風は完全手動。事前取得データからも自動反映しない。
     if (data.odds && Object.keys(data.odds).length >= 10) {
       setOdds(data.odds);
       setPMsg("odds", `✓ ${targetVenue}${targetRaceNo}Rの3連単オッズ ${Object.keys(data.odds).length}点を事前取得済みデータから反映しました`);
     }
-    const windNote = windKey ? `／風も自動入力：${windKey}` : "";
-    const metaNote = meta.racerCount || meta.motorCount || meta.fCount ? `／選手・モーター・F持ちも反映` : "";
-    const oddsNote = data.odds && Object.keys(data.odds).length >= 10 ? `／3連単オッズ${Object.keys(data.odds).length}点も反映` : "";
     const simpleFetchMsg = `${targetVenue}${targetRaceNo}Rのデータを取得しました。`;
     setPMsg("tenji", simpleFetchMsg);
     setAutoMsg(simpleFetchMsg);
@@ -2938,7 +2933,7 @@ export default function App() {
     setMotors(emptyBoatMap(null));
     setRacerProfiles({});
     setOdds(null);
-    setWind("無風");
+    // 風は完全手動のため、レース変更・オールクリアでも選択値を維持する。
   };
 
   const set = (boat, key, v) =>
@@ -4910,7 +4905,7 @@ export default function App() {
 
           {/* 風の選択 */}
           <div style={{ fontSize: 11, color: "#7da3c8", marginTop: 16, marginBottom: 6 }}>
-            風を選択
+            風を選択（完全手動）
           </div>
           <select
             value={wind}
@@ -4925,6 +4920,9 @@ export default function App() {
               <option key={w} value={w}>{w}</option>
             ))}
           </select>
+          <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 6, lineHeight: 1.5 }}>
+            自動取得・事前取得・レース変更では上書きされません。公式表示を確認して手動で選択してください。
+          </div>
 
         </div>
 

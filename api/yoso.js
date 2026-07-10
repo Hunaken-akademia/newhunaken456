@@ -1137,6 +1137,302 @@ function boatcastRaceUrls(venue, raceNo, dateStr) {
   };
 }
 
+function buildOfficialResultUrl(venue, raceNo, dateStr) {
+  const jcd = JCD[venue];
+  if (!jcd) return "";
+  const ymd = yyyymmdd(dateStr);
+  return `https://www.boatrace.jp/owpc/pc/race/raceresult?rno=${Number(raceNo)}&jcd=${jcd}&hd=${ymd}`;
+}
+
+function htmlTableRows(tableHtml) {
+  const rows = [];
+  const rowRe = /<tr\b[^>]*>[\s\S]*?<\/tr>/gi;
+  let rm;
+  while ((rm = rowRe.exec(String(tableHtml || "")))) {
+    const rowHtml = rm[0];
+    const cells = [];
+    const cellRe = /<(td|th)\b[^>]*>([\s\S]*?)<\/\1>/gi;
+    let cm;
+    while ((cm = cellRe.exec(rowHtml))) cells.push(pickText(cm[2]));
+    if (cells.length) rows.push({ rowHtml, cells, text: cells.join(" ").replace(/\s+/g, " ").trim() });
+  }
+  return rows;
+}
+
+function htmlTables(html) {
+  return String(html || "").match(/<table\b[^>]*>[\s\S]*?<\/table>/gi) || [];
+}
+
+function boatNoFromResultRowHtml(rowHtml) {
+  const raw = String(rowHtml || "");
+  const patterns = [
+    /is-boat(?:Color|No|Image)[-_]?([1-6])\b/i,
+    /boat(?:Color|No|Image)[-_]?([1-6])\b/i,
+    /class=["'][^"']*\bboat[-_]?([1-6])\b/i,
+  ];
+  for (const re of patterns) {
+    const m = raw.match(re);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+function parseActualStToken(raw) {
+  const compact = String(raw || "").replace(/[　]/g, " ").replace(/[−ー─]/g, "-").toUpperCase().trim();
+  const m = compact.match(/(?:^|[^0-9])([FL])?\s*(-?(?:\d+)?\.\d{2})(?!\d)/);
+  if (!m) return null;
+  let value = Number(m[2].startsWith(".") ? `0${m[2]}` : m[2]);
+  if (!Number.isFinite(value)) return null;
+  const marker = m[1] || "";
+  if (marker === "F") value = -Math.abs(value);
+  return { st: Number(value.toFixed(3)), marker, isF: marker === "F" || value < 0 };
+}
+
+function resultStatusFromText(text) {
+  const t = String(text || "").replace(/\s+/g, "");
+  if (/フライング|\bF\b|(^|[^A-Z])F\d*/i.test(t)) return "F";
+  if (/出遅れ|\bL\b|(^|[^A-Z])L\d*/i.test(t)) return "L";
+  if (/欠場|欠/.test(t)) return "欠";
+  if (/失格|失/.test(t)) return "失";
+  if (/転覆|転/.test(t)) return "転";
+  if (/落水|落/.test(t)) return "落";
+  if (/妨害|妨/.test(t)) return "妨";
+  if (/不完走|不/.test(t)) return "不";
+  return "";
+}
+
+function findRegnoInCells(cells, racersByRegno) {
+  const candidates = [];
+  for (const cell of cells || []) {
+    for (const m of String(cell || "").matchAll(/\b(\d{4})\b/g)) candidates.push(m[1]);
+  }
+  const matched = candidates.find((x) => racersByRegno.has(Number(x)));
+  return matched ? Number(matched) : (candidates.length ? Number(candidates[0]) : null);
+}
+
+function parseOfficialFinishRows(html, racers = []) {
+  const racersByRegno = new Map((racers || []).map((r) => [Number(r.regNo), r]).filter(([n]) => Number.isFinite(n)));
+  const candidates = [];
+  for (const table of htmlTables(html)) {
+    const rows = htmlTableRows(table);
+    const head = rows.slice(0, 3).map((r) => r.text).join(" ");
+    if (!/着/.test(head) || !/(ボートレーサー|選手名|レーサー)/.test(head) || !/枠/.test(head)) continue;
+    const out = [];
+    for (const row of rows) {
+      if (/(着順|ボートレーサー|選手名|レースタイム)/.test(row.text)) continue;
+      const status = resultStatusFromText(row.cells.slice(0, 3).join(" "));
+      const firstCell = String(row.cells[0] || "").trim();
+      const rankMatch = firstCell.match(/^([1-6])(?:着)?$/);
+      const exactSmall = row.cells.map((c) => String(c || "").trim()).filter((c) => /^[1-6]$/.test(c)).map(Number);
+      const regno = findRegnoInCells(row.cells, racersByRegno);
+      const racer = regno ? racersByRegno.get(regno) : null;
+      let boat = boatNoFromResultRowHtml(row.rowHtml);
+      if (!(boat >= 1 && boat <= 6)) {
+        if (exactSmall.length >= 2) boat = exactSmall[1];
+        else if (racer?.boat) boat = Number(racer.boat);
+        else if (exactSmall.length === 1 && !rankMatch) boat = exactSmall[0];
+      }
+      if (!(boat >= 1 && boat <= 6) || out.some((x) => x.boat === boat)) continue;
+      const rank = rankMatch ? Number(rankMatch[1]) : (status ? 7 : null);
+      if (rank == null) continue;
+      out.push({ boat, rank, status, regno: regno || (racer?.regNo ? Number(racer.regNo) : null) });
+    }
+    if (out.length) candidates.push(out);
+  }
+  candidates.sort((a, b) => b.length - a.length);
+  return candidates[0] || [];
+}
+
+function parseStartRowsFromTables(html) {
+  const candidates = [];
+  for (const table of htmlTables(html)) {
+    const rows = htmlTableRows(table);
+    const joined = rows.map((r) => r.text).join(" ");
+    const stMatches = joined.match(/(?:F|L)?\s*(?:\d+)?\.\d{2}/gi) || [];
+    if (!/ST|スタート/i.test(joined) && stMatches.length < 4) continue;
+    const out = [];
+    for (const row of rows) {
+      const stInfo = parseActualStToken(row.text);
+      if (!stInfo) continue;
+      const exactSmall = row.cells.map((c) => String(c || "").trim()).filter((c) => /^[1-6]$/.test(c)).map(Number);
+      const classBoat = boatNoFromResultRowHtml(row.rowHtml);
+      let course = exactSmall.length >= 2 ? exactSmall[0] : out.length + 1;
+      let boat = classBoat || (exactSmall.length >= 2 ? exactSmall[1] : exactSmall[0]);
+      if (!(boat >= 1 && boat <= 6)) continue;
+      if (!(course >= 1 && course <= 6) || out.some((x) => x.course === course)) course = out.length + 1;
+      if (out.some((x) => x.boat === boat)) continue;
+      out.push({ boat, course, ...stInfo });
+    }
+    if (out.length) candidates.push(out);
+  }
+  candidates.sort((a, b) => b.length - a.length);
+  return candidates[0] || [];
+}
+
+function parseStartRowsFromText(raw) {
+  const lines = textLinesFromHtml(raw);
+  let start = lines.findIndex((line) => /スタート情報|スタート展示/.test(line));
+  let scoped = start >= 0 ? lines.slice(start + 1, start + 100) : lines;
+  const end = scoped.findIndex((line) => /水面気象|払戻|勝式|レース結果/.test(line));
+  if (end > 0) scoped = scoped.slice(0, end);
+  const out = [];
+  const usedBoats = new Set();
+  for (let i = 0; i < scoped.length; i++) {
+    const stInfo = parseActualStToken(scoped[i]);
+    if (!stInfo) continue;
+    const near = scoped.slice(Math.max(0, i - 5), i + 1).reverse();
+    let boat = null;
+    for (const line of near) {
+      const m = String(line || "").trim().match(/^([1-6])$/);
+      if (m && !usedBoats.has(Number(m[1]))) { boat = Number(m[1]); break; }
+    }
+    if (!(boat >= 1 && boat <= 6)) {
+      boat = [1,2,3,4,5,6].find((b) => !usedBoats.has(b)) || null;
+    }
+    if (!boat) continue;
+    usedBoats.add(boat);
+    out.push({ boat, course: out.length + 1, ...stInfo });
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+function parseKimariteFromResultHtml(html) {
+  const text = pickText(html);
+  const m = text.match(/決まり手\s*[:：]?\s*(まくり差し|逃げ|差し|まくり|抜き|恵まれ)/);
+  return m ? m[1] : "";
+}
+
+function buildRaceResultRows({ venue, raceNo, ymd, resultHtml, racers, sttRaw = "", resultRaw = "" }) {
+  const raceDate = ymdToDate(ymd);
+  const placeNo = PLACE_NO_BY_VENUE[venue];
+  if (!raceDate || !placeNo) return { rows: [], complete: false, reason: "日付または場コード不正" };
+
+  const finishRows = parseOfficialFinishRows(resultHtml, racers);
+  let startRows = parseStartRowsFromTables(resultHtml);
+  if (startRows.length < 5) startRows = parseStartRowsFromText(resultHtml);
+  if (startRows.length < 5 && resultRaw) startRows = parseStartRowsFromText(resultRaw);
+  const sttRows = parseBoatcastSttRows(sttRaw);
+  const startByBoat = new Map(startRows.map((r) => [Number(r.boat), r]));
+  const courseByBoat = new Map(sttRows.map((r) => [Number(r.boat), Number(r.course)]));
+  const racersByBoat = new Map((racers || []).map((r) => [Number(r.boat), r]));
+  const racersByRegno = new Map((racers || []).map((r) => [Number(r.regNo), r]).filter(([n]) => Number.isFinite(n)));
+  const kimarite = parseKimariteFromResultHtml(resultHtml);
+
+  const rows = [];
+  for (const fr of finishRows) {
+    const sr = startByBoat.get(Number(fr.boat));
+    const racer = (fr.regno && racersByRegno.get(Number(fr.regno))) || racersByBoat.get(Number(fr.boat));
+    const course = Number(sr?.course || courseByBoat.get(Number(fr.boat)) || fr.boat);
+    const st = sr?.st;
+    const status = fr.status || sr?.marker || "";
+    rows.push({
+      race_date: raceDate,
+      place_no: placeNo,
+      race_no: Number(raceNo),
+      boat: Number(fr.boat),
+      course: course >= 1 && course <= 6 ? course : Number(fr.boat),
+      rank: Number(fr.rank) >= 1 && Number(fr.rank) <= 6 ? Number(fr.rank) : 7,
+      kimarite: kimarite || null,
+      regno: fr.regno || (racer?.regNo ? Number(racer.regNo) : null),
+      st: Number.isFinite(Number(st)) ? Number(st) : null,
+      is_f: status === "F" || sr?.isF === true || Number(st) < 0,
+    });
+  }
+
+  const racerCount = (racers || []).filter((r) => Number(r?.boat) >= 1 && Number(r?.boat) <= 6).length;
+  const expected = racerCount >= 4 && racerCount <= 6 ? racerCount : 6;
+  const uniqueBoats = new Set(rows.map((r) => r.boat));
+  const startCount = rows.filter((r) => Number.isFinite(r.st)).length;
+  const validCore = rows.every((r) => r.regno && r.course >= 1 && r.course <= 6 && r.rank >= 1);
+  const complete = rows.length >= expected && uniqueBoats.size >= expected && startCount >= expected && validCore;
+  const reason = complete ? "" : `結果未確定または解析不足（着順${finishRows.length}艇・ST${startRows.length}艇・保存候補${rows.length}艇）`;
+  return { rows, complete, reason, finishCount: finishRows.length, startCount: startRows.length, kimarite };
+}
+
+async function saveRaceResultRows(rows) {
+  if (!ENABLE_PERSISTENT_CACHE) return { ok: false, skipped: true, reason: "SUPABASE_SERVICE_KEYなし" };
+  if (!Array.isArray(rows) || !rows.length) return { ok: false, skipped: true, reason: "保存対象なし" };
+  try {
+    await supabaseCacheRequest("race_results?on_conflict=race_date,place_no,race_no,boat", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(rows),
+    });
+    return { ok: true, count: rows.length, mode: "upsert" };
+  } catch (e) {
+    const msg = String(e?.message || e);
+    // 既存DBに複合UNIQUEが無い場合の保険。完成した1レース分だけを入れ替えて欠損を修復する。
+    if (!/42P10|unique|conflict target|matching the ON CONFLICT/i.test(msg)) throw e;
+    const first = rows[0];
+    const filter = `race_results?race_date=eq.${encodeURIComponent(first.race_date)}&place_no=eq.${Number(first.place_no)}&race_no=eq.${Number(first.race_no)}`;
+    await supabaseCacheRequest(filter, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+    await supabaseCacheRequest("race_results", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify(rows),
+    });
+    return { ok: true, count: rows.length, mode: "replace", warning: "複合UNIQUEなしのためレース単位で入替" };
+  }
+}
+
+async function fetchBoatcastRaceResultPayload(venue, raceNo, ymd) {
+  const urls = boatcastRaceUrls(venue, raceNo, ymd);
+  const resultUrl = buildOfficialResultUrl(venue, raceNo, ymd);
+  if (!urls || !resultUrl) throw new Error(`${venue}の結果取得URLを作成できません`);
+
+  const [resultRes, str3Res, sttRes, resultRawRes] = await Promise.allSettled([
+    fetchHtml(resultUrl),
+    fetchHtml(urls.str3),
+    fetchHtml(urls.stt),
+    fetchHtml(urls.weatherCurrent),
+  ]);
+  if (resultRes.status !== "fulfilled") {
+    return { ok: true, action: "result", completed: false, venue, race: Number(raceNo), date: ymd, reason: `公式結果未取得: ${resultRes.reason?.message || resultRes.reason}` };
+  }
+
+  const resultHtml = resultRes.value || "";
+  const racers = str3Res.status === "fulfilled" ? parseBoatcastRacerInfo(str3Res.value) : [];
+  const sttRaw = sttRes.status === "fulfilled" ? sttRes.value : "";
+  const resultRaw = resultRawRes.status === "fulfilled" ? resultRawRes.value : "";
+  const parsed = buildRaceResultRows({ venue, raceNo, ymd, resultHtml, racers, sttRaw, resultRaw });
+  if (!parsed.complete) {
+    return {
+      ok: true,
+      action: "result",
+      completed: false,
+      venue,
+      race: Number(raceNo),
+      date: ymd,
+      resultUrl,
+      reason: parsed.reason,
+      finishCount: parsed.finishCount,
+      startCount: parsed.startCount,
+      candidateCount: parsed.rows.length,
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+
+  const saved = await saveRaceResultRows(parsed.rows);
+  return {
+    ok: true,
+    action: "result",
+    completed: true,
+    appVersion: "v116",
+    venue,
+    race: Number(raceNo),
+    date: ymd,
+    resultUrl,
+    rowsCount: parsed.rows.length,
+    stCount: parsed.rows.filter((r) => r.st != null).length,
+    fCount: parsed.rows.filter((r) => r.is_f).length,
+    kimarite: parsed.kimarite,
+    resultSaved: saved,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+
 function parseNumericTokens(line) {
   return (String(line || "").match(/-?\d+(?:\.\d+)?/g) || []).map((x) => String(x));
 }
@@ -2756,6 +3052,21 @@ export default async function handler(req, res) {
         return;
       }
       const payload = await fetchBoatcastPreRaceStatusPayload(venue, raceNo, ymd);
+      res.status(200).json(payload);
+      return;
+    }
+
+    if (action === "result") {
+      res.setHeader("Cache-Control", "no-store");
+      if (!venue) {
+        res.status(400).json({ ok: false, error: "venue を指定してください" });
+        return;
+      }
+      if (!JCD[venue]) {
+        res.status(400).json({ ok: false, error: `${venue}は結果取得対象外です` });
+        return;
+      }
+      const payload = await fetchBoatcastRaceResultPayload(venue, raceNo, ymd);
       res.status(200).json(payload);
       return;
     }
