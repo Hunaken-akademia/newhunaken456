@@ -9,10 +9,10 @@ const CACHE_MS = STATIC_CACHE_MS;
 
 // Vercelの同一実行環境内で共有するキャッシュ。
 // 同じ場・日付・RはTTL内ならBOATCASTへ再アクセスせず、取得中は他ユーザーへ古いキャッシュを返す。
-const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V113__ || new Map();
-globalThis.__HUNAKEN_YOSO_CACHE_V113__ = cacheStore;
-const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V112__ || new Map();
-globalThis.__HUNAKEN_YOSO_INFLIGHT_V112__ = inFlightStore;
+const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V114__ || new Map();
+globalThis.__HUNAKEN_YOSO_CACHE_V114__ = cacheStore;
+const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V114__ || new Map();
+globalThis.__HUNAKEN_YOSO_INFLIGHT_V114__ = inFlightStore;
 
 const SUPABASE_REST_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -592,7 +592,29 @@ function directionFromText(raw) {
   return "";
 }
 
-function directionFromImgToken(html) {
+// 公式beforeinfoの風向き画像番号は、場によって「スタート方向」と画面上の矢印の対応が逆になることがある。
+// 文字で「向かい風/追い風」が取れる場合はそれを最優先し、画像番号しか取れない場合だけこの場別補正表を使う。
+// 根本対策: 全場共通の矢印判定で決め打ちせず、場別に補正できる構造にする。
+const DEFAULT_WIND_IMAGE_DIRECTION_MAP = {
+  1: "追い風", 2: "右横風", 3: "右横風", 4: "向かい風",
+  5: "向かい風", 6: "左横風", 7: "左横風", 8: "追い風",
+};
+
+const WIND_IMAGE_DIRECTION_MAP_BY_VENUE = {
+  // 鳴門は公式画面の矢印番号を全場共通で読むと、追い風/向かい風が逆になるケースがあるため反転。
+  // 横風は左右も入れ替わる可能性があるため、同じく左右を反転しておく。
+  "鳴門": {
+    1: "向かい風", 2: "左横風", 3: "左横風", 4: "追い風",
+    5: "追い風", 6: "右横風", 7: "右横風", 8: "向かい風",
+  },
+};
+
+function windImageDirectionFromNumber(n, venue) {
+  const map = WIND_IMAGE_DIRECTION_MAP_BY_VENUE[String(venue || "")] || DEFAULT_WIND_IMAGE_DIRECTION_MAP;
+  return map[Number(n)] || "";
+}
+
+function directionFromImgToken(html, venue = "") {
   const raw = String(html || "");
   const low = raw.toLowerCase();
 
@@ -614,17 +636,13 @@ function directionFromImgToken(html) {
     || around.match(/(?:class|src|data-[^=]+)=['"][^'"]*(?:wind|kaze|weather)[^'"]*?0?([1-8])[^'"]*['"]/i);
   if (m) {
     const n = Number(m[1]);
-    // 8方向画像を4分類に丸める。ずれがある場合は windRaw に番号が出るので後で調整可能。
-    const map = {
-      1: "追い風", 2: "右横風", 3: "右横風", 4: "向かい風",
-      5: "向かい風", 6: "左横風", 7: "左横風", 8: "追い風",
-    };
-    return { direction: map[n] || "", raw: `wind-${n}`, confidence: "number" };
+    // 8方向画像を4分類に丸める。場によって追い/向かいが逆になるため、場別補正を通す。
+    return { direction: windImageDirectionFromNumber(n, venue), raw: `wind-${n}@${venue || "default"}`, confidence: "number" };
   }
   return { direction: "", raw: "", confidence: "none" };
 }
 
-function parseWeather(html) {
+function parseWeather(html, venue = "") {
   const text = pickText(html);
   const windSpeed = text.match(/風速\s*([0-9]+(?:\.[0-9]+)?)\s*m/i)?.[1] || "";
   const temp = text.match(/気温\s*([0-9]+(?:\.[0-9]+)?)\s*℃/)?.[1] || "";
@@ -633,7 +651,7 @@ function parseWeather(html) {
 
   const idx = html.search(/水面気象|風速|weather1|気象/i);
   const section = idx >= 0 ? html.slice(Math.max(0, idx - 3500), idx + 6500) : html;
-  const dir = directionFromImgToken(section);
+  const dir = directionFromImgToken(section, venue);
   const windKey = windKeyFromDirectionAndSpeed(dir.direction, windSpeed);
   return {
     windSpeed,
@@ -1779,12 +1797,12 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
   // 風は「現在選択しているレースの公式beforeinfo」を最優先。
   // 以前は前レースのBOATCAST結果txtを先に見ていたため、展示公開前の次Rで古い風/無風が残ることがあった。
   // 優先順: 公式beforeinfo(現在R) → BOATCAST現在R → 直前情報txt → 前R結果txt(最終フォールバック)。
-  const officialWeather = officialBeforeInfoHtml ? parseWeather(officialBeforeInfoHtml) : {};
+  const officialWeather = officialBeforeInfoHtml ? parseWeather(officialBeforeInfoHtml, venue) : {};
   let weather = (officialWeather.windKey || officialWeather.windSpeed || officialWeather.windDirection) ? officialWeather : {};
   if (!weather.windKey) weather = parseBoatcastResultWeather(weatherCurrent);
-  if (!weather.windKey) weather = parseWeather(tkz || stt || str3);
+  if (!weather.windKey) weather = parseWeather(tkz || stt || str3, venue);
   if (!weather.windKey) weather = parseBoatcastResultWeather(weatherPrev);
-  if (!weather.windDirection && tkz) weather = mergeWeatherPreferReliable(weather, parseWeather(tkz));
+  if (!weather.windDirection && tkz) weather = mergeWeatherPreferReliable(weather, parseWeather(tkz, venue));
 
   let oddsInfo = null;
   try { oddsInfo = await fetchBoatcastOddsForVenue(venue, raceNo, dateStr); }
@@ -2578,12 +2596,12 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
     throw new Error(`${venue}の展示データ取得失敗: ${lastFetchError?.message || lastFetchError || "取得できませんでした"}`);
   }
 
-  let weather = parseWeather(html);
+  let weather = parseWeather(html, venue);
   const weatherUrl = buildOfficialBeforeInfoUrl(venue, raceNo, ymd);
   if (weatherUrl) {
     try {
       const officialHtml = await fetchHtml(weatherUrl);
-      const officialWeather = parseWeather(officialHtml);
+      const officialWeather = parseWeather(officialHtml, venue);
       weather = mergeWeatherPreferReliable(weather, officialWeather);
     } catch (e) {
       weather = { ...weather, weatherError: e.message || String(e) };
