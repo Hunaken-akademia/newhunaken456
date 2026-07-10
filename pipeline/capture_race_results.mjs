@@ -1,7 +1,7 @@
 // ============================================================
 // 全開催場の確定結果（着順・実ST・進入・決まり手・F）をSupabaseへ保存する。
 // Vercelの /api/yoso?action=result を叩き、同じレースはupsertで欠損補修する。
-// v117: 4並列・45秒タイムアウト・0件保存時は失敗終了。
+// v118: Supabase空本文対応・ST1艇欠損許容・0件保存時は失敗終了。
 // ============================================================
 
 import fs from "node:fs";
@@ -109,7 +109,7 @@ function appendSummary(stats) {
   const lines = [
     `## race_results capture ${date}`,
     "",
-    `- parser: v117-result-rank-flex`,
+    `- parser: v118-empty-body-partial-st`,
     `- concurrency: ${CONCURRENCY}`,
     `- venues held: ${stats.venuesHeld}`,
     `- saved races: ${stats.savedRaces}`,
@@ -159,7 +159,8 @@ for (const venue of venues) {
 
       if (data.completed) {
         const count = Number(data.resultSaved?.count || data.rowsCount || 0);
-        console.log(`SAVED ${venue}${race}R rows=${count} ST=${data.stCount ?? "?"} F=${data.fCount ?? "?"} 決まり手=${data.kimarite || "-"} parser=${data.parserVersion || data.appVersion || "?"}`);
+        const partial = data.partialSt ? ` PARTIAL_ST missing=${(data.missingStBoats || []).join(",") || "?"}` : "";
+        console.log(`SAVED ${venue}${race}R rows=${count} ST=${data.stCount ?? "?"} F=${data.fCount ?? "?"}${partial} 決まり手=${data.kimarite || "-"} parser=${data.parserVersion || data.appVersion || "?"}`);
         savedRaces++;
         savedRows += count;
       } else {

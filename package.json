@@ -1,6 +1,6 @@
 {
   "name": "hunaken-academia-paid-auto",
-  "version": "1.4.1-noinstall",
+  "version": "1.4.2-noinstall",
   "private": true,
   "type": "module",
   "scripts": {

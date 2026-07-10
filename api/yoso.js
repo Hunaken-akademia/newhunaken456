@@ -230,12 +230,20 @@ async function supabaseCacheRequest(path, options = {}) {
       ...(options.headers || {}),
     },
   });
+
+  // PostgREST の return=minimal は、成功時に 201/200 でも本文が空になることがある。
+  // res.json() を直接呼ぶと、保存自体は成功しているのに
+  // "Unexpected end of JSON input" で API が500になるため、必ず一度 text で受ける。
+  const body = await res.text().catch(() => "");
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
     throw new Error(`Supabase cache ${res.status}: ${body}`);
   }
-  if (res.status === 204) return null;
-  return await res.json();
+  if (!String(body || "").trim()) return null;
+  try {
+    return JSON.parse(body);
+  } catch (error) {
+    throw new Error(`Supabase response JSON parse ${res.status}: ${String(body).slice(0, 240)}`);
+  }
 }
 
 async function readPersistentCache(key) {
@@ -1466,9 +1474,15 @@ function buildRaceResultRows({ venue, raceNo, ymd, resultHtml, racers, sttRaw = 
   const uniqueBoats = new Set(rows.map((r) => r.boat));
   const startCount = rows.filter((r) => Number.isFinite(r.st)).length;
   const validCore = rows.every((r) => r.regno && r.course >= 1 && r.course <= 6 && r.rank >= 1);
-  const complete = rows.length >= expected && uniqueBoats.size >= expected && startCount >= expected && validCore;
+  const coreComplete = rows.length >= expected && uniqueBoats.size >= expected && validCore;
+  // 公式結果で欠場・失格等があると、着順6艇に対して実STが5艇だけのケースがある。
+  // その1艇のために着順・他5艇のSTまで破棄しない。ST欠損はnullで保存し、再取得で補修する。
+  const stAcceptable = startCount >= Math.max(1, expected - 1);
+  const complete = coreComplete && stAcceptable;
+  const partialSt = complete && startCount < expected;
+  const missingStBoats = rows.filter((r) => !Number.isFinite(r.st)).map((r) => r.boat);
   const reason = complete ? "" : `結果未確定または解析不足（着順${finishRows.length}艇・ST${startRows.length}艇・保存候補${rows.length}艇）`;
-  return { rows, complete, reason, finishCount: finishRows.length, startCount: startRows.length, kimarite };
+  return { rows, complete, partialSt, missingStBoats, reason, finishCount: finishRows.length, startCount: startRows.length, kimarite };
 }
 
 async function saveRaceResultRows(rows) {
@@ -1532,7 +1546,8 @@ async function fetchBoatcastRaceResultPayload(venue, raceNo, ymd) {
       candidateCount: parsed.rows.length,
       resultHtmlLength: resultHtml.length,
       resultPageHasResultText: /レース結果|着順|レースタイム/.test(pickText(resultHtml)),
-      parserVersion: "v117-result-rank-flex",
+      parserVersion: "v118-empty-body-partial-st",
+      missingStBoats: parsed.missingStBoats || [],
       fetchedAt: new Date().toISOString(),
     };
   }
@@ -1542,7 +1557,7 @@ async function fetchBoatcastRaceResultPayload(venue, raceNo, ymd) {
     ok: true,
     action: "result",
     completed: true,
-    appVersion: "v117",
+    appVersion: "v118",
     venue,
     race: Number(raceNo),
     date: ymd,
@@ -1550,6 +1565,9 @@ async function fetchBoatcastRaceResultPayload(venue, raceNo, ymd) {
     rowsCount: parsed.rows.length,
     stCount: parsed.rows.filter((r) => r.st != null).length,
     fCount: parsed.rows.filter((r) => r.is_f).length,
+    partialSt: !!parsed.partialSt,
+    missingStBoats: parsed.missingStBoats || [],
+    parserVersion: "v118-empty-body-partial-st",
     kimarite: parsed.kimarite,
     resultSaved: saved,
     fetchedAt: new Date().toISOString(),
