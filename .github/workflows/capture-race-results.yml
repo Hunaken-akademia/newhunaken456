@@ -1,0 +1,69 @@
+name: capture-race-results
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '取得日 YYYY-MM-DD（空ならモードに従う）'
+        required: false
+        default: ''
+      mode:
+        description: 'today=当日 / yesterday=前日補修'
+        required: true
+        default: 'today'
+        type: choice
+        options:
+          - today
+          - yesterday
+      dry:
+        description: 'trueならURL確認のみ / falseなら保存実行'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+  schedule:
+    - cron: '35 14 * * *'
+    - cron: '40 23 * * *'
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Capture confirmed race results
+        env:
+          PUBLIC_APP_URL: ${{ vars.PUBLIC_APP_URL || 'https://newhunaken456.vercel.app' }}
+          CAPTURE_TOKEN: ${{ secrets.CAPTURE_TOKEN }}
+
+        run: |
+          DATE_INPUT='${{ github.event.inputs.date }}'
+          MODE_INPUT='${{ github.event.inputs.mode }}'
+          DRY_INPUT='${{ github.event.inputs.dry }}'
+          SCHEDULE_EXPR='${{ github.event.schedule }}'
+
+          CMD="node pipeline/capture_race_results.mjs"
+
+          if [ -n "$DATE_INPUT" ]; then
+            CMD="$CMD $DATE_INPUT"
+          elif [ "$MODE_INPUT" = "yesterday" ] || [ "$SCHEDULE_EXPR" = "40 23 * * *" ]; then
+            CMD="$CMD --yesterday"
+          fi
+
+          if [ "$DRY_INPUT" = "true" ]; then
+            CMD="$CMD --dry"
+          fi
+
+          echo "$CMD"
+          eval "$CMD"
