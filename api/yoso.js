@@ -1210,35 +1210,156 @@ function findRegnoInCells(cells, racersByRegno) {
   return matched ? Number(matched) : (candidates.length ? Number(candidates[0]) : null);
 }
 
+
+function normalizeResultToken(value) {
+  return String(value == null ? "" : value)
+    .replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+    .replace(/[　]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function rankFromResultCells(cells) {
+  const list = (cells || []).slice(0, 3).map(normalizeResultToken);
+  for (const token of list) {
+    const m = token.match(/^([1-6])(?:着|位)?$/);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+function parseFinishRowsFromTableRows(rows, racersByRegno) {
+  const out = [];
+  for (const row of rows || []) {
+    const normalizedCells = (row.cells || []).map(normalizeResultToken);
+    const rank = rankFromResultCells(normalizedCells);
+    const status = resultStatusFromText(normalizedCells.slice(0, 4).join(" "));
+    if (rank == null && !status) continue;
+
+    const regno = findRegnoInCells(normalizedCells, racersByRegno);
+    const racer = regno ? racersByRegno.get(regno) : null;
+    let boat = boatNoFromResultRowHtml(row.rowHtml);
+
+    if (!(boat >= 1 && boat <= 6) && racer?.boat) {
+      boat = Number(racer.boat);
+    }
+
+    if (!(boat >= 1 && boat <= 6)) {
+      const exactSmall = normalizedCells
+        .map((c, idx) => ({ idx, value: /^[1-6]$/.test(c) ? Number(c) : null }))
+        .filter((x) => x.value != null);
+
+      // 先頭の数字は着順である可能性が高いので、それ以外の最初の数字を艇番として採用。
+      const rankCellIndex = normalizedCells.findIndex((c) => /^([1-6])(?:着|位)?$/.test(c));
+      const boatCell = exactSmall.find((x) => x.idx !== rankCellIndex);
+      if (boatCell) boat = boatCell.value;
+    }
+
+    if (!(boat >= 1 && boat <= 6) || out.some((x) => x.boat === boat)) continue;
+    out.push({
+      boat,
+      rank: rank != null ? rank : 7,
+      status,
+      regno: regno || (racer?.regNo ? Number(racer.regNo) : null),
+    });
+  }
+  return out;
+}
+
+function parseOfficialFinishRowsByLines(html, racers = []) {
+  const racersByRegno = new Map(
+    (racers || [])
+      .map((r) => [Number(r.regNo), r])
+      .filter(([n]) => Number.isFinite(n))
+  );
+  const lines = textLinesFromHtml(html).map(normalizeResultToken);
+  const sectionStart = lines.findIndex((line) => /レース結果|着順/.test(line));
+  const source = sectionStart >= 0 ? lines.slice(sectionStart, sectionStart + 220) : lines.slice(0, 400);
+  const out = [];
+
+  for (let i = 0; i < source.length; i++) {
+    const rankMatch = source[i].match(/^([1-6])(?:着|位)$/);
+    if (!rankMatch) continue;
+    const rank = Number(rankMatch[1]);
+
+    let end = Math.min(source.length, i + 30);
+    for (let j = i + 1; j < end; j++) {
+      if (/^[1-6](?:着|位)$/.test(source[j])) {
+        end = j;
+        break;
+      }
+      if (/払戻|勝式|返還|備考/.test(source[j])) {
+        end = j;
+        break;
+      }
+    }
+
+    const block = source.slice(i, end);
+    let regno = null;
+    for (const line of block) {
+      for (const match of line.matchAll(/\b(\d{4})\b/g)) {
+        const value = Number(match[1]);
+        if (racersByRegno.has(value)) {
+          regno = value;
+          break;
+        }
+      }
+      if (regno) break;
+    }
+
+    const racer = regno ? racersByRegno.get(regno) : null;
+    let boat = racer?.boat ? Number(racer.boat) : null;
+    if (!(boat >= 1 && boat <= 6)) {
+      // 着順行の直後に現れる単独1〜6を艇番候補にする。
+      const candidate = block
+        .slice(1)
+        .map((line) => line.match(/^([1-6])$/))
+        .find(Boolean);
+      if (candidate) boat = Number(candidate[1]);
+    }
+
+    if (!(boat >= 1 && boat <= 6) || out.some((x) => x.boat === boat)) continue;
+    const status = resultStatusFromText(block.slice(0, 8).join(" "));
+    out.push({
+      boat,
+      rank,
+      status,
+      regno: regno || (racer?.regNo ? Number(racer.regNo) : null),
+    });
+  }
+
+  return out;
+}
+
 function parseOfficialFinishRows(html, racers = []) {
-  const racersByRegno = new Map((racers || []).map((r) => [Number(r.regNo), r]).filter(([n]) => Number.isFinite(n)));
+  const racersByRegno = new Map(
+    (racers || [])
+      .map((r) => [Number(r.regNo), r])
+      .filter(([n]) => Number.isFinite(n))
+  );
   const candidates = [];
+
+  // 旧版は「枠・ボートレーサー・着」の3語がヘッダーにすべて存在する表だけを対象にしていた。
+  // 公式ページの表記差分で全レース0艇になるため、結果らしい表を広く解析して行単位で厳密判定する。
   for (const table of htmlTables(html)) {
     const rows = htmlTableRows(table);
-    const head = rows.slice(0, 3).map((r) => r.text).join(" ");
-    if (!/着/.test(head) || !/(ボートレーサー|選手名|レーサー)/.test(head) || !/枠/.test(head)) continue;
-    const out = [];
-    for (const row of rows) {
-      if (/(着順|ボートレーサー|選手名|レースタイム)/.test(row.text)) continue;
-      const status = resultStatusFromText(row.cells.slice(0, 3).join(" "));
-      const firstCell = String(row.cells[0] || "").trim();
-      const rankMatch = firstCell.match(/^([1-6])(?:着)?$/);
-      const exactSmall = row.cells.map((c) => String(c || "").trim()).filter((c) => /^[1-6]$/.test(c)).map(Number);
-      const regno = findRegnoInCells(row.cells, racersByRegno);
-      const racer = regno ? racersByRegno.get(regno) : null;
-      let boat = boatNoFromResultRowHtml(row.rowHtml);
-      if (!(boat >= 1 && boat <= 6)) {
-        if (exactSmall.length >= 2) boat = exactSmall[1];
-        else if (racer?.boat) boat = Number(racer.boat);
-        else if (exactSmall.length === 1 && !rankMatch) boat = exactSmall[0];
-      }
-      if (!(boat >= 1 && boat <= 6) || out.some((x) => x.boat === boat)) continue;
-      const rank = rankMatch ? Number(rankMatch[1]) : (status ? 7 : null);
-      if (rank == null) continue;
-      out.push({ boat, rank, status, regno: regno || (racer?.regNo ? Number(racer.regNo) : null) });
-    }
+    const joined = rows.slice(0, 12).map((r) => r.text).join(" ");
+    if (!/(着順|レースタイム|レース結果|着)/.test(joined)) continue;
+    const out = parseFinishRowsFromTableRows(rows, racersByRegno);
     if (out.length) candidates.push(out);
   }
+
+  // table抽出が入れ子やHTML差分で失敗した場合は、全trを直接解析。
+  if (!candidates.some((rows) => rows.length >= 4)) {
+    const globalRows = htmlTableRows(String(html || ""));
+    const globalOut = parseFinishRowsFromTableRows(globalRows, racersByRegno);
+    if (globalOut.length) candidates.push(globalOut);
+  }
+
+  // 最終フォールバック：テキスト化した「1着〜6着」ブロックを登録番号と照合。
+  const lineOut = parseOfficialFinishRowsByLines(html, racers);
+  if (lineOut.length) candidates.push(lineOut);
+
   candidates.sort((a, b) => b.length - a.length);
   return candidates[0] || [];
 }
@@ -1382,7 +1503,7 @@ async function fetchBoatcastRaceResultPayload(venue, raceNo, ymd) {
   if (!urls || !resultUrl) throw new Error(`${venue}の結果取得URLを作成できません`);
 
   const [resultRes, str3Res, sttRes, resultRawRes] = await Promise.allSettled([
-    fetchHtml(resultUrl),
+    fetchHtml(resultUrl, { referer: "https://www.boatrace.jp/", timeoutMs: 12000 }),
     fetchHtml(urls.str3),
     fetchHtml(urls.stt),
     fetchHtml(urls.weatherCurrent),
@@ -1409,6 +1530,9 @@ async function fetchBoatcastRaceResultPayload(venue, raceNo, ymd) {
       finishCount: parsed.finishCount,
       startCount: parsed.startCount,
       candidateCount: parsed.rows.length,
+      resultHtmlLength: resultHtml.length,
+      resultPageHasResultText: /レース結果|着順|レースタイム/.test(pickText(resultHtml)),
+      parserVersion: "v117-result-rank-flex",
       fetchedAt: new Date().toISOString(),
     };
   }
@@ -1418,7 +1542,7 @@ async function fetchBoatcastRaceResultPayload(venue, raceNo, ymd) {
     ok: true,
     action: "result",
     completed: true,
-    appVersion: "v116",
+    appVersion: "v117",
     venue,
     race: Number(raceNo),
     date: ymd,
@@ -2850,16 +2974,29 @@ function parseByVenue(venue, html) {
   throw new Error(`${venue || "未選択"}はまだ展示等自動取得未対応です`);
 }
 
-async function fetchHtml(url) {
-  const r = await fetch(url, {
-    headers: {
-      "user-agent": "Mozilla/5.0 (compatible; HunakenAcademiaTool/1.0; +https://hunaken-academia.vercel.app)",
-      "accept": "text/html,text/plain,application/json,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "referer": "https://race.boatcast.jp/",
-    },
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return await r.text();
+async function fetchHtml(url, options = {}) {
+  const controller = new AbortController();
+  const timeoutMs = Math.max(3000, Number(options.timeoutMs || 15000));
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const isOfficial = String(url || "").includes("boatrace.jp");
+  try {
+    const r = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "accept": "text/html,text/plain,application/json,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "ja,en-US;q=0.8,en;q=0.6",
+        "referer": options.referer || (isOfficial ? "https://www.boatrace.jp/" : "https://race.boatcast.jp/"),
+      },
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.text();
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error(`HTTP timeout ${timeoutMs}ms`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function validRows(rows) {

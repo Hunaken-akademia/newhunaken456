@@ -1,13 +1,18 @@
 // ============================================================
 // 全開催場の確定結果（着順・実ST・進入・決まり手・F）をSupabaseへ保存する。
 // Vercelの /api/yoso?action=result を叩き、同じレースはupsertで欠損補修する。
+// v117: 4並列・45秒タイムアウト・0件保存時は失敗終了。
 // ============================================================
+
+import fs from "node:fs";
 
 const BASE_URL = (process.env.PUBLIC_APP_URL || process.env.APP_URL || "https://newhunaken456.vercel.app").replace(/\/$/, "");
 const argDate = process.argv.find((x) => /^\d{4}-\d{2}-\d{2}$/.test(x));
 const DRY = process.argv.includes("--dry");
 const YESTERDAY = process.argv.includes("--yesterday");
 const CAPTURE_TOKEN = process.env.CAPTURE_TOKEN || "";
+const CONCURRENCY = Math.min(6, Math.max(1, Number(process.env.RESULT_CAPTURE_CONCURRENCY || 4)));
+const REQUEST_TIMEOUT_MS = Math.max(10000, Number(process.env.RESULT_CAPTURE_TIMEOUT_MS || 45000));
 
 function jstDate(offsetDays = 0) {
   const now = new Date(Date.now() + offsetDays * 86400000);
@@ -30,21 +35,34 @@ const venues = [
 ];
 
 const headers = {
-  "user-agent": "HunakenRaceResultCapture/1.0",
+  "user-agent": "HunakenRaceResultCapture/1.1",
   ...(CAPTURE_TOKEN ? { "x-capture-token": CAPTURE_TOKEN } : {}),
 };
 
-async function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function getJson(url) {
-  const res = await fetch(url, { headers });
-  const text = await res.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch {}
-  if (!res.ok || json?.ok === false) {
-    throw new Error(`${res.status} ${json?.error || text.slice(0, 240)}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { headers, signal: controller.signal });
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+    if (!res.ok || json?.ok === false) {
+      throw new Error(`${res.status} ${json?.error || text.slice(0, 240)}`);
+    }
+    return json || {};
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`request timeout ${REQUEST_TIMEOUT_MS}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-  return json || {};
 }
 
 async function getRaceNumbers(venue) {
@@ -69,7 +87,42 @@ async function captureOne(venue, race) {
   return await getJson(url);
 }
 
-console.log(`race_results capture start date=${date} base=${BASE_URL} dry=${DRY} yesterday=${YESTERDAY}`);
+async function captureWithRetry(venue, race) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const data = await captureOne(venue, race);
+      return { venue, race, data, error: null };
+    } catch (error) {
+      if (attempt < 2) {
+        await sleep(1000);
+        continue;
+      }
+      return { venue, race, data: null, error };
+    }
+  }
+  return { venue, race, data: null, error: new Error("unknown capture error") };
+}
+
+function appendSummary(stats) {
+  const file = process.env.GITHUB_STEP_SUMMARY;
+  if (!file) return;
+  const lines = [
+    `## race_results capture ${date}`,
+    "",
+    `- parser: v117-result-rank-flex`,
+    `- concurrency: ${CONCURRENCY}`,
+    `- venues held: ${stats.venuesHeld}`,
+    `- saved races: ${stats.savedRaces}`,
+    `- saved rows: ${stats.savedRows}`,
+    `- pending races: ${stats.pendingRaces}`,
+    `- failed races: ${stats.failedRaces}`,
+    "",
+  ];
+  fs.appendFileSync(file, lines.join("\n"), "utf8");
+}
+
+console.log(`race_results capture start date=${date} base=${BASE_URL} dry=${DRY} yesterday=${YESTERDAY} concurrency=${CONCURRENCY}`);
+
 let venuesHeld = 0;
 let savedRaces = 0;
 let pendingRaces = 0;
@@ -80,8 +133,8 @@ for (const venue of venues) {
   let races = [];
   try {
     races = await getRaceNumbers(venue);
-  } catch (e) {
-    console.log(`SCHEDULE NG ${venue}: ${e.message || e} / 1〜12Rを直接確認します`);
+  } catch (error) {
+    console.log(`SCHEDULE NG ${venue}: ${error.message || error} / 1〜12Rを直接確認します`);
     races = Array.from({ length: 12 }, (_, i) => i + 1);
   }
 
@@ -91,39 +144,46 @@ for (const venue of venues) {
   }
   venuesHeld++;
 
-  for (const race of races) {
-    let succeeded = false;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const data = await captureOne(venue, race);
-        if (DRY) {
-          succeeded = true;
-          break;
-        }
-        if (data.completed) {
-          const count = Number(data.resultSaved?.count || data.rowsCount || 0);
-          console.log(`SAVED ${venue}${race}R rows=${count} ST=${data.stCount ?? "?"} F=${data.fCount ?? "?"} 決まり手=${data.kimarite || "-"}`);
-          savedRaces++;
-          savedRows += count;
-        } else {
-          console.log(`PENDING ${venue}${race}R ${data.reason || "結果未確定"}`);
-          pendingRaces++;
-        }
-        succeeded = true;
-        break;
-      } catch (e) {
-        if (attempt < 2) {
-          await sleep(1200);
-          continue;
-        }
-        console.log(`NG ${venue}${race}R ${e.message || e}`);
+  for (let i = 0; i < races.length; i += CONCURRENCY) {
+    const chunk = races.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(chunk.map((race) => captureWithRetry(venue, race)));
+
+    for (const item of results) {
+      const { race, data, error } = item;
+      if (error) {
+        console.log(`NG ${venue}${race}R ${error.message || error}`);
         failedRaces++;
+        continue;
+      }
+      if (DRY) continue;
+
+      if (data.completed) {
+        const count = Number(data.resultSaved?.count || data.rowsCount || 0);
+        console.log(`SAVED ${venue}${race}R rows=${count} ST=${data.stCount ?? "?"} F=${data.fCount ?? "?"} 決まり手=${data.kimarite || "-"} parser=${data.parserVersion || data.appVersion || "?"}`);
+        savedRaces++;
+        savedRows += count;
+      } else {
+        const diag = [
+          data.reason || "結果未確定",
+          data.resultHtmlLength != null ? `html=${data.resultHtmlLength}` : "",
+          data.resultPageHasResultText != null ? `hasResultText=${data.resultPageHasResultText}` : "",
+          data.parserVersion ? `parser=${data.parserVersion}` : "",
+        ].filter(Boolean).join(" ");
+        console.log(`PENDING ${venue}${race}R ${diag}`);
+        pendingRaces++;
       }
     }
-    if (!succeeded && DRY) break;
-    await sleep(220);
+
+    await sleep(250);
   }
 }
 
+const stats = { venuesHeld, savedRaces, savedRows, pendingRaces, failedRaces };
 console.log(`race_results capture done date=${date} venuesHeld=${venuesHeld} savedRaces=${savedRaces} savedRows=${savedRows} pending=${pendingRaces} failed=${failedRaces}`);
-if (!DRY && savedRaces === 0 && failedRaces > 0) process.exit(1);
+appendSummary(stats);
+
+if (!DRY && savedRaces === 0 && (pendingRaces > 0 || failedRaces > 0)) {
+  console.error("保存0件のため失敗終了します。Actionsの緑完了と実データ保存を混同しないための安全策です。");
+  process.exit(2);
+}
+if (!DRY && failedRaces > 0 && savedRaces === 0) process.exit(1);
