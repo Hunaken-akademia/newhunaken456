@@ -178,7 +178,7 @@ function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, o
       <div style={{ background: "#0e1b2c", border: "1px solid #284766", borderRadius: 10, padding: 12, fontWeight: 800, wordBreak: "break-all" }}>{email || "不明"}</div>
       <p style={{ color: "#ffb4a8", lineHeight: 1.8, fontSize: 13 }}>{entitlement?.reason || "購入者リストに登録されていません。"}</p>
       {authMsg ? <p style={{ color: "#ffd166", background: "#0e1b2c", border: "1px solid #8a6f2c", borderRadius: 10, padding: 10, fontSize: 12, lineHeight: 1.7, wordBreak: "break-word" }}>{authMsg}</p> : null}
-      <button onClick={onPurchase} style={buyBtn}>購入して利用開始</button>
+      <button onClick={onPurchase} style={buyBtn}>購入手続きへ進む</button>
       <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 12 }}>
         決済完了後、Stripe Webhook が <b>paid_users</b> にこのGoogleメールを自動追加します。購入は1人1回まで、利用期限は2026/12/31 23:59までです。古参クーポンはStripe決済画面で入力できます。
       </p>
