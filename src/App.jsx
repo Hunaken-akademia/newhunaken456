@@ -143,7 +143,10 @@ function startGoogleLogin() {
 }
 
 function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, onRetry, onPurchase }) {
+  const [purchaseAgreed, setPurchaseAgreed] = useState(false);
   const email = user?.email || user?.user_metadata?.email || "";
+  const isCreatingCheckout = String(authMsg || "").includes("作成中");
+  const canPurchase = purchaseAgreed && !isCreatingCheckout;
   const card = {
     minHeight: "100vh", background: "#0e1b2c", color: "#e8eef5",
     fontFamily: "'Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif",
@@ -151,7 +154,15 @@ function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, o
   };
   const box = { width: "100%", maxWidth: 520, background: "#13243a", border: "1px solid #284766", borderRadius: 18, padding: 22, boxShadow: "0 16px 50px rgba(0,0,0,.25)" };
   const btn = { width: "100%", border: "none", borderRadius: 12, padding: "13px 16px", fontSize: 15, fontWeight: 900, cursor: "pointer", background: "#4ea1ff", color: "#061425", marginTop: 14 };
-  const buyBtn = { ...btn, background: "#ffd166", color: "#1a2433" };
+  const buyBtn = {
+    ...btn,
+    background: canPurchase ? "#ffd166" : "#617086",
+    color: canPurchase ? "#1a2433" : "#c7d1dc",
+    cursor: canPurchase ? "pointer" : "not-allowed",
+    opacity: canPurchase ? 1 : 0.75,
+  };
+  const linkStyle = { color: "#73d9ff", fontWeight: 800, textDecoration: "underline" };
+
   if (mode === "loading") {
     return <div style={card}><div style={box}><div style={{ fontSize: 22, fontWeight: 900 }}>舟券アカデミア</div><p style={{ color: "#9db5cc" }}>ログイン状態と購入者情報を確認中…</p></div></div>;
   }
@@ -163,7 +174,7 @@ function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, o
       <div style={card}><div style={box}>
         <div style={{ fontSize: 11, letterSpacing: ".18em", color: "#7da3c8", marginBottom: 6 }}>購入者専用</div>
         <div style={{ fontSize: 24, fontWeight: 900 }}>舟券アカデミア 有料自動取得版</div>
-        <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 13 }}>Googleログイン後、購入済みのメールだけツールを表示します。販売期間は2026/7/10〜2026/8/13、利用期限は2026/12/31 23:59までです。</p>
+        <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 13 }}>Googleログイン後、購入済みのメールだけツールを表示します。販売期間は2026/7/10〜2026/8/13、利用期限は2026/12/31 23:59までです。予想履歴・収支記録は利用端末のブラウザ内に保存され、端末変更やブラウザデータ削除で消える場合があります。クラウド同期・復元には対応していません。</p>
         <button onClick={onLogin} style={btn}>Googleでログイン</button>
         {authMsg ? <p style={{ color: "#ffb4a8", fontSize: 12, lineHeight: 1.7 }}>{authMsg}</p> : null}
         <p style={{ color: "#5f7f9f", fontSize: 11, lineHeight: 1.7, marginTop: 16 }}>本ツールは予想補助であり、的中や利益を保証するものではありません。</p>
@@ -178,84 +189,31 @@ function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, o
       <div style={{ background: "#0e1b2c", border: "1px solid #284766", borderRadius: 10, padding: 12, fontWeight: 800, wordBreak: "break-all" }}>{email || "不明"}</div>
       <p style={{ color: "#ffb4a8", lineHeight: 1.8, fontSize: 13 }}>{entitlement?.reason || "購入者リストに登録されていません。"}</p>
       {authMsg ? <p style={{ color: "#ffd166", background: "#0e1b2c", border: "1px solid #8a6f2c", borderRadius: 10, padding: 10, fontSize: 12, lineHeight: 1.7, wordBreak: "break-word" }}>{authMsg}</p> : null}
-      <div
-  style={{
-    margin: "18px 0",
-    padding: "16px",
-    border: "1px solid rgba(148, 163, 184, 0.35)",
-    borderRadius: "14px",
-    background: "rgba(15, 23, 42, 0.55)",
-    color: "#e5eefb",
-    fontSize: "14px",
-    lineHeight: 1.8,
-    textAlign: "left",
-  }}
->
-  <div
-    style={{
-      marginBottom: "12px",
-      fontSize: "17px",
-      fontWeight: "700",
-      color: "#ffffff",
-    }}
-  >
-    購入前の確認事項
-  </div>
 
-  <div style={{ marginBottom: "12px" }}>
-    <strong>商品名</strong>
-    <br />
-    舟券アカデミア予想ツール 2026年版
-  </div>
+      <div style={{ margin: "18px 0 14px", padding: 16, border: "1px solid rgba(115,217,255,.35)", borderRadius: 14, background: "rgba(8,21,38,.72)", color: "#e5eefb", fontSize: 13, lineHeight: 1.75, textAlign: "left" }}>
+        <div style={{ marginBottom: 12, fontSize: 17, fontWeight: 900, color: "#ffffff" }}>購入前の確認事項</div>
+        <div style={{ marginBottom: 10 }}><b>商品名</b><br />舟券アカデミア予想ツール 2026年版</div>
+        <div style={{ marginBottom: 10 }}><b>販売価格</b><br />4,000円（税込）<br />古参クーポン適用時は3,000円（税込）</div>
+        <div style={{ marginBottom: 10 }}><b>販売期間</b><br />2026年7月10日0時00分〜2026年8月13日23時59分</div>
+        <div style={{ marginBottom: 10 }}><b>サービスの提供時期</b><br />決済完了後、購入時に使用したGoogleアカウントでログインすることで、原則として直ちに利用できます。</div>
+        <div style={{ marginBottom: 10 }}><b>利用期限</b><br />2026年12月31日23時59分まで</div>
+        <div style={{ marginBottom: 10 }}><b>キャンセル・返金</b><br />購入者都合によるキャンセルおよび返金はできません。決済完了後も利用権が反映されず、当方で確認・対応を行っても利用できない場合に限り、決済日から3日以内のお申し出により返金します。</div>
+        <div><b>データ保存</b><br />予想履歴・収支記録は利用端末のブラウザ内に保存されます。端末変更やブラウザデータ削除等によるデータ消失、端末間の引き継ぎおよび復元には対応していません。</div>
+      </div>
 
-  <div style={{ marginBottom: "12px" }}>
-    <strong>販売価格</strong>
-    <br />
-    4,000円（税込）
-    <br />
-    古参クーポン適用時は3,000円（税込）
-  </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 14px", margin: "0 0 14px", fontSize: 12, lineHeight: 1.7 }}>
+        <a href="/tokushoho.html" target="_blank" rel="noreferrer" style={linkStyle}>特定商取引法に基づく表記</a>
+        <a href="/terms.html" target="_blank" rel="noreferrer" style={linkStyle}>利用規約</a>
+        <a href="/privacy.html" target="_blank" rel="noreferrer" style={linkStyle}>プライバシーポリシー</a>
+      </div>
 
-  <div style={{ marginBottom: "12px" }}>
-    <strong>販売期間</strong>
-    <br />
-    2026年7月10日0時00分から
-    <br />
-    2026年8月13日23時59分まで
-  </div>
+      <label style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: 12, border: "1px solid #365877", borderRadius: 12, background: "#0e1b2c", color: "#dce8f4", fontSize: 13, lineHeight: 1.65, cursor: "pointer" }}>
+        <input type="checkbox" checked={purchaseAgreed} onChange={(e) => setPurchaseAgreed(e.target.checked)} style={{ width: 20, height: 20, marginTop: 2, flex: "0 0 auto" }} />
+        <span>利用規約、プライバシーポリシー、返金条件およびデータ保存に関する注意事項を確認し、同意します。</span>
+      </label>
 
-  <div style={{ marginBottom: "12px" }}>
-    <strong>サービスの提供時期</strong>
-    <br />
-    決済完了後、購入時に使用したGoogleアカウントでログインすることで、
-    原則として直ちに利用できます。
-  </div>
-
-  <div style={{ marginBottom: "12px" }}>
-    <strong>利用期限</strong>
-    <br />
-    2026年12月31日23時59分まで
-  </div>
-
-  <div style={{ marginBottom: "12px" }}>
-    <strong>キャンセル・返金</strong>
-    <br />
-    購入者都合によるキャンセルおよび返金はできません。
-    <br />
-    ただし、決済完了後も利用権が反映されず、当方で確認・対応を行っても
-    利用できない場合に限り、決済日から3日以内のお申し出により返金します。
-  </div>
-
-  <div>
-    <strong>データ保存</strong>
-    <br />
-    予想履歴および収支記録は、利用端末のブラウザ内に保存されます。
-    端末変更、ブラウザデータの削除、プライベートブラウズの利用等による
-    データ消失、端末間の引き継ぎおよび復元には対応していません。
-  </div>
-</div>
-      
-      <button onClick={onPurchase} style={buyBtn}>購入手続きへ進む</button>
+      <button onClick={onPurchase} disabled={!canPurchase} style={buyBtn}>購入手続きへ進む</button>
+      {!purchaseAgreed ? <p style={{ color: "#9db5cc", fontSize: 11, lineHeight: 1.6, margin: "8px 0 0" }}>上の確認欄にチェックすると、購入手続きへ進めます。</p> : null}
       <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 12 }}>
         決済完了後、Stripe Webhook が <b>paid_users</b> にこのGoogleメールを自動追加します。購入は1人1回まで、利用期限は2026/12/31 23:59までです。古参クーポンはStripe決済画面で入力できます。
       </p>
@@ -7198,7 +7156,7 @@ export default function App() {
           ・本ツールのコード改変、複製、再配布、転売、貸与を禁止します。<br />
           ・本ツールの内容・画面・ロジックを無断で公開、配布、販売する行為を禁じます。<br />
           ・舟券アカデミアに無断での商用利用（販売・有料配布・収益目的での再公開など）を固く禁じます。<br />
-          ・本ツールは的中を保証するものではありません。舟券の購入は自己責任でお願いします。<br />
+          ・本ツールは的中を保証するものではありません。舟券の購入は自己責任でお願いします。予想履歴・収支記録は利用端末のブラウザ内に保存され、端末変更、ブラウザデータ消去、プライベートブラウズ、端末故障等で消失する場合があります。端末間同期・クラウドバックアップ・消失記録の復元には対応していません。<br />
           <div style={{ marginTop: 6, textAlign: "right", color: "#4a5d70" }}>
             © 舟券アカデミア
           </div>
