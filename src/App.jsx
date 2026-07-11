@@ -4648,6 +4648,10 @@ export default function App() {
     autoMsg && /エラー|不足|失敗|failed|error/i.test(autoMsg) ? autoMsg : null,
   ].filter(Boolean);
   const systemReady = !!venue && !systemErrors.length && (stTable || racerStats || kimari || nigeSim || result);
+  const currentRaceDataReady = !!venue
+    && !!raceNo
+    && Object.keys(racerProfiles || {}).length >= 6
+    && hasCompleteAutoStaticData(venue);
 
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     return <AuthGateScreen mode="config" authMsg={authMsg} />;
@@ -4717,7 +4721,7 @@ export default function App() {
               {autoLoading ? "更新中…" : "次R更新"}
             </button>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 6 }}>
             {VENUE_ORDER.map((v) => {
               const selected = venue === v;
               const autoOk = AUTO_FETCH_VENUES.includes(v);
@@ -4743,7 +4747,7 @@ export default function App() {
                   disabled={disabled}
                   title={disabled ? `${v}は本日未開催です` : `${v}を選択`}
                   style={{
-                    minHeight: 96,
+                    minHeight: 92,
                     padding: 0,
                     borderRadius: 8,
                     cursor: disabled ? "not-allowed" : "pointer",
@@ -4764,21 +4768,22 @@ export default function App() {
                 >
                   <div style={{
                     display: "flex", alignItems: "center", justifyContent: "center",
-                    padding: "8px 7px", background: disabled ? "rgba(255,255,255,0.04)" : "rgba(113,143,190,0.18)",
+                    padding: "7px 3px", background: disabled ? "rgba(255,255,255,0.04)" : "rgba(113,143,190,0.18)",
                     borderBottom: "1px solid rgba(255,255,255,0.06)",
                   }}>
-                    <span style={{ textAlign: "center", fontSize: 17, fontWeight: 900, lineHeight: 1.1 }}>{v}</span>
+                    <span style={{ textAlign: "center", fontSize: 15, fontWeight: 900, lineHeight: 1.1, whiteSpace: "nowrap" }}>{v}</span>
                   </div>
-                  <div style={{ padding: "8px 7px 9px", textAlign: "center" }}>
-                    <div style={{ fontSize: 11, color: disabled ? "#8b9198" : "#c4d3e6", fontWeight: 800, minHeight: 18 }}>
+                  <div style={{ padding: "6px 3px 7px", textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: disabled ? "#8b9198" : "#c4d3e6", fontWeight: 800, minHeight: 16, whiteSpace: "nowrap" }}>
                       {heldText}
                     </div>
                     <div style={{
                       marginTop: 5,
-                      fontSize: noRace || allClosed ? 12 : 14,
+                      fontSize: noRace || allClosed ? 11 : 12,
                       color: noRace ? "#9ba0a5" : allClosed ? "#ffd28a" : "#fff",
                       fontWeight: 900,
-                      letterSpacing: "0.02em",
+                      letterSpacing: 0,
+                      whiteSpace: "nowrap",
                     }}>{raceLine}</div>
                   </div>
                 </button>
@@ -4972,11 +4977,12 @@ export default function App() {
         }}>
           <div style={{
             padding: "9px 12px", borderRadius: 10,
-            background: "#123326", color: "#7ee2aa",
+            background: currentRaceDataReady ? "#123326" : "#16273c",
+            color: currentRaceDataReady ? "#7ee2aa" : "#9db5cc",
             fontSize: 12, fontWeight: 700,
-            border: "1px solid #1c7047",
+            border: currentRaceDataReady ? "1px solid #1c7047" : "1px solid #2c4762",
           }}>
-            ✓ データ取得済
+            {currentRaceDataReady ? "✓ データ取得済" : "未取得"}
           </div>
           <button
             onClick={allClear}
@@ -4989,15 +4995,19 @@ export default function App() {
             🗑 オールクリア
           </button>
         </div>
-        {(autoMsg || systemReady || systemErrors.length > 0) && (
+        {(autoMsg || currentRaceDataReady || systemErrors.length > 0) && (
           <div style={{
             margin: "-2px 0 10px", padding: "8px 10px", borderRadius: 8,
-            background: systemErrors.length ? "#3a2030" : "#123326",
-            color: systemErrors.length ? "#ff8a80" : "#7ee2aa",
-            border: systemErrors.length ? "1px solid #5e2d3a" : "1px solid #1c7047",
+            background: systemErrors.length ? "#3a2030" : currentRaceDataReady ? "#123326" : "#16273c",
+            color: systemErrors.length ? "#ff8a80" : currentRaceDataReady ? "#7ee2aa" : "#9db5cc",
+            border: systemErrors.length ? "1px solid #5e2d3a" : currentRaceDataReady ? "1px solid #1c7047" : "1px solid #2c4762",
             fontSize: 12, fontWeight: 700,
           }}>
-            {systemErrors.length ? systemErrors.join(" ／ ") : `✓ ${venue || ""}${raceNo || ""}R データ取得済`}
+            {systemErrors.length
+              ? systemErrors.join(" ／ ")
+              : currentRaceDataReady
+                ? `✓ ${venue || ""}${raceNo || ""}R データ取得済`
+                : (autoMsg || "未取得")}
           </div>
         )}
 
@@ -5026,7 +5036,7 @@ export default function App() {
           {stTable ? (
             <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ データ取得済</span>
           ) : systemErrors.length ? null : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>取得待ち</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>未取得</span>
           )}
         </div>
 
@@ -5054,7 +5064,7 @@ export default function App() {
           ) : systemErrors.length ? (
             <span style={{ fontSize: 11, color: "#ff8a80" }}>{systemErrors.find((x) => String(x).includes("選手成績")) || "取得エラー"}</span>
           ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>取得待ち</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>未取得</span>
           )}
         </div>
 
@@ -5080,14 +5090,14 @@ export default function App() {
           {kimari ? (
             <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ データ取得済</span>
           ) : systemErrors.length ? null : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>取得待ち</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>未取得</span>
           )}
           {nigeSim ? (
             <span style={{ fontSize: 11, color: "#5dd39e" }}>✓ データ取得済</span>
           ) : systemErrors.length ? (
             <span style={{ fontSize: 11, color: "#ff8a80" }}>{systemErrors.find((x) => String(x).includes("逃げ")) || "取得エラー"}</span>
           ) : (
-            <span style={{ fontSize: 11, color: "#7da3c8" }}>取得待ち</span>
+            <span style={{ fontSize: 11, color: "#7da3c8" }}>未取得</span>
           )}
         </div>
 
@@ -5725,45 +5735,13 @@ export default function App() {
                         gap: 8,
                       }}
                     >
-                      <span
-                        style={{
-                          width: 124,
-                          fontSize: 11,
-                          color: "#cfe0f0",
-                          fontWeight: 700,
-                          whiteSpace: "nowrap",
-                        }}
-                      >
+                      <span style={{ width: 124, fontSize: 11, color: "#cfe0f0", fontWeight: 700, whiteSpace: "nowrap" }}>
                         {p.k.replace("(", "（").replace(")", "号艇）")}
                       </span>
-                      <div
-                        style={{
-                          width: "100%",
-                          height: 10,
-                          background: "#0e1b2c",
-                          borderRadius: 999,
-                          overflow: "hidden",
-                          position: "relative",
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: `${Math.min(100, p.pct)}%`,
-                            height: "100%",
-                            background: "linear-gradient(90deg, #74c4ea 0%, #96defa 100%)",
-                            borderRadius: 999,
-                          }}
-                        />
+                      <div style={{ width: "100%", height: 10, background: "#0e1b2c", borderRadius: 999, overflow: "hidden" }}>
+                        <div style={{ width: `${Math.min(100, p.pct)}%`, height: "100%", background: "linear-gradient(90deg, #74c4ea 0%, #96defa 100%)", borderRadius: 999 }} />
                       </div>
-                      <span
-                        style={{
-                          fontSize: 11,
-                          color: "#f5c518",
-                          fontVariantNumeric: "tabular-nums",
-                          width: 52,
-                          textAlign: "right",
-                        }}
-                      >
+                      <span style={{ width: 52, fontSize: 11, color: "#f5c518", fontVariantNumeric: "tabular-nums", textAlign: "right" }}>
                         {p.pct.toFixed(1)}%
                       </span>
                     </div>
