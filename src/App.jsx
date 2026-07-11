@@ -178,6 +178,82 @@ function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, o
       <div style={{ background: "#0e1b2c", border: "1px solid #284766", borderRadius: 10, padding: 12, fontWeight: 800, wordBreak: "break-all" }}>{email || "不明"}</div>
       <p style={{ color: "#ffb4a8", lineHeight: 1.8, fontSize: 13 }}>{entitlement?.reason || "購入者リストに登録されていません。"}</p>
       {authMsg ? <p style={{ color: "#ffd166", background: "#0e1b2c", border: "1px solid #8a6f2c", borderRadius: 10, padding: 10, fontSize: 12, lineHeight: 1.7, wordBreak: "break-word" }}>{authMsg}</p> : null}
+      <div
+  style={{
+    margin: "18px 0",
+    padding: "16px",
+    border: "1px solid rgba(148, 163, 184, 0.35)",
+    borderRadius: "14px",
+    background: "rgba(15, 23, 42, 0.55)",
+    color: "#e5eefb",
+    fontSize: "14px",
+    lineHeight: 1.8,
+    textAlign: "left",
+  }}
+>
+  <div
+    style={{
+      marginBottom: "12px",
+      fontSize: "17px",
+      fontWeight: "700",
+      color: "#ffffff",
+    }}
+  >
+    購入前の確認事項
+  </div>
+
+  <div style={{ marginBottom: "12px" }}>
+    <strong>商品名</strong>
+    <br />
+    舟券アカデミア予想ツール 2026年版
+  </div>
+
+  <div style={{ marginBottom: "12px" }}>
+    <strong>販売価格</strong>
+    <br />
+    4,000円（税込）
+    <br />
+    古参クーポン適用時は3,000円（税込）
+  </div>
+
+  <div style={{ marginBottom: "12px" }}>
+    <strong>販売期間</strong>
+    <br />
+    2026年7月10日0時00分から
+    <br />
+    2026年8月13日23時59分まで
+  </div>
+
+  <div style={{ marginBottom: "12px" }}>
+    <strong>サービスの提供時期</strong>
+    <br />
+    決済完了後、購入時に使用したGoogleアカウントでログインすることで、
+    原則として直ちに利用できます。
+  </div>
+
+  <div style={{ marginBottom: "12px" }}>
+    <strong>利用期限</strong>
+    <br />
+    2026年12月31日23時59分まで
+  </div>
+
+  <div style={{ marginBottom: "12px" }}>
+    <strong>キャンセル・返金</strong>
+    <br />
+    購入者都合によるキャンセルおよび返金はできません。
+    <br />
+    ただし、決済完了後も利用権が反映されず、当方で確認・対応を行っても
+    利用できない場合に限り、決済日から3日以内のお申し出により返金します。
+  </div>
+
+  <div>
+    <strong>データ保存</strong>
+    <br />
+    予想履歴および収支記録は、利用端末のブラウザ内に保存されます。
+    端末変更、ブラウザデータの削除、プライベートブラウズの利用等による
+    データ消失、端末間の引き継ぎおよび復元には対応していません。
+  </div>
+</div>
       <button onClick={onPurchase} style={buyBtn}>購入手続きへ進む</button>
       <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 12 }}>
         決済完了後、Stripe Webhook が <b>paid_users</b> にこのGoogleメールを自動追加します。購入は1人1回まで、利用期限は2026/12/31 23:59までです。古参クーポンはStripe決済画面で入力できます。
