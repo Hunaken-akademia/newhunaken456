@@ -254,6 +254,7 @@ function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, o
     データ消失、端末間の引き継ぎおよび復元には対応していません。
   </div>
 </div>
+      
       <button onClick={onPurchase} style={buyBtn}>購入手続きへ進む</button>
       <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 12 }}>
         決済完了後、Stripe Webhook が <b>paid_users</b> にこのGoogleメールを自動追加します。購入は1人1回まで、利用期限は2026/12/31 23:59までです。古参クーポンはStripe決済画面で入力できます。
