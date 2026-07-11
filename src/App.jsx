@@ -4717,7 +4717,7 @@ export default function App() {
               {autoLoading ? "更新中…" : "次R更新"}
             </button>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
             {VENUE_ORDER.map((v) => {
               const selected = venue === v;
               const autoOk = AUTO_FETCH_VENUES.includes(v);
@@ -4743,7 +4743,7 @@ export default function App() {
                   disabled={disabled}
                   title={disabled ? `${v}は本日未開催です` : `${v}を選択`}
                   style={{
-                    minHeight: 104,
+                    minHeight: 96,
                     padding: 0,
                     borderRadius: 8,
                     cursor: disabled ? "not-allowed" : "pointer",
@@ -4767,15 +4767,15 @@ export default function App() {
                     padding: "8px 7px", background: disabled ? "rgba(255,255,255,0.04)" : "rgba(113,143,190,0.18)",
                     borderBottom: "1px solid rgba(255,255,255,0.06)",
                   }}>
-                    <span style={{ textAlign: "center", fontSize: 19, fontWeight: 900, lineHeight: 1.1 }}>{v}</span>
+                    <span style={{ textAlign: "center", fontSize: 17, fontWeight: 900, lineHeight: 1.1 }}>{v}</span>
                   </div>
                   <div style={{ padding: "8px 7px 9px", textAlign: "center" }}>
-                    <div style={{ fontSize: 12, color: disabled ? "#8b9198" : "#c4d3e6", fontWeight: 800, minHeight: 20 }}>
+                    <div style={{ fontSize: 11, color: disabled ? "#8b9198" : "#c4d3e6", fontWeight: 800, minHeight: 18 }}>
                       {heldText}
                     </div>
                     <div style={{
                       marginTop: 5,
-                      fontSize: noRace || allClosed ? 13 : 15,
+                      fontSize: noRace || allClosed ? 12 : 14,
                       color: noRace ? "#9ba0a5" : allClosed ? "#ffd28a" : "#fff",
                       fontWeight: 900,
                       letterSpacing: "0.02em",
@@ -5714,14 +5714,56 @@ export default function App() {
                   各艇の平均ST・F持ち・進入・当日評価から、スタート隊形を{tenkaiRehearsal.iters}回シミュレート。
                   「レースがどう動きやすいか」の出現率です。
                 </div>
-                <div style={{ display: "grid", gap: 4 }}>
+                <div style={{ display: "grid", gap: 6 }}>
                   {tenkaiRehearsal.patterns.slice(0, 6).map((p) => (
-                    <div key={p.k} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{ fontSize: 11, color: "#cfe0f0", fontWeight: 700, minWidth: 100 }}>{p.k.replace("(", "（").replace(")", "号艇）")}</span>
-                      <div style={{ flex: 1, height: 8, background: "#0e1b2c", borderRadius: 4, overflow: "hidden" }}>
-                        <div style={{ width: `${Math.min(100, p.pct)}%`, height: "100%", background: "#7ac8e8" }} />
+                    <div
+                      key={p.k}
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "124px minmax(0, 1fr) 52px",
+                        alignItems: "center",
+                        gap: 8,
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 124,
+                          fontSize: 11,
+                          color: "#cfe0f0",
+                          fontWeight: 700,
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {p.k.replace("(", "（").replace(")", "号艇）")}
+                      </span>
+                      <div
+                        style={{
+                          width: "100%",
+                          height: 10,
+                          background: "#0e1b2c",
+                          borderRadius: 999,
+                          overflow: "hidden",
+                          position: "relative",
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: `${Math.min(100, p.pct)}%`,
+                            height: "100%",
+                            background: "linear-gradient(90deg, #74c4ea 0%, #96defa 100%)",
+                            borderRadius: 999,
+                          }}
+                        />
                       </div>
-                      <span style={{ fontSize: 11, color: "#f5c518", fontVariantNumeric: "tabular-nums", minWidth: 46, textAlign: "right" }}>
+                      <span
+                        style={{
+                          fontSize: 11,
+                          color: "#f5c518",
+                          fontVariantNumeric: "tabular-nums",
+                          width: 52,
+                          textAlign: "right",
+                        }}
+                      >
                         {p.pct.toFixed(1)}%
                       </span>
                     </div>
