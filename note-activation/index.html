@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>note購入者 利用権申請 | 舟券アカデミア</title>
+  <script src="/api/runtime-config.js"></script>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <main class="page">
+    <section class="card">
+      <div class="eyebrow">NOTE PURCHASE ACTIVATION</div>
+      <h1>note購入者<br />利用権申請</h1>
+      <p class="lead">noteで購入したご本人が、舟券アカデミアで使用するGoogleアカウントに利用権を申請するページです。</p>
+
+      <div id="configError" class="notice error hidden"></div>
+
+      <section id="loginSection" class="panel hidden">
+        <h2>1．Googleログイン</h2>
+        <p>有料版で実際に使用するGoogleアカウントを選んでください。申請後の変更は原則できません。</p>
+        <button id="loginButton" class="button primary" type="button">Googleでログイン</button>
+      </section>
+
+      <section id="loadingSection" class="panel">
+        <div class="spinner"></div>
+        <p>ログイン状態を確認しています…</p>
+      </section>
+
+      <section id="formSection" class="hidden">
+        <div class="accountBox">
+          <div>
+            <span>申請するGoogleアカウント</span>
+            <strong id="userEmail"></strong>
+          </div>
+          <button id="logoutButton" class="textButton" type="button">ログアウト</button>
+        </div>
+
+        <div id="currentStatus" class="notice hidden"></div>
+
+        <form id="applicationForm" novalidate>
+          <section class="panel">
+            <h2>2．購入情報</h2>
+
+            <label>
+              購入した記事
+              <select id="saleTier" required>
+                <option value="regular_4000">通常版 4,000円</option>
+                <option value="veteran_3000">古参向け 3,000円</option>
+              </select>
+            </label>
+
+            <label>
+              noteの購入者名
+              <input id="noteBuyerName" type="text" maxlength="80" autocomplete="name" placeholder="note上に表示される購入者名" required />
+            </label>
+
+            <label>
+              購入日時
+              <input id="purchasedAt" type="datetime-local" required />
+            </label>
+          </section>
+
+          <section class="panel">
+            <h2>3．購入証明</h2>
+            <p class="help">noteの購入完了画面、または購入履歴が確認できる画面を添付してください。画像は非公開で保存され、審査以外には使用しません。</p>
+            <label class="filePicker">
+              <input id="proofFile" type="file" accept="image/jpeg,image/png,image/webp,application/pdf" required />
+              <span id="fileLabel">購入証明を選択</span>
+            </label>
+            <p class="small">JPEG・PNG・WebP・PDF／5MB以内</p>
+          </section>
+
+          <label class="checkRow">
+            <input id="declaration" type="checkbox" />
+            <span>この購入証明は私自身がnoteで購入した正規の購入情報です。</span>
+          </label>
+
+          <button id="submitButton" class="button success" type="submit" disabled>申請を送信する</button>
+          <div id="submitMessage" class="notice hidden"></div>
+        </form>
+      </section>
+
+      <section id="successSection" class="panel successPanel hidden">
+        <h2>申請を受け付けました</h2>
+        <p>購入証明を確認後、管理者が承認します。承認後は、申請したGoogleアカウントで有料版を開けます。</p>
+        <a class="button primary linkButton" href="/">舟券アカデミアへ戻る</a>
+      </section>
+
+      <footer>
+        <p>利用期限：2026年12月31日 23:59まで</p>
+        <p>本サービスは予想検討を補助するツールであり、的中や利益を保証するものではありません。</p>
+      </footer>
+    </section>
+  </main>
+  <script type="module" src="./app.js?v=20260712-1"></script>
+</body>
+</html>
