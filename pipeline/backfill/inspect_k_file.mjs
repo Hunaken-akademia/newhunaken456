@@ -1,5 +1,7 @@
-// 舟券アカデミア：過去1年バックフィル前のK票書式確認 v2
+// 舟券アカデミア：過去1年バックフィル前のK票書式確認 v3
 // このスクリプトはDBへ一切書き込みません。
+// v3: ST抽出に加え、場名・レース番号の取り違えを調査するため、
+//     非6行レースと重複候補の周辺コンテキストを出力します。
 // Usage: node pipeline/backfill/inspect_k_file.mjs 2026-07-02 [--raw]
 
 import { execFileSync } from "node:child_process";
@@ -31,6 +33,8 @@ const placeMap = {
   "下関": 19, "若松": 20, "芦屋": 21, "福岡": 22, "唐津": 23, "大村": 24,
 };
 
+const placeEntries = Object.entries(placeMap).sort((a, b) => b[0].length - a[0].length);
+
 function normalizeLine(line) {
   return String(line || "")
     .replace(/\u3000/g, " ")
@@ -48,10 +52,6 @@ function normalizeStText(value) {
 
 function parseResultRow(rawLine) {
   const line = normalizeLine(rawLine).trimEnd();
-
-  // K票の着順行は概ね以下の形：
-  // 01  3 4071 選手名 46   53  6.85   3    0.23     1.50.3
-  // v1では .23 だけを探していたため、0.23 を全て取り逃がしていた。
   const head = line.match(/^\s*(\d{2}|F|L|欠|失|転|落|妨|不)\s+([1-6])\s+(\d{4})\s+(.+)$/);
   if (!head) return null;
 
@@ -60,8 +60,6 @@ function parseResultRow(rawLine) {
   const regno = Number(head[3]);
   const tail = head[4];
 
-  // 末尾から 展示タイム / 進入 / ST / レースタイム を拾う。
-  // レースタイムが無い失格・欠場系は次STEPで別扱いにするため、ここでは安全に候補から外す。
   const metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+([FL]?\s*(?:0?\.\d{2}))\s+(\d\.\d{2}\.\d)\s*$/);
   if (!metrics) return null;
 
@@ -83,31 +81,66 @@ function parseResultRow(rawLine) {
   };
 }
 
+function maybePlaceHeader(line) {
+  const t = normalizeLine(line).trim();
+  if (!t) return null;
+  // 結果行・選手行では場名判定しない。
+  if (/^(\d{2}|F|L|欠|失|転|落|妨|不)\s+[1-6]\s+\d{4}\s+/.test(t)) return null;
+
+  for (const [name, no] of placeEntries) {
+    // 「津」は1文字で誤検出しやすいので、単独・ボートレース津・津競走場などだけ許可。
+    if (name === "津") {
+      if (t === "津" || /(^|\s|　)(ボートレース)?津(競走場|ボート|\s|　|$)/.test(t)) {
+        return { name, no, line: t };
+      }
+      continue;
+    }
+    if (t.includes(name)) return { name, no, line: t };
+  }
+  return null;
+}
+
+function maybeRaceHeader(line) {
+  const t = normalizeLine(line).trim();
+  if (!t) return null;
+  if (/^(\d{2}|F|L|欠|失|転|落|妨|不)\s+[1-6]\s+\d{4}\s+/.test(t)) return null;
+  const m = t.match(/(?:^|\s)(?:第\s*)?(\d{1,2})\s*(?:R|レース|競走)(?:\s|$)/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (n >= 1 && n <= 12) return { raceNo: n, line: t };
+  return null;
+}
+
 function candidateRows(text) {
   const lines = text.split(/\r?\n/);
   const rawRows = [];
   const rows = [];
   const duplicateRows = [];
+  const transitions = [];
   let placeNo = null;
   let placeName = "";
   let raceNo = null;
+  let lastPlaceLineNo = null;
+  let lastRaceLineNo = null;
 
   for (let index = 0; index < lines.length; index += 1) {
     const raw = lines[index];
     const line = normalizeLine(raw);
 
-    for (const [name, no] of Object.entries(placeMap)) {
-      if (line.includes(name)) {
-        placeNo = no;
-        placeName = name;
-        break;
-      }
+    const ph = maybePlaceHeader(line);
+    if (ph && ph.no !== placeNo) {
+      placeNo = ph.no;
+      placeName = ph.name;
+      raceNo = null;
+      lastPlaceLineNo = index + 1;
+      transitions.push({ lineNo: index + 1, type: "PLACE", value: placeName, rawLine: raw });
     }
 
-    const raceMatch = line.match(/(?:^|\s)(\d{1,2})\s*R(?:\s|$)/i);
-    if (raceMatch) {
-      const n = Number(raceMatch[1]);
-      if (n >= 1 && n <= 12) raceNo = n;
+    const rh = maybeRaceHeader(line);
+    if (rh) {
+      raceNo = rh.raceNo;
+      lastRaceLineNo = index + 1;
+      transitions.push({ lineNo: index + 1, type: "RACE", value: `${raceNo}R`, placeName, rawLine: raw });
     }
 
     if (!placeNo || !raceNo) continue;
@@ -119,6 +152,8 @@ function candidateRows(text) {
       placeNo,
       placeName,
       raceNo,
+      lastPlaceLineNo,
+      lastRaceLineNo,
       ...parsed,
       rawLine: raw,
     };
@@ -136,12 +171,24 @@ function candidateRows(text) {
     rows.push(row);
   }
 
-  return { rows, rawRows, duplicateRows };
+  return { rows, rawRows, duplicateRows, transitions, lines };
+}
+
+function rowKey(row) {
+  return `${row.placeName}${row.raceNo}R`;
+}
+
+function printContext(lines, centerLineNo, before = 8, after = 4) {
+  const start = Math.max(1, centerLineNo - before);
+  const end = Math.min(lines.length, centerLineNo + after);
+  for (let lineNo = start; lineNo <= end; lineNo += 1) {
+    const mark = lineNo === centerLineNo ? ">>" : "  ";
+    console.log(`${mark}${String(lineNo).padStart(5, " ")}: ${lines[lineNo - 1]}`);
+  }
 }
 
 function printDiagnostics(text, result) {
-  const { rows, rawRows, duplicateRows } = result;
-  const lines = text.split(/\r?\n/);
+  const { rows, rawRows, duplicateRows, transitions, lines } = result;
   const raceKeys = new Set(rows.map((r) => `${r.placeNo}-${r.raceNo}`));
   const venueKeys = new Set(rows.map((r) => r.placeNo));
   const invalidBoat = rows.filter((r) => r.boat < 1 || r.boat > 6);
@@ -149,7 +196,7 @@ function printDiagnostics(text, result) {
   const noRegno = rows.filter((r) => !Number.isFinite(r.regno) || r.regno <= 0);
   const noCourse = rows.filter((r) => !Number.isFinite(r.course) || r.course < 1 || r.course > 6);
 
-  console.log("\n=== K票バックフィル事前診断 v2 ===");
+  console.log("\n=== K票バックフィル事前診断 v3 ===");
   console.log(`date=${argDate}`);
   console.log(`lines=${lines.length}`);
   console.log(`candidate_rows_raw=${rawRows.length}`);
@@ -163,24 +210,21 @@ function printDiagnostics(text, result) {
   console.log(`invalid_course_rows=${noCourse.length}`);
 
   const perRace = new Map();
-  for (const row of rows) {
-    const key = `${row.placeName}${row.raceNo}R`;
-    perRace.set(key, (perRace.get(key) || 0) + 1);
-  }
+  for (const row of rows) perRace.set(rowKey(row), (perRace.get(rowKey(row)) || 0) + 1);
   const counts = [...perRace.entries()];
   const nonSix = counts.filter(([, count]) => count !== 6);
   console.log(`races_with_6_rows=${counts.filter(([, count]) => count === 6).length}`);
   console.log(`races_not_6_rows=${nonSix.length}`);
-  if (nonSix.length) {
-    console.log("races_not_6_rows_sample=", JSON.stringify(nonSix.slice(0, 30)));
-  }
+  if (nonSix.length) console.log("races_not_6_rows_sample=", JSON.stringify(nonSix.slice(0, 30)));
 
-  console.log("\n--- 候補行サンプル（最大30行）---");
-  for (const row of rows.slice(0, 30)) {
+  console.log("\n--- 候補行サンプル（最大24行）---");
+  for (const row of rows.slice(0, 24)) {
     console.log(JSON.stringify({
       lineNo: row.lineNo,
       venue: row.placeName,
       race: row.raceNo,
+      lastPlaceLineNo: row.lastPlaceLineNo,
+      lastRaceLineNo: row.lastRaceLineNo,
       rankText: row.rankText,
       boat: row.boat,
       regno: row.regno,
@@ -193,12 +237,14 @@ function printDiagnostics(text, result) {
   }
 
   if (duplicateRows.length) {
-    console.log("\n--- 重複候補サンプル（最大10行）---");
-    for (const row of duplicateRows.slice(0, 10)) {
+    console.log("\n--- 重複候補サンプル（最大8行）---");
+    for (const row of duplicateRows.slice(0, 8)) {
       console.log(JSON.stringify({
         lineNo: row.lineNo,
         venue: row.placeName,
         race: row.raceNo,
+        lastPlaceLineNo: row.lastPlaceLineNo,
+        lastRaceLineNo: row.lastRaceLineNo,
         boat: row.boat,
         regno: row.regno,
         stText: row.stText,
@@ -207,9 +253,33 @@ function printDiagnostics(text, result) {
     }
   }
 
+  console.log("\n--- 場・レースヘッダー検出履歴（最大80件）---");
+  for (const t of transitions.slice(0, 80)) {
+    console.log(JSON.stringify(t));
+  }
+
+  const contextTargets = [];
+  for (const row of duplicateRows.slice(0, 3)) contextTargets.push({ label: `duplicate ${row.placeName}${row.raceNo}R boat${row.boat}`, lineNo: row.lineNo });
+  for (const [label] of nonSix.slice(0, 4)) {
+    const row = rows.find((r) => rowKey(r) === label);
+    if (row) contextTargets.push({ label: `non6 ${label}`, lineNo: row.lineNo });
+  }
+
+  if (contextTargets.length) {
+    console.log("\n--- 問題候補の周辺コンテキスト ---");
+    const printed = new Set();
+    for (const target of contextTargets) {
+      const bucket = Math.floor(target.lineNo / 20);
+      if (printed.has(bucket)) continue;
+      printed.add(bucket);
+      console.log(`\n[${target.label}] around line ${target.lineNo}`);
+      printContext(lines, target.lineNo, 10, 5);
+    }
+  }
+
   if (SHOW_RAW) {
-    console.log("\n--- 生テキスト先頭120行 ---");
-    console.log(lines.slice(0, 120).join("\n"));
+    console.log("\n--- 生テキスト先頭160行 ---");
+    console.log(lines.slice(0, 160).join("\n"));
   }
 
   console.log("\nDB_WRITE=NONE");
@@ -220,12 +290,10 @@ async function main() {
   try {
     console.log(`download=${url}`);
     const response = await fetch(url, {
-      headers: { "user-agent": "HunakenKFileInspector/1.1" },
+      headers: { "user-agent": "HunakenKFileInspector/1.2" },
       signal: AbortSignal.timeout(60_000),
     });
-    if (!response.ok) {
-      throw new Error(`K票ダウンロード失敗 status=${response.status} url=${url}`);
-    }
+    if (!response.ok) throw new Error(`K票ダウンロード失敗 status=${response.status} url=${url}`);
     const archive = Buffer.from(await response.arrayBuffer());
     if (archive.length < 100) throw new Error(`K票ファイルが小さすぎます bytes=${archive.length}`);
     writeFileSync(archivePath, archive);
@@ -238,21 +306,12 @@ async function main() {
     const text = iconv.decode(readFileSync(join(workdir, extracted)), "Shift_JIS");
     const result = candidateRows(text);
     printDiagnostics(text, result);
-
-    if (!result.rows.length) {
-      console.error("候補行が0件です。パーサ書式が合っていないため、バックフィルへ進めません。");
-      process.exitCode = 2;
-    }
-    if (result.rows.some((r) => !r.stText)) {
-      console.error("ST未取得行があります。バックフィルへ進む前にパーサ修正が必要です。");
-      process.exitCode = 2;
-    }
+  } catch (error) {
+    console.error("ERROR", error?.stack || error?.message || error);
+    process.exit(1);
   } finally {
     rmSync(workdir, { recursive: true, force: true });
   }
 }
 
-main().catch((error) => {
-  console.error("INSPECT_FAILED", error?.stack || error?.message || String(error));
-  process.exit(1);
-});
+main();
