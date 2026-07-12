@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import iconv from "iconv-lite";
 
-const VERSION = "k-backfill-staging-v5-l0-null-st-fix";
+const VERSION = "k-backfill-staging-v5-l-dot-regex-fix";
 const argDate = process.argv[2];
 const dryArg = process.argv.find((a) => a.startsWith("--dry="));
 const DRY = dryArg ? dryArg.split("=")[1] !== "false" : true;
@@ -148,7 +148,7 @@ function parseResultLine(line) {
 
   // K票は5・6着などでレースタイムが「.  .」になることがあります。
   // 平均ST・コース別STでは、レースタイムが無くてもSTと進入があれば必要です。
-  const metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+([FLfl]?\s*(?:(?:\d\.\d{2})|(?:0?\.\d{2})))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/i);
+  const metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+((?:[FLfl]\s*\.)|(?:[FLfl]?\s*(?:(?:\d\.\d{2})|(?:0?\.\d{2}))))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/i);
   if (!metrics) return null;
 
   const beforeMetrics = tail.slice(0, metrics.index).trimEnd();
