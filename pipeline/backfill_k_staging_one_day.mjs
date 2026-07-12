@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import iconv from "iconv-lite";
 
-const VERSION = "k-backfill-staging-v1";
+const VERSION = "k-backfill-staging-v2-parser-parity";
 const argDate = process.argv[2];
 const dryArg = process.argv.find((a) => a.startsWith("--dry="));
 const DRY = dryArg ? dryArg.split("=")[1] !== "false" : true;
@@ -80,9 +80,15 @@ function parseSt(stText) {
 
 function resultStatusFromRankAndSt(rankText, stText) {
   const r = String(rankText || "").trim().toUpperCase();
-  const st = String(stText || "").trim().toUpperCase();
+  const st = String(stText || "").trim().toUpperCase().replace(/\s+/g, "");
   if (r.startsWith("F") || st.startsWith("F")) return "F";
   if (r.startsWith("L") || st.startsWith("L")) return "L";
+  if (r.startsWith("欠")) return "ABSENT";
+  if (r.startsWith("失")) return "DISQUALIFIED";
+  if (r.startsWith("転")) return "CAPSIZED";
+  if (r.startsWith("落")) return "FELL";
+  if (r.startsWith("妨")) return "OBSTRUCTION";
+  if (r.startsWith("不")) return "DID_NOT_FINISH";
   if (r.startsWith("S")) return "OTHER";
   if (/^\d{2}$/.test(r)) return "NORMAL";
   return "UNKNOWN";
@@ -90,14 +96,66 @@ function resultStatusFromRankAndSt(rankText, stText) {
 
 function isAverageStEligible(rankText, stText) {
   const status = resultStatusFromRankAndSt(rankText, stText);
-  // F/Lや特殊失格行は通常平均STから除外する前提。STそのものは監査用に保存する。
-  return status === "NORMAL";
+  // F/Lはフライング・出遅れのため通常平均STから除外。
+  // S/失格/転覆/落水などは、STが記録されていればスタート済みとして候補に残す。
+  return Boolean(stText) && status !== "F" && status !== "L";
 }
 
 function finishOrderFromRank(rankText, status) {
   if (status !== "NORMAL") return null;
   const n = Number(rankText);
   return Number.isInteger(n) && n >= 1 && n <= 6 ? n : null;
+}
+
+function parseResultLine(line) {
+  // K票の結果行。rankは 01-06 のほか、F0/L0/S0/S1/転/落/失/妨/不 なども拾う。
+  const head = String(line || "").match(/^\s*(\d{2}|F\d?|L\d?|S\d?|欠|失|転|落|妨|不)\s+([1-6])\s+(\d{4})\s+(.+)$/i);
+  if (!head) return null;
+
+  const rankText = String(head[1]).trim().toUpperCase();
+  const boatNo = Number(head[2]);
+  const regno = Number(head[3]);
+  const tail = head[4];
+
+  // K票は5・6着などでレースタイムが「.  .」になることがあります。
+  // 平均ST・コース別STでは、レースタイムが無くてもSTと進入があれば必要です。
+  const metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+([FLfl]?\s*(?:(?:\d\.\d{2})|(?:0?\.\d{2})))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/i);
+  if (!metrics) return null;
+
+  const beforeMetrics = tail.slice(0, metrics.index).trimEnd();
+  const nameMotorBoat = beforeMetrics.match(/^(.+?)\s+(\d{1,3})\s+(\d{1,3})$/);
+  const racerName = nameMotorBoat ? compact(nameMotorBoat[1]) : null;
+  const motorNo = nameMotorBoat ? Number(nameMotorBoat[2]) : null;
+  const boatMotorNo = nameMotorBoat ? Number(nameMotorBoat[3]) : null;
+
+  const exhibitTime = Number(metrics[1]);
+  const course = Number(metrics[2]);
+  const officialStText = normalizeNumberText(String(metrics[3] || "").replace(/\s+/g, ""));
+  const st = parseSt(officialStText);
+  const raceTimeRaw = metrics[4] ? String(metrics[4]).replace(/\s+/g, "") : "";
+  const raceTime = /^\d\.\d{2}\.\d$/.test(raceTimeRaw) ? raceTimeRaw : null;
+  if (!officialStText || st == null) return null;
+
+  const resultStatus = resultStatusFromRankAndSt(rankText, officialStText);
+  const averageStEligible = isAverageStEligible(rankText, officialStText);
+  const finishOrder = finishOrderFromRank(rankText, resultStatus);
+
+  return {
+    rankText,
+    boatNo,
+    regno,
+    racerName,
+    motorNo,
+    boatMotorNo,
+    exhibitTime,
+    course,
+    officialStText,
+    st,
+    raceTime,
+    resultStatus,
+    averageStEligible,
+    finishOrder,
+  };
 }
 
 function parseRows(text, raceDate) {
@@ -140,28 +198,30 @@ function parseRows(text, raceDate) {
       continue;
     }
 
-    // K票の結果行。rankは 01-06 のほか、F0/L0/S0/S1 なども拾う。
-    const m = line.match(/^\s*([0-9]{2}|[A-Za-z][0-9])\s+([1-6])\s+(\d{4})\s+(.+?)\s+(\d{1,3})\s+(\d{1,3})\s+(\d+(?:\.\d+)?)\s+([1-6])\s+([FLfl]?\d+(?:\.\d+)?|\.\d+)\s+((?:\d+\.\d+\.\d+)|\.\s*\.)?/);
-    if (!m) continue;
+    const parsed = parseResultLine(line);
+    if (!parsed) continue;
 
     if (!placeNo || !raceNo) {
       warnings.push({ lineNo, reason: "NO_CONTEXT", rawLine: line });
       continue;
     }
 
-    const rankText = m[1].toUpperCase();
-    const boatNo = Number(m[2]);
-    const regno = Number(m[3]);
-    const racerName = compact(m[4]);
-    const exhibitTime = parseNumeric(m[6 + 1]); // m[7]
-    const course = Number(m[8]);
-    const officialStText = normalizeNumberText(m[9]) || String(m[9] || "").trim();
-    const st = parseSt(officialStText);
-    const raceTimeRaw = m[10] || null;
-    const raceTime = raceTimeRaw && !/^\.\s*\.$/.test(raceTimeRaw) ? raceTimeRaw.trim() : null;
-    const resultStatus = resultStatusFromRankAndSt(rankText, officialStText);
-    const averageStEligible = isAverageStEligible(rankText, officialStText);
-    const finishOrder = finishOrderFromRank(rankText, resultStatus);
+    const {
+      rankText,
+      boatNo,
+      regno,
+      racerName,
+      motorNo,
+      boatMotorNo,
+      exhibitTime,
+      course,
+      officialStText,
+      st,
+      raceTime,
+      resultStatus,
+      averageStEligible,
+      finishOrder,
+    } = parsed;
 
     rows.push({
       race_date: raceDate,
@@ -185,6 +245,8 @@ function parseRows(text, raceDate) {
       raw_data: {
         venue_name: venueName,
         rank_text: rankText,
+        motor_no: motorNo,
+        boat_motor_no: boatMotorNo,
         exhibit_time: exhibitTime,
         race_time: raceTime,
         average_st_eligible: averageStEligible,
