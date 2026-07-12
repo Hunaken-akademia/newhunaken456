@@ -174,7 +174,7 @@ function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, o
       <div style={card}><div style={box}>
         <div style={{ fontSize: 11, letterSpacing: ".18em", color: "#7da3c8", marginBottom: 6 }}>購入者専用</div>
         <div style={{ fontSize: 24, fontWeight: 900 }}>舟券アカデミア 有料自動取得版</div>
-        <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 13 }}>Googleログイン後、購入済みのメールだけツールを表示します。販売期間は2026/7/10〜2026/8/13、利用期限は2026/12/31 23:59までです。予想履歴・収支記録は利用端末のブラウザ内に保存され、端末変更やブラウザデータ削除で消える場合があります。クラウド同期・復元には対応していません。</p>
+        <p style={{ color: "#9db5cc", lineHeight: 1.8, fontSize: 13 }}>Googleログイン後、購入済みのメールだけツールを表示します。販売期間は2026/7/10〜2026/8/13、利用期限は2026/12/31 23:59までです。予想履歴・収支記録は端末内に保存され、購入者ログイン後は「今すぐ保存」でこのGoogleアカウントへクラウド保存できます。別端末では同じアカウントでログインすると復元されます。</p>
         <button onClick={onLogin} style={btn}>Googleでログイン</button>
         {authMsg ? <p style={{ color: "#ffb4a8", fontSize: 12, lineHeight: 1.7 }}>{authMsg}</p> : null}
         <p style={{ color: "#5f7f9f", fontSize: 11, lineHeight: 1.7, marginTop: 16 }}>本ツールは予想補助であり、的中や利益を保証するものではありません。</p>
@@ -198,7 +198,7 @@ function AuthGateScreen({ mode, user, entitlement, authMsg, onLogin, onLogout, o
         <div style={{ marginBottom: 10 }}><b>サービスの提供時期</b><br />決済完了後、購入時に使用したGoogleアカウントでログインすることで、原則として直ちに利用できます。</div>
         <div style={{ marginBottom: 10 }}><b>利用期限</b><br />2026年12月31日23時59分まで</div>
         <div style={{ marginBottom: 10 }}><b>キャンセル・返金</b><br />購入者都合によるキャンセルおよび返金はできません。決済完了後も利用権が反映されず、当方で確認・対応を行っても利用できない場合に限り、決済日から3日以内のお申し出により返金します。</div>
-        <div><b>データ保存</b><br />予想履歴・収支記録は利用端末のブラウザ内に保存されます。端末変更やブラウザデータ削除等によるデータ消失、端末間の引き継ぎおよび復元には対応していません。</div>
+        <div><b>データ保存</b><br />予想履歴・収支記録は端末内に保存されます。購入者ログイン後に「今すぐ保存」を押すと、このGoogleアカウントへクラウド保存され、別端末でも復元できます。</div>
       </div>
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 14px", margin: "0 0 14px", fontSize: 12, lineHeight: 1.7 }}>
@@ -7176,7 +7176,7 @@ export default function App() {
           ・本ツールのコード改変、複製、再配布、転売、貸与を禁止します。<br />
           ・本ツールの内容・画面・ロジックを無断で公開、配布、販売する行為を禁じます。<br />
           ・舟券アカデミアに無断での商用利用（販売・有料配布・収益目的での再公開など）を固く禁じます。<br />
-          ・本ツールは的中を保証するものではありません。舟券の購入は自己責任でお願いします。予想履歴・収支記録は利用端末のブラウザ内に保存され、端末変更、ブラウザデータ消去、プライベートブラウズ、端末故障等で消失する場合があります。端末間同期・クラウドバックアップ・消失記録の復元には対応していません。<br />
+          ・本ツールは的中を保証するものではありません。舟券の購入は自己責任でお願いします。予想履歴・収支記録は端末内に保存されます。購入者ログイン後に「今すぐ保存」を押すと、このGoogleアカウントへクラウド保存されます。保存前の端末データや削除済みデータは復元できない場合があります。<br />
           <div style={{ marginTop: 6, textAlign: "right", color: "#4a5d70" }}>
             © 舟券アカデミア
           </div>
