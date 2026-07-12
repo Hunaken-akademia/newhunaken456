@@ -1550,6 +1550,8 @@ export default function App() {
   // ── 結果出目・保存レコード ──
   const [resultDigits, setResultDigits] = useState({ first: "", second: "", third: "" });
   const [records, setRecords] = useState([]);       // 保存した予想＋結果
+  const recordsRef = useRef([]);                 // 保存処理用の最新値ミラー
+  useEffect(() => { recordsRef.current = records; }, [records]);
   const [saveMsg, setSaveMsg] = useState("");
   // 集計の絞り込み（的中率・AI収支・自分の収支に共通で適用）
   const [statPeriod, setStatPeriod] = useState("all");   // "all" | "month" | "last30"
@@ -1568,6 +1570,8 @@ export default function App() {
   // Webアプリ版（Vercel）では localStorage に永続保存されるため有効。
   const SHOW_RECORDS = true;
   const [betRecords, setBetRecords] = useState([]); // 確定した購入履歴
+  const betRecordsRef = useRef([]);              // 保存処理用の最新値ミラー
+  useEffect(() => { betRecordsRef.current = betRecords; }, [betRecords]);
   const [betMsg, setBetMsg] = useState("");
   const [cart, setCart] = useState([]);  // 記録前の買い目リスト [{id,label,tickets,amountPerPoint}]
   const [payoutOddsInput, setPayoutOddsInput] = useState(""); // 配当(100円あたり)
@@ -1583,27 +1587,49 @@ export default function App() {
       let loaded = null;
       try {
         const r = await window.storage.get("betRecords");
-        if (r && r.value) loaded = JSON.parse(r.value);
+        const raw = r?.value;
+        if (raw === "undefined") {
+          try { await window.storage.set("betRecords", "[]"); } catch (e) { /* noop */ }
+          loaded = [];
+        } else if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) loaded = parsed;
+        }
       } catch (e) { /* noop */ }
-      if (!loaded) {
+      if (loaded === null) {
         try {
-          const ls = localStorage.getItem("hunaken_betRecords");
-          if (ls) loaded = JSON.parse(ls);
+          const raw = localStorage.getItem("hunaken_betRecords");
+          if (raw === "undefined") {
+            localStorage.removeItem("hunaken_betRecords");
+            loaded = [];
+          } else if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) loaded = parsed;
+          }
         } catch (e) { /* noop */ }
       }
-      if (loaded) setBetRecords(loaded);
+      if (Array.isArray(loaded)) {
+        betRecordsRef.current = loaded;
+        setBetRecords(loaded);
+      }
     })();
   }, []);
 
   const persistBets = async (updater) => {
-    let computed;
-    setBetRecords((prev) => {
-      computed = typeof updater === "function" ? updater(prev) : updater;
-      return computed;
-    });
-    const json = JSON.stringify(computed);
-    try { await window.storage.set("betRecords", json); } catch (e) { /* noop */ }
-    try { localStorage.setItem("hunaken_betRecords", json); } catch (e) { /* noop */ }
+    const current = Array.isArray(betRecordsRef.current) ? betRecordsRef.current : [];
+    const next = typeof updater === "function" ? updater(current) : updater;
+    if (!Array.isArray(next)) {
+      console.warn("betRecords save skipped: next value is not an array");
+      return false;
+    }
+    const json = JSON.stringify(next);
+    if (json === undefined || json === "undefined") return false;
+    betRecordsRef.current = next;
+    setBetRecords(next);
+    let saved = false;
+    try { await window.storage.set("betRecords", json); saved = true; } catch (e) { /* noop */ }
+    try { localStorage.setItem("hunaken_betRecords", json); saved = true; } catch (e) { /* noop */ }
+    return saved;
   };
   const setResultDigit = (k, v) => setResultDigits((p) => ({ ...p, [k]: v }));
 
@@ -1613,28 +1639,50 @@ export default function App() {
       let loaded = null;
       try {
         const r = await window.storage.get("records");
-        if (r && r.value) loaded = JSON.parse(r.value);
+        const raw = r?.value;
+        if (raw === "undefined") {
+          try { await window.storage.set("records", "[]"); } catch (e) { /* noop */ }
+          loaded = [];
+        } else if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) loaded = parsed;
+        }
       } catch (e) { /* noop */ }
-      if (!loaded) {
+      if (loaded === null) {
         try {
-          const ls = localStorage.getItem("hunaken_records");
-          if (ls) loaded = JSON.parse(ls);
+          const raw = localStorage.getItem("hunaken_records");
+          if (raw === "undefined") {
+            localStorage.removeItem("hunaken_records");
+            loaded = [];
+          } else if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) loaded = parsed;
+          }
         } catch (e) { /* noop */ }
       }
-      if (loaded) setRecords(loaded);
+      if (Array.isArray(loaded)) {
+        recordsRef.current = loaded;
+        setRecords(loaded);
+      }
     })();
   }, []);
 
   const persistRecords = async (updater) => {
     // updater は配列、または (prev)=>next の関数
-    let computed;
-    setRecords((prev) => {
-      computed = typeof updater === "function" ? updater(prev) : updater;
-      return computed;
-    });
-    const json = JSON.stringify(computed);
-    try { await window.storage.set("records", json); } catch (e) { /* noop */ }
-    try { localStorage.setItem("hunaken_records", json); } catch (e) { /* noop */ }
+    const current = Array.isArray(recordsRef.current) ? recordsRef.current : [];
+    const next = typeof updater === "function" ? updater(current) : updater;
+    if (!Array.isArray(next)) {
+      console.warn("records save skipped: next value is not an array");
+      return false;
+    }
+    const json = JSON.stringify(next);
+    if (json === undefined || json === "undefined") return false;
+    recordsRef.current = next;
+    setRecords(next);
+    let saved = false;
+    try { await window.storage.set("records", json); saved = true; } catch (e) { /* noop */ }
+    try { localStorage.setItem("hunaken_records", json); saved = true; } catch (e) { /* noop */ }
+    return saved;
   };
 
   // ── データのバックアップ（エクスポート/インポート） ──
@@ -1784,7 +1832,7 @@ export default function App() {
   const ST_PERIODS = ST_PERIOD_LABELS;
   const [stTable, setStTable] = useState(null);
   const [stMeta, setStMeta] = useState(null);
-  const [stPeriod, setStPeriod] = useState("直近3ヶ月");
+  const [stPeriod, setStPeriod] = useState("直近6ヶ月");
 
   const applyStTable = (table, period) => {
     const row = table[period];
@@ -4569,7 +4617,11 @@ export default function App() {
         payout,
       };
     });
-    await persistBets((prev) => [...recs, ...prev]);
+    const saved = await persistBets((prev) => [...recs, ...prev]);
+    if (!saved) {
+      setBetMsg("✗ 買い目の保存に失敗しました。ページを閉じずに、もう一度お試しください");
+      return;
+    }
     const totalAmt = recs.reduce((a, r) => a + r.amount, 0);
     const totalPay = recs.reduce((a, r) => a + (r.payout || 0), 0);
     setBetMsg(`✓ ${recs.length}件・${totalAmt.toLocaleString()}円を記録${hasResult ? `／払戻 ${totalPay.toLocaleString()}円` : ""}`);
