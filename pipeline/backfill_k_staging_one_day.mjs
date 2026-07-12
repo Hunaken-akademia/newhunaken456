@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import iconv from "iconv-lite";
 
-const VERSION = "k-backfill-staging-v5-l0-normal-format-fix";
+const VERSION = "k-backfill-staging-v5-l0-null-st-fix";
 const argDate = process.argv[2];
 const dryArg = process.argv.find((a) => a.startsWith("--dry="));
 const DRY = dryArg ? dryArg.split("=")[1] !== "false" : true;
@@ -163,9 +163,12 @@ function parseResultLine(line) {
   const st = parseSt(officialStText);
   const raceTimeRaw = metrics[4] ? String(metrics[4]).replace(/\s+/g, "") : "";
   const raceTime = /^\d\.\d{2}\.\d$/.test(raceTimeRaw) ? raceTimeRaw : null;
-  if (!officialStText || st == null) return null;
+  if (!officialStText) return null;
 
   const resultStatus = resultStatusFromRankAndSt(rankText, officialStText);
+  // L0/L1 や F0/F1 は、K票上で ST が「L .」「F .」となり数値を持たない場合があります。
+  // その場合も6艇の1行として保持し、st=null・平均ST対象外で保存します。
+  if (st == null && resultStatus !== "F" && resultStatus !== "L") return null;
   const averageStEligible = isAverageStEligible(rankText, officialStText);
   const finishOrder = finishOrderFromRank(rankText, resultStatus);
 
