@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import iconv from "iconv-lite";
 
-const VERSION = "k-backfill-staging-v2-parser-parity";
+const VERSION = "k-backfill-staging-v4-k-status-fix";
 const argDate = process.argv[2];
 const dryArg = process.argv.find((a) => a.startsWith("--dry="));
 const DRY = dryArg ? dryArg.split("=")[1] !== "false" : true;
@@ -83,6 +83,7 @@ function resultStatusFromRankAndSt(rankText, stText) {
   const st = String(stText || "").trim().toUpperCase().replace(/\s+/g, "");
   if (r.startsWith("F") || st.startsWith("F")) return "F";
   if (r.startsWith("L") || st.startsWith("L")) return "L";
+  if (r.startsWith("K")) return "SCRATCHED";
   if (r.startsWith("欠")) return "ABSENT";
   if (r.startsWith("失")) return "DISQUALIFIED";
   if (r.startsWith("転")) return "CAPSIZED";
@@ -109,13 +110,40 @@ function finishOrderFromRank(rankText, status) {
 
 function parseResultLine(line) {
   // K票の結果行。rankは 01-06 のほか、F0/L0/S0/S1/転/落/失/妨/不 なども拾う。
-  const head = String(line || "").match(/^\s*(\d{2}|F\d?|L\d?|S\d?|欠|失|転|落|妨|不)\s+([1-6])\s+(\d{4})\s+(.+)$/i);
+  const head = String(line || "").match(/^\s*(\d{2}|F\d?|L\d?|S\d?|K\d?|欠|失|転|落|妨|不)\s+([1-6])\s+(\d{4})\s+(.+)$/i);
   if (!head) return null;
 
   const rankText = String(head[1]).trim().toUpperCase();
   const boatNo = Number(head[2]);
   const regno = Number(head[3]);
   const tail = head[4];
+
+  // K0/K1 はK票上で展示・進入・STが「K .」になり、通常の数値行ではありません。
+  // ただし6艇レースの1艇としては存在するため、SCRATCHED行として保存します。
+  if (/^K\d?$/.test(rankText)) {
+    const kMatch = tail.match(/^(.+?)\s+(\d{1,3})\s+(\d{1,3})\s+K\s*\.\s+K\s*\.\s+\.\s*\.\s*$/i);
+    if (!kMatch) return null;
+    const racerName = compact(kMatch[1]);
+    const motorNo = Number(kMatch[2]);
+    const boatMotorNo = Number(kMatch[3]);
+    const resultStatus = resultStatusFromRankAndSt(rankText, "K.");
+    return {
+      rankText,
+      boatNo,
+      regno,
+      racerName,
+      motorNo,
+      boatMotorNo,
+      exhibitTime: null,
+      course: null,
+      officialStText: null,
+      st: null,
+      raceTime: null,
+      resultStatus,
+      averageStEligible: false,
+      finishOrder: null,
+    };
+  }
 
   // K票は5・6着などでレースタイムが「.  .」になることがあります。
   // 平均ST・コース別STでは、レースタイムが無くてもSTと進入があれば必要です。
@@ -274,9 +302,10 @@ function validateRows(rows) {
     if (!r.place_no || r.place_no < 1 || r.place_no > 24) errors.push({ type: "bad_place", row: r });
     if (!r.race_no || r.race_no < 1 || r.race_no > 12) errors.push({ type: "bad_race", row: r });
     if (!r.boat_no || r.boat_no < 1 || r.boat_no > 6) errors.push({ type: "bad_boat", row: r });
-    if (!r.course || r.course < 1 || r.course > 6) errors.push({ type: "bad_course", row: r });
+    if (r.course != null && (r.course < 1 || r.course > 6)) errors.push({ type: "bad_course", row: r });
     if (!r.regno || r.regno <= 0) errors.push({ type: "bad_regno", row: r });
-    if (r.st == null || r.st < -1 || r.st > 2) errors.push({ type: "bad_st", row: r });
+    if (r.result_status === "NORMAL" && (r.course == null || r.st == null)) errors.push({ type: "normal_missing_course_or_st", row: r });
+    if (r.st != null && (r.st < -1 || r.st > 2)) errors.push({ type: "bad_st", row: r });
   }
 
   const racesNot6 = [];
