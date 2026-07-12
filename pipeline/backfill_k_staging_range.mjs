@@ -5,7 +5,7 @@ const daysArg = process.argv[3];
 const dryArg = process.argv.find((a) => a.startsWith("--dry="));
 const DRY = dryArg ? dryArg.split("=")[1] !== "false" : true;
 
-const MAX_DAYS = 14;
+const MAX_DAYS = 180;
 
 function isIsoDate(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
@@ -48,6 +48,7 @@ console.log(`days=${days}`);
 console.log(`dry=${DRY}`);
 console.log("target=STAGING_ONLY");
 console.log("本番race_results・paid_usersには一切書き込みません。");
+console.log("半年実行対応: 最大180日まで。まずdry=trueで全日検証してください。");
 
 const summary = [];
 for (let i = 0; i < days; i++) {
