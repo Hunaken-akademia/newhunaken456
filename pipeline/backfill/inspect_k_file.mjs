@@ -1,7 +1,7 @@
-// 舟券アカデミア：過去1年バックフィル前のK票書式確認 v3
+// 舟券アカデミア：過去1年バックフィル前のK票書式確認 v4
 // このスクリプトはDBへ一切書き込みません。
-// v3: ST抽出に加え、場名・レース番号の取り違えを調査するため、
-//     非6行レースと重複候補の周辺コンテキストを出力します。
+// v4: 場名検出を「ボートレース○○」ヘッダー限定にし、
+//     レースタイム未記録（.  .）の5・6着行もST集計候補に含めます。
 // Usage: node pipeline/backfill/inspect_k_file.mjs 2026-07-02 [--raw]
 
 import { execFileSync } from "node:child_process";
@@ -60,13 +60,16 @@ function parseResultRow(rawLine) {
   const regno = Number(head[3]);
   const tail = head[4];
 
-  const metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+([FL]?\s*(?:0?\.\d{2}))\s+(\d\.\d{2}\.\d)\s*$/);
+  // K票は5・6着などでレースタイムが「.  .」になることがあります。
+  // 平均ST・コース別STのバックフィルでは、レースタイムが無くてもSTと進入があれば必要です。
+  const metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+([FL]?\s*(?:0?\.\d{2}))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/);
   if (!metrics) return null;
 
   const exhibitTime = Number(metrics[1]);
   const course = Number(metrics[2]);
   const stText = normalizeStText(metrics[3]);
-  const raceTime = metrics[4];
+  const rawRaceTime = metrics[4] ? String(metrics[4]).replace(/\s+/g, "") : "";
+  const raceTime = /^\d\.\d{2}\.\d$/.test(rawRaceTime) ? rawRaceTime : null;
   if (!stText) return null;
 
   return {
@@ -84,19 +87,18 @@ function parseResultRow(rawLine) {
 function maybePlaceHeader(line) {
   const t = normalizeLine(line).trim();
   if (!t) return null;
-  // 結果行・選手行では場名判定しない。
-  if (/^(\d{2}|F|L|欠|失|転|落|妨|不)\s+[1-6]\s+\d{4}\s+/.test(t)) return null;
+  // 場名は「ボートレース○○」の開催場ヘッダーだけで判定します。
+  // 例: 「ボートレース唐　津」は空白を詰めて「ボートレース唐津」として読む。
+  // これにより、レース名の「福岡選抜」や「津」を含む語で場名が切り替わる誤検出を防ぎます。
+  const compact = t.replace(/\s+/g, "");
+  if (!compact.includes("ボートレース")) return null;
 
   for (const [name, no] of placeEntries) {
-    // 「津」は1文字で誤検出しやすいので、単独・ボートレース津・津競走場などだけ許可。
-    if (name === "津") {
-      if (t === "津" || /(^|\s|　)(ボートレース)?津(競走場|ボート|\s|　|$)/.test(t)) {
-        return { name, no, line: t };
-      }
-      continue;
+    if (compact.includes(`ボートレース${name}`)) {
+      return { name, no, line: t };
     }
-    if (t.includes(name)) return { name, no, line: t };
   }
+
   return null;
 }
 
@@ -195,8 +197,9 @@ function printDiagnostics(text, result) {
   const noSt = rows.filter((r) => !r.stText);
   const noRegno = rows.filter((r) => !Number.isFinite(r.regno) || r.regno <= 0);
   const noCourse = rows.filter((r) => !Number.isFinite(r.course) || r.course < 1 || r.course > 6);
+  const noRaceTime = rows.filter((r) => !r.raceTime);
 
-  console.log("\n=== K票バックフィル事前診断 v3 ===");
+  console.log("\n=== K票バックフィル事前診断 v4 ===");
   console.log(`date=${argDate}`);
   console.log(`lines=${lines.length}`);
   console.log(`candidate_rows_raw=${rawRows.length}`);
@@ -205,6 +208,7 @@ function printDiagnostics(text, result) {
   console.log(`candidate_races=${raceKeys.size}`);
   console.log(`candidate_venues=${venueKeys.size}`);
   console.log(`rows_without_st=${noSt.length}`);
+  console.log(`rows_without_race_time=${noRaceTime.length}`);
   console.log(`invalid_boat_rows=${invalidBoat.length}`);
   console.log(`invalid_regno_rows=${noRegno.length}`);
   console.log(`invalid_course_rows=${noCourse.length}`);
