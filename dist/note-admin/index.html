@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="robots" content="noindex,nofollow,noarchive" />
+  <title>note購入申請 管理 | 舟券アカデミア</title>
+  <script src="/api/runtime-config.js"></script>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">NOTE PURCHASE ADMIN</div>
+        <h1>note購入申請<br />管理画面</h1>
+        <p>購入証明を確認し、確認済みの申請だけをまとめて承認します。</p>
+      </div>
+    </header>
+
+    <section id="loadingSection" class="panel center">
+      <div class="spinner"></div>
+      <p>管理権限を確認しています…</p>
+    </section>
+
+    <section id="loginSection" class="panel hidden">
+      <h2>管理者Googleログイン</h2>
+      <p>管理者として登録したGoogleアカウントでログインしてください。</p>
+      <button id="loginButton" class="button primary" type="button">Googleでログイン</button>
+    </section>
+
+    <section id="deniedSection" class="panel errorPanel hidden">
+      <h2>管理画面を開けません</h2>
+      <p id="deniedMessage"></p>
+      <button id="deniedLogoutButton" class="button secondary" type="button">別のGoogleアカウントでログイン</button>
+    </section>
+
+    <section id="adminSection" class="hidden">
+      <div class="accountBar">
+        <div>
+          <span>管理者</span>
+          <strong id="adminEmail"></strong>
+        </div>
+        <button id="logoutButton" class="textButton" type="button">ログアウト</button>
+      </div>
+
+      <section class="toolbar panel">
+        <label>
+          表示する申請
+          <select id="statusFilter">
+            <option value="review">確認待ち・確認済み</option>
+            <option value="pending">確認待ちのみ</option>
+            <option value="proof_checked">確認済みのみ</option>
+            <option value="approved">承認済み</option>
+            <option value="rejected">却下済み</option>
+            <option value="all">すべて</option>
+          </select>
+        </label>
+        <button id="reloadButton" class="button secondary compact" type="button">再読み込み</button>
+      </section>
+
+      <div id="message" class="notice hidden"></div>
+
+      <section class="summaryRow">
+        <div><strong id="applicationCount">0</strong><span>表示件数</span></div>
+        <label class="selectAllRow">
+          <input id="selectAll" type="checkbox" />
+          <span>確認済みを選択</span>
+        </label>
+      </section>
+
+      <section id="emptyState" class="panel center hidden">
+        <h2>申請はありません</h2>
+        <p>現在の条件に一致する申請はありません。</p>
+      </section>
+
+      <section id="applicationList" class="applicationList"></section>
+    </section>
+  </main>
+
+  <div id="batchBar" class="batchBar hidden">
+    <div><strong id="selectedCount">0</strong>件選択中</div>
+    <button id="approveSelectedButton" type="button">選択した申請をまとめて承認</button>
+  </div>
+
+  <div id="proofModal" class="modal hidden" role="dialog" aria-modal="true" aria-label="購入証明">
+    <div class="modalCard">
+      <div class="modalHeader">
+        <strong>購入証明</strong>
+        <button id="closeProofButton" type="button">閉じる</button>
+      </div>
+      <div id="proofLoading" class="proofLoading">読み込み中…</div>
+      <img id="proofImage" class="proofMedia hidden" alt="購入証明" />
+      <iframe id="proofPdf" class="proofMedia hidden" title="購入証明PDF"></iframe>
+      <a id="openProofLink" class="openLink hidden" target="_blank" rel="noopener noreferrer">別のタブで開く</a>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js?v=20260712-1"></script>
+</body>
+</html>
