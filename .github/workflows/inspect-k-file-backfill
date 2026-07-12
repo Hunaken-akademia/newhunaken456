@@ -1,0 +1,45 @@
+name: inspect-k-file-backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '確認日 YYYY-MM-DD'
+        required: true
+        default: '2026-07-02'
+      show_raw:
+        description: '生テキスト先頭120行もログへ表示'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install LZH extractor
+        run: sudo apt-get update && sudo apt-get install -y lhasa
+
+      - name: Install parser dependency
+        run: npm install --no-save iconv-lite
+
+      - name: Inspect official K file without database writes
+        run: |
+          CMD="node pipeline/backfill/inspect_k_file.mjs '${{ github.event.inputs.date }}'"
+          if [ '${{ github.event.inputs.show_raw }}' = 'true' ]; then CMD="$CMD --raw"; fi
+          echo "$CMD"
+          eval "$CMD"
