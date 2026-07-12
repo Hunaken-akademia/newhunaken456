@@ -1,4 +1,4 @@
-// 舟券アカデミア：過去1年バックフィル前のK票書式確認
+// 舟券アカデミア：過去1年バックフィル前のK票書式確認 v2
 // このスクリプトはDBへ一切書き込みません。
 // Usage: node pipeline/backfill/inspect_k_file.mjs 2026-07-02 [--raw]
 
@@ -32,12 +32,62 @@ const placeMap = {
 };
 
 function normalizeLine(line) {
-  return String(line || "").replace(/\u3000/g, " ");
+  return String(line || "")
+    .replace(/\u3000/g, " ")
+    .replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .replace(/Ｆ/g, "F")
+    .replace(/Ｌ/g, "L");
+}
+
+function normalizeStText(value) {
+  const s = String(value || "").replace(/\s+/g, "").replace(/^([FL])?\./, "$10.");
+  const m = s.match(/^([FL])?(0\.\d{2})$/);
+  if (!m) return "";
+  return `${m[1] || ""}${m[2]}`;
+}
+
+function parseResultRow(rawLine) {
+  const line = normalizeLine(rawLine).trimEnd();
+
+  // K票の着順行は概ね以下の形：
+  // 01  3 4071 選手名 46   53  6.85   3    0.23     1.50.3
+  // v1では .23 だけを探していたため、0.23 を全て取り逃がしていた。
+  const head = line.match(/^\s*(\d{2}|F|L|欠|失|転|落|妨|不)\s+([1-6])\s+(\d{4})\s+(.+)$/);
+  if (!head) return null;
+
+  const rankText = head[1];
+  const boat = Number(head[2]);
+  const regno = Number(head[3]);
+  const tail = head[4];
+
+  // 末尾から 展示タイム / 進入 / ST / レースタイム を拾う。
+  // レースタイムが無い失格・欠場系は次STEPで別扱いにするため、ここでは安全に候補から外す。
+  const metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+([FL]?\s*(?:0?\.\d{2}))\s+(\d\.\d{2}\.\d)\s*$/);
+  if (!metrics) return null;
+
+  const exhibitTime = Number(metrics[1]);
+  const course = Number(metrics[2]);
+  const stText = normalizeStText(metrics[3]);
+  const raceTime = metrics[4];
+  if (!stText) return null;
+
+  return {
+    rankText,
+    boat,
+    regno,
+    course,
+    stText,
+    st: Number(stText.replace(/^[FL]/, "")),
+    exhibitTime,
+    raceTime,
+  };
 }
 
 function candidateRows(text) {
   const lines = text.split(/\r?\n/);
+  const rawRows = [];
   const rows = [];
+  const duplicateRows = [];
   let placeNo = null;
   let placeName = "";
   let raceNo = null;
@@ -60,52 +110,57 @@ function candidateRows(text) {
       if (n >= 1 && n <= 12) raceNo = n;
     }
 
-    // 現行スケルトンと同じ候補判定。まだ本番保存には使わない。
-    const rowMatch = line.match(/^\s*(\d{2})\s+(\d)\s+(\d{4})\s+/);
-    if (!rowMatch || !placeNo || !raceNo) continue;
+    if (!placeNo || !raceNo) continue;
+    const parsed = parseResultRow(raw);
+    if (!parsed) continue;
 
-    const rankText = rowMatch[1];
-    const boat = Number(rowMatch[2]);
-    const regno = Number(rowMatch[3]);
-    const kimarite = line.match(/(まくり差し|まくり|逃げ|差し|抜き|恵まれ)/)?.[1] || "";
-    const head = kimarite ? line.slice(0, line.indexOf(kimarite)) : line;
-    const stMatches = [...head.matchAll(/(^|[^\d])([FLＦ]?)\.(\d{2})(?!\d)/g)];
-    const lastSt = stMatches.at(-1);
-    const stText = lastSt ? `${lastSt[2] || ""}.${lastSt[3]}` : "";
-
-    rows.push({
+    const row = {
       lineNo: index + 1,
       placeNo,
       placeName,
       raceNo,
-      rankText,
-      boat,
-      regno,
-      stText,
-      kimarite,
+      ...parsed,
       rawLine: raw,
-    });
+    };
+    rawRows.push(row);
   }
-  return rows;
+
+  const seen = new Set();
+  for (const row of rawRows) {
+    const key = `${row.placeNo}-${row.raceNo}-${row.boat}`;
+    if (seen.has(key)) {
+      duplicateRows.push(row);
+      continue;
+    }
+    seen.add(key);
+    rows.push(row);
+  }
+
+  return { rows, rawRows, duplicateRows };
 }
 
-function printDiagnostics(text, rows) {
+function printDiagnostics(text, result) {
+  const { rows, rawRows, duplicateRows } = result;
   const lines = text.split(/\r?\n/);
   const raceKeys = new Set(rows.map((r) => `${r.placeNo}-${r.raceNo}`));
   const venueKeys = new Set(rows.map((r) => r.placeNo));
   const invalidBoat = rows.filter((r) => r.boat < 1 || r.boat > 6);
   const noSt = rows.filter((r) => !r.stText);
   const noRegno = rows.filter((r) => !Number.isFinite(r.regno) || r.regno <= 0);
+  const noCourse = rows.filter((r) => !Number.isFinite(r.course) || r.course < 1 || r.course > 6);
 
-  console.log("\n=== K票バックフィル事前診断 ===");
+  console.log("\n=== K票バックフィル事前診断 v2 ===");
   console.log(`date=${argDate}`);
   console.log(`lines=${lines.length}`);
+  console.log(`candidate_rows_raw=${rawRows.length}`);
+  console.log(`duplicate_rows_dropped=${duplicateRows.length}`);
   console.log(`candidate_rows=${rows.length}`);
   console.log(`candidate_races=${raceKeys.size}`);
   console.log(`candidate_venues=${venueKeys.size}`);
   console.log(`rows_without_st=${noSt.length}`);
   console.log(`invalid_boat_rows=${invalidBoat.length}`);
   console.log(`invalid_regno_rows=${noRegno.length}`);
+  console.log(`invalid_course_rows=${noCourse.length}`);
 
   const perRace = new Map();
   for (const row of rows) {
@@ -129,10 +184,27 @@ function printDiagnostics(text, rows) {
       rankText: row.rankText,
       boat: row.boat,
       regno: row.regno,
+      course: row.course,
       stText: row.stText,
-      kimarite: row.kimarite,
+      exhibitTime: row.exhibitTime,
+      raceTime: row.raceTime,
       rawLine: row.rawLine,
     }));
+  }
+
+  if (duplicateRows.length) {
+    console.log("\n--- 重複候補サンプル（最大10行）---");
+    for (const row of duplicateRows.slice(0, 10)) {
+      console.log(JSON.stringify({
+        lineNo: row.lineNo,
+        venue: row.placeName,
+        race: row.raceNo,
+        boat: row.boat,
+        regno: row.regno,
+        stText: row.stText,
+        rawLine: row.rawLine,
+      }));
+    }
   }
 
   if (SHOW_RAW) {
@@ -148,7 +220,7 @@ async function main() {
   try {
     console.log(`download=${url}`);
     const response = await fetch(url, {
-      headers: { "user-agent": "HunakenKFileInspector/1.0" },
+      headers: { "user-agent": "HunakenKFileInspector/1.1" },
       signal: AbortSignal.timeout(60_000),
     });
     if (!response.ok) {
@@ -164,11 +236,15 @@ async function main() {
     if (!extracted) throw new Error("解凍後のTXT/DATファイルが見つかりません");
 
     const text = iconv.decode(readFileSync(join(workdir, extracted)), "Shift_JIS");
-    const rows = candidateRows(text);
-    printDiagnostics(text, rows);
+    const result = candidateRows(text);
+    printDiagnostics(text, result);
 
-    if (!rows.length) {
+    if (!result.rows.length) {
       console.error("候補行が0件です。パーサ書式が合っていないため、バックフィルへ進めません。");
+      process.exitCode = 2;
+    }
+    if (result.rows.some((r) => !r.stText)) {
+      console.error("ST未取得行があります。バックフィルへ進む前にパーサ修正が必要です。");
       process.exitCode = 2;
     }
   } finally {
