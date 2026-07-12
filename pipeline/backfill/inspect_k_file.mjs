@@ -1,7 +1,7 @@
-// 舟券アカデミア：過去1年バックフィル前のK票書式確認 v4
+// 舟券アカデミア：過去1年バックフィル前のK票書式確認 v5
 // このスクリプトはDBへ一切書き込みません。
-// v4: 場名検出を「ボートレース○○」ヘッダー限定にし、
-//     レースタイム未記録（.  .）の5・6着行もST集計候補に含めます。
+// v5: S0/S1/L0/F0などの特殊着順行も1艇分として採用し、
+//     6艇揃い判定を欠場・失格・L等でも崩さないようにします。
 // Usage: node pipeline/backfill/inspect_k_file.mjs 2026-07-02 [--raw]
 
 import { execFileSync } from "node:child_process";
@@ -44,15 +44,41 @@ function normalizeLine(line) {
 }
 
 function normalizeStText(value) {
-  const s = String(value || "").replace(/\s+/g, "").replace(/^([FL])?\./, "$10.");
-  const m = s.match(/^([FL])?(0\.\d{2})$/);
+  const compact = String(value || "").replace(/\s+/g, "").toUpperCase();
+  if (!compact) return "";
+
+  // 例: .13 -> 0.13 / F.01 -> F0.01 / L1.99 -> L1.99
+  const fixed = compact.replace(/^([FL])?\./, "$10.");
+  const m = fixed.match(/^([FL])?(\d\.\d{2})$/);
   if (!m) return "";
   return `${m[1] || ""}${m[2]}`;
 }
 
+function classifyResultStatus(rankText, stText) {
+  const r = String(rankText || "").toUpperCase();
+  const st = String(stText || "").toUpperCase();
+
+  if (r.startsWith("F") || st.startsWith("F")) return "F";
+  if (r.startsWith("L") || st.startsWith("L")) return "L";
+  if (r.startsWith("S") || r === "失") return "DISQUALIFIED";
+  if (r === "転") return "CAPSIZED";
+  if (r === "落") return "FELL";
+  if (r === "欠") return "ABSENT";
+  if (r === "妨") return "OBSTRUCTION";
+  if (r === "不") return "DID_NOT_FINISH";
+  return "NORMAL";
+}
+
+function isAverageStEligible(rankText, stText) {
+  const status = classifyResultStatus(rankText, stText);
+  const st = String(stText || "");
+  // F/Lは平均STからは除外候補。S/失格はスタートしていれば平均ST候補に残します。
+  return Boolean(st) && status !== "F" && status !== "L";
+}
+
 function parseResultRow(rawLine) {
   const line = normalizeLine(rawLine).trimEnd();
-  const head = line.match(/^\s*(\d{2}|F|L|欠|失|転|落|妨|不)\s+([1-6])\s+(\d{4})\s+(.+)$/);
+  const head = line.match(/^\s*(\d{2}|F\d?|L\d?|S\d?|欠|失|転|落|妨|不)\s+([1-6])\s+(\d{4})\s+(.+)$/i);
   if (!head) return null;
 
   const rankText = head[1];
@@ -62,7 +88,7 @@ function parseResultRow(rawLine) {
 
   // K票は5・6着などでレースタイムが「.  .」になることがあります。
   // 平均ST・コース別STのバックフィルでは、レースタイムが無くてもSTと進入があれば必要です。
-  const metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+([FL]?\s*(?:0?\.\d{2}))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/);
+  const metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+([FL]?\s*(?:(?:\d\.\d{2})|(?:0?\.\d{2})))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/i);
   if (!metrics) return null;
 
   const exhibitTime = Number(metrics[1]);
@@ -72,6 +98,8 @@ function parseResultRow(rawLine) {
   const raceTime = /^\d\.\d{2}\.\d$/.test(rawRaceTime) ? rawRaceTime : null;
   if (!stText) return null;
 
+  const resultStatus = classifyResultStatus(rankText, stText);
+
   return {
     rankText,
     boat,
@@ -79,6 +107,8 @@ function parseResultRow(rawLine) {
     course,
     stText,
     st: Number(stText.replace(/^[FL]/, "")),
+    averageStEligible: isAverageStEligible(rankText, stText),
+    resultStatus,
     exhibitTime,
     raceTime,
   };
@@ -105,7 +135,7 @@ function maybePlaceHeader(line) {
 function maybeRaceHeader(line) {
   const t = normalizeLine(line).trim();
   if (!t) return null;
-  if (/^(\d{2}|F|L|欠|失|転|落|妨|不)\s+[1-6]\s+\d{4}\s+/.test(t)) return null;
+  if (/^(\d{2}|F\d?|L\d?|S\d?|欠|失|転|落|妨|不)\s+[1-6]\s+\d{4}\s+/i.test(t)) return null;
   const m = t.match(/(?:^|\s)(?:第\s*)?(\d{1,2})\s*(?:R|レース|競走)(?:\s|$)/i);
   if (!m) return null;
   const n = Number(m[1]);
@@ -198,8 +228,10 @@ function printDiagnostics(text, result) {
   const noRegno = rows.filter((r) => !Number.isFinite(r.regno) || r.regno <= 0);
   const noCourse = rows.filter((r) => !Number.isFinite(r.course) || r.course < 1 || r.course > 6);
   const noRaceTime = rows.filter((r) => !r.raceTime);
+  const specialStatusRows = rows.filter((r) => r.resultStatus && r.resultStatus !== "NORMAL");
+  const averageStExcludedRows = rows.filter((r) => !r.averageStEligible);
 
-  console.log("\n=== K票バックフィル事前診断 v4 ===");
+  console.log("\n=== K票バックフィル事前診断 v5 ===");
   console.log(`date=${argDate}`);
   console.log(`lines=${lines.length}`);
   console.log(`candidate_rows_raw=${rawRows.length}`);
@@ -209,6 +241,8 @@ function printDiagnostics(text, result) {
   console.log(`candidate_venues=${venueKeys.size}`);
   console.log(`rows_without_st=${noSt.length}`);
   console.log(`rows_without_race_time=${noRaceTime.length}`);
+  console.log(`special_status_rows=${specialStatusRows.length}`);
+  console.log(`average_st_excluded_rows=${averageStExcludedRows.length}`);
   console.log(`invalid_boat_rows=${invalidBoat.length}`);
   console.log(`invalid_regno_rows=${noRegno.length}`);
   console.log(`invalid_course_rows=${noCourse.length}`);
@@ -234,6 +268,8 @@ function printDiagnostics(text, result) {
       regno: row.regno,
       course: row.course,
       stText: row.stText,
+      resultStatus: row.resultStatus,
+      averageStEligible: row.averageStEligible,
       exhibitTime: row.exhibitTime,
       raceTime: row.raceTime,
       rawLine: row.rawLine,
@@ -252,6 +288,8 @@ function printDiagnostics(text, result) {
         boat: row.boat,
         regno: row.regno,
         stText: row.stText,
+        resultStatus: row.resultStatus,
+        averageStEligible: row.averageStEligible,
         rawLine: row.rawLine,
       }));
     }
