@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import iconv from "iconv-lite";
 
-const VERSION = "k-backfill-staging-v5-fl-no-course-fix";
+const VERSION = "k-backfill-staging-v5-k-robust-scratch-fix";
 const argDate = process.argv[2];
 const dryArg = process.argv.find((a) => a.startsWith("--dry="));
 const DRY = dryArg ? dryArg.split("=")[1] !== "false" : true;
@@ -120,11 +120,23 @@ function parseResultLine(line) {
   const regno = Number(head[3]);
   const tail = head[4];
 
-  // K0/K1 はK票上で展示・進入・STがすべて特殊表記になる行です。
-  // L0/L1 は展示・進入が通常値で、STのみ L . になるため、この分岐には入れません。
   // K0/K1 は6艇レースの1艇としてSCRATCHED扱いで保存します。
+  // K票には主に2パターンあります。
+  // 1) K .         K .        .  .
+  // 2) 0.00       K .        .  .  （展示欄だけ0.00、進入欄なし）
+  // どちらも展示・進入・STは分析値として使わず、boat/regno/name/motor/boatは保持します。
   if (/^K\d?$/.test(rankText)) {
-    const kMatch = tail.match(/^(.+?)\s+(\d{1,3})\s+(\d{1,3})\s+[KL]\s*\.\s+[KL]\s*\.\s+\.\s*\.\s*$/i);
+    // K0/K1 は欠場系の行として6艇レースの1艇に数えます。
+    // K票には複数の揺れがあります。
+    // 例1: K0  ... K .         K .        .  .
+    // 例2: K1  ... 0.00       K .        .  .
+    // 例3: K1  ... ０.００      K .        .  .  （全角数字対策）
+    // 解析値としては展示・進入・STを使わず、boat/regno/name/motor/boatだけ保持します。
+    const halfTail = tail.replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0));
+    const beforeScratchSuffix = halfTail
+      .replace(/\s+(?:K\s*\.|(?:0\.00|\d\.\d{2}))\s+K\s*\.\s+\.\s*\.\s*$/i, "")
+      .trimEnd();
+    const kMatch = beforeScratchSuffix.match(/^(.+?)\s+(\d{1,3})\s+(\d{1,3})$/);
     if (!kMatch) return null;
     const racerName = compact(kMatch[1]);
     const motorNo = Number(kMatch[2]);
@@ -139,7 +151,7 @@ function parseResultLine(line) {
       boatMotorNo,
       exhibitTime: null,
       course: null,
-      officialStText: null,
+      officialStText: "K.",
       st: null,
       raceTime: null,
       resultStatus,
