@@ -8,7 +8,7 @@ on:
         required: true
         default: "2026-07-02"
       days:
-        description: "日数。安全のため最大14日"
+        description: "日数。最大180日（半年）"
         required: true
         default: "7"
       dry:
@@ -23,7 +23,7 @@ on:
 jobs:
   backfill-k-staging-range:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
