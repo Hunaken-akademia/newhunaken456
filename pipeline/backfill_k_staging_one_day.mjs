@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import iconv from "iconv-lite";
 
-const VERSION = "k-backfill-staging-v4-k-status-fix";
+const VERSION = "k-backfill-staging-v5-l0-normal-format-fix";
 const argDate = process.argv[2];
 const dryArg = process.argv.find((a) => a.startsWith("--dry="));
 const DRY = dryArg ? dryArg.split("=")[1] !== "false" : true;
@@ -118,9 +118,10 @@ function parseResultLine(line) {
   const regno = Number(head[3]);
   const tail = head[4];
 
-  // K0/K1/L0/L1 はK票上で展示・進入・STが特殊表記になる行です。
-  // 6艇レースの1艇としてSCRATCHED扱いで保存します。
-  if (/^[KL]\d?$/.test(rankText)) {
+  // K0/K1 はK票上で展示・進入・STがすべて特殊表記になる行です。
+  // L0/L1 は展示・進入が通常値で、STのみ L . になるため、この分岐には入れません。
+  // K0/K1 は6艇レースの1艇としてSCRATCHED扱いで保存します。
+  if (/^K\d?$/.test(rankText)) {
     const kMatch = tail.match(/^(.+?)\s+(\d{1,3})\s+(\d{1,3})\s+[KL]\s*\.\s+[KL]\s*\.\s+\.\s*\.\s*$/i);
     if (!kMatch) return null;
     const racerName = compact(kMatch[1]);
