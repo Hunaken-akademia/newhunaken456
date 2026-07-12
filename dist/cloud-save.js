@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "v121-cloud-save-v1";
+  const VERSION = "v121-cloud-save-v2-reflection-fix";
   const TABLE = "hunaken_user_data";
   const AUTH_SESSION_KEY = "hunaken_paid_auth_session_v1";
   const RECORDS_KEY = "hunaken_records";
@@ -108,13 +108,46 @@
     }
   }
 
-  function writeArray(key, value) {
+  // App.jsx は window.storage を先に読み、値が無い場合だけ localStorage を読みます。
+  // クラウド復元・保存も同じ優先順位に合わせ、画面とクラウドで参照先がずれないようにします。
+  async function readAppArray(storageKey, localKey) {
     try {
-      localStorage.setItem(key, JSON.stringify(Array.isArray(value) ? value : []));
-      return true;
+      if (window.storage && typeof window.storage.get === "function") {
+        const result = await window.storage.get(storageKey);
+        if (result && typeof result.value === "string") {
+          const parsed = safeJsonParse(result.value, null);
+          if (Array.isArray(parsed)) return parsed;
+        }
+      }
     } catch (_error) {
-      return false;
+      // window.storage が使えない環境では localStorage へフォールバックする。
     }
+    return readArray(localKey);
+  }
+
+  async function writeAppArray(storageKey, localKey, value) {
+    const normalized = Array.isArray(value) ? value : [];
+    const json = JSON.stringify(normalized);
+    let localOk = false;
+    let appStorageOk = false;
+
+    try {
+      localStorage.setItem(localKey, json);
+      localOk = true;
+    } catch (_error) {
+      // 後続の window.storage 保存を試す。
+    }
+
+    try {
+      if (window.storage && typeof window.storage.set === "function") {
+        await window.storage.set(storageKey, json);
+        appStorageOk = true;
+      }
+    } catch (_error) {
+      // localStorage が成功していれば復元は継続できる。
+    }
+
+    return localOk || appStorageOk;
   }
 
   function itemKey(item, type, index) {
@@ -197,16 +230,16 @@
         return;
       }
 
-      const localRecords = readArray(RECORDS_KEY);
-      const localBets = readArray(BETS_KEY);
+      const localRecords = await readAppArray("records", RECORDS_KEY);
+      const localBets = await readAppArray("betRecords", BETS_KEY);
       const mergedRecords = mergeArrays(localRecords, row.records, "records");
       const mergedBets = mergeArrays(localBets, row.bet_records, "bets");
       const before = signature(localRecords, localBets);
       const after = signature(mergedRecords, mergedBets);
 
       if (before !== after) {
-        const recordOk = writeArray(RECORDS_KEY, mergedRecords);
-        const betsOk = writeArray(BETS_KEY, mergedBets);
+        const recordOk = await writeAppArray("records", RECORDS_KEY, mergedRecords);
+        const betsOk = await writeAppArray("betRecords", BETS_KEY, mergedBets);
         if (!recordOk || !betsOk) {
           throw new Error("端末内への復元に失敗しました。通常ブラウザで開き直してください。");
         }
@@ -249,8 +282,8 @@
     try {
       const session = await activeSession();
       currentUser = currentUser || await fetchCurrentUser(session);
-      const records = readArray(RECORDS_KEY);
-      const betRecords = readArray(BETS_KEY);
+      const records = await readAppArray("records", RECORDS_KEY);
+      const betRecords = await readAppArray("betRecords", BETS_KEY);
       const existing = await fetchCloudRow(session, currentUser.id);
       const payload = {
         records,
