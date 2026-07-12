@@ -118,10 +118,10 @@ function parseResultLine(line) {
   const regno = Number(head[3]);
   const tail = head[4];
 
-  // K0/K1 はK票上で展示・進入・STが「K .」になり、通常の数値行ではありません。
-  // ただし6艇レースの1艇としては存在するため、SCRATCHED行として保存します。
-  if (/^K\d?$/.test(rankText)) {
-    const kMatch = tail.match(/^(.+?)\s+(\d{1,3})\s+(\d{1,3})\s+K\s*\.\s+K\s*\.\s+\.\s*\.\s*$/i);
+  // K0/K1/L0/L1 はK票上で展示・進入・STが特殊表記になる行です。
+  // 6艇レースの1艇としてSCRATCHED扱いで保存します。
+  if (/^[KL]\d?$/.test(rankText)) {
+    const kMatch = tail.match(/^(.+?)\s+(\d{1,3})\s+(\d{1,3})\s+[KL]\s*\.\s+[KL]\s*\.\s+\.\s*\.\s*$/i);
     if (!kMatch) return null;
     const racerName = compact(kMatch[1]);
     const motorNo = Number(kMatch[2]);
