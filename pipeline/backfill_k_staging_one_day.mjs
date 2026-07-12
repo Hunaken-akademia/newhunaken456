@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import iconv from "iconv-lite";
 
-const VERSION = "k-backfill-staging-v5-k-robust-scratch-fix";
+const VERSION = "k-backfill-staging-v5-rank00-other-fix";
 const argDate = process.argv[2];
 const dryArg = process.argv.find((a) => a.startsWith("--dry="));
 const DRY = dryArg ? dryArg.split("=")[1] !== "false" : true;
@@ -93,6 +93,9 @@ function resultStatusFromRankAndSt(rankText, stText) {
   if (r.startsWith("妨")) return "OBSTRUCTION";
   if (r.startsWith("不")) return "DID_NOT_FINISH";
   if (r.startsWith("S")) return "OTHER";
+  // K票では「00」着順で、STや進入はあるがレースタイムがない行が出ることがあります。
+  // これは通常着順(01-06)ではないため、NORMALにせずOTHERとして保持します。
+  if (r === "00") return "OTHER";
   if (/^\d{2}$/.test(r)) return "NORMAL";
   return "UNKNOWN";
 }
