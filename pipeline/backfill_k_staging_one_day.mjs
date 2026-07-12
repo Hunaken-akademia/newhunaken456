@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import iconv from "iconv-lite";
 
-const VERSION = "k-backfill-staging-v5-l-dot-regex-fix";
+const VERSION = "k-backfill-staging-v5-fl-no-course-fix";
 const argDate = process.argv[2];
 const dryArg = process.argv.find((a) => a.startsWith("--dry="));
 const DRY = dryArg ? dryArg.split("=")[1] !== "false" : true;
@@ -68,7 +68,9 @@ function normalizeNumberText(v) {
 }
 
 function parseNumeric(v) {
-  const n = Number(normalizeNumberText(v));
+  const normalized = normalizeNumberText(v);
+  if (normalized == null) return null;
+  const n = Number(normalized);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -148,20 +150,32 @@ function parseResultLine(line) {
 
   // K票は5・6着などでレースタイムが「.  .」になることがあります。
   // 平均ST・コース別STでは、レースタイムが無くてもSTと進入があれば必要です。
-  const metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+((?:[FLfl]\s*\.)|(?:[FLfl]?\s*(?:(?:\d\.\d{2})|(?:0?\.\d{2}))))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/i);
-  if (!metrics) return null;
+  let metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+((?:[FLfl]\s*\.)|(?:[FLfl]?\s*(?:(?:\d\.\d{2})|(?:0?\.\d{2}))))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/i);
+  let metricsNoCourse = null;
 
-  const beforeMetrics = tail.slice(0, metrics.index).trimEnd();
+  // L1/F1 の一部は、展示タイムはあるが進入欄が空欄で、ST欄だけ「L .」「F .」になる。
+  // 例: L1  4 ... 6.69       L .        .  .
+  // この場合も6艇の1行として保持し、course=null・st=null・平均ST対象外にする。
+  if (!metrics && /^[FL]\d?$/i.test(rankText)) {
+    metricsNoCourse = tail.match(/\s(\d\.\d{2})\s+((?:[FLfl]\s*\.))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/i);
+  }
+
+  if (!metrics && !metricsNoCourse) return null;
+
+  const metricIndex = metrics ? metrics.index : metricsNoCourse.index;
+  const beforeMetrics = tail.slice(0, metricIndex).trimEnd();
   const nameMotorBoat = beforeMetrics.match(/^(.+?)\s+(\d{1,3})\s+(\d{1,3})$/);
   const racerName = nameMotorBoat ? compact(nameMotorBoat[1]) : null;
   const motorNo = nameMotorBoat ? Number(nameMotorBoat[2]) : null;
   const boatMotorNo = nameMotorBoat ? Number(nameMotorBoat[3]) : null;
 
-  const exhibitTime = Number(metrics[1]);
-  const course = Number(metrics[2]);
-  const officialStText = normalizeNumberText(String(metrics[3] || "").replace(/\s+/g, ""));
+  const exhibitTime = Number(metrics ? metrics[1] : metricsNoCourse[1]);
+  const course = metrics ? Number(metrics[2]) : null;
+  const officialStText = normalizeNumberText(String((metrics ? metrics[3] : metricsNoCourse[2]) || "").replace(/\s+/g, ""));
   const st = parseSt(officialStText);
-  const raceTimeRaw = metrics[4] ? String(metrics[4]).replace(/\s+/g, "") : "";
+  const raceTimeRaw = metrics
+    ? (metrics[4] ? String(metrics[4]).replace(/\s+/g, "") : "")
+    : (metricsNoCourse[3] ? String(metricsNoCourse[3]).replace(/\s+/g, "") : "");
   const raceTime = /^\d\.\d{2}\.\d$/.test(raceTimeRaw) ? raceTimeRaw : null;
   if (!officialStText) return null;
 
