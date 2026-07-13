@@ -2716,30 +2716,34 @@ function normalizeRaceMetaText(s) {
     .trim();
 }
 
-function inferGradeFromText(text) {
+function literalGradeFromText(text) {
   const t = normalizeRaceMetaText(text);
 
-  // 固有大会名を一般的な語（オールスター/ダービー等）より先に判定する。
-  // 例: レディースオールスターをSG、ヤングダービーをSGと誤判定しない。
-  if (/(レディースオールスター|女子オールスター)/i.test(t)) return "G2";
-  if (/(PG1|P G1|プレミアムG1|BBCトーナメント|バトルチャンピオントーナメント|ヤングダービー|クイーンズクライマックス|レディースチャンピオン|女子王座(?:決定戦)?|賞金女王(?:決定戦)?|スピードクイーンメモリアル|マスターズチャンピオン)/i.test(t)) return "PG1";
-  if (/(G3|G 3|オールレディース|企業杯|マスターズリーグ|イースタンヤング|ウエスタンヤング)/i.test(t)) return "G3";
-  if (/(G2|G 2|モーターボート大賞|秩父宮妃記念杯|全国ボートレース甲子園)/i.test(t)) return "G2";
-  if (/(SG|S G|グランプリ|賞金王|ボートレースクラシック|総理大臣杯|ボートレースオールスター|笹川賞|グランドチャンピオン|グラチャン|オーシャンカップ|ボートレースメモリアル|モーターボート記念|ボートレースダービー|全日本選手権|チャレンジカップ)/i.test(t)) return "SG";
-  if (/(G1|G 1|周年|地区選手権|高松宮記念|ダイヤモンドカップ)/i.test(t)) return "G1";
-  return "一般";
+  // V123: 大会名から推測しない。
+  // BOATCAST上に明示された「SG / PG1 / G1 / G2 / G3」表記だけを採用する。
+  // 表記が見つからない時は、誤ってPG1/SGにするより null に逃がす。
+  const token = (body) => new RegExp(`(^|[^A-Z0-9])${body}([^A-Z0-9]|$)`, "i");
+  if (token("P\\s*G\\s*1").test(t) || token("PG1").test(t)) return "PG1";
+  if (token("S\\s*G").test(t) || token("SG").test(t)) return "SG";
+  if (token("G\\s*1").test(t) || token("G1").test(t)) return "G1";
+  if (token("G\\s*2").test(t) || token("G2").test(t)) return "G2";
+  if (token("G\\s*3").test(t) || token("G3").test(t)) return "G3";
+  return null;
+}
+
+function inferGradeFromText(text) {
+  return literalGradeFromText(text);
 }
 
 function inferLadiesFromText(text) {
   const t = normalizeRaceMetaText(text);
 
-  // 男女混合企画は大会名だけで全レースを女子戦扱いしない。
-  // そのレースの6艇が全員女子選手の時だけ、後段の allFemale 判定で女子戦にする。
+  // V123: レディース判定も、表示文字だけを見る。
+  // 大会名辞書から推測しない。全員女子の場合は後段の allFemale 判定で true にする。
   if (/(レディース\s*(?:VS|対)\s*ルーキーズ|男女W優勝戦|男女ダブル優勝戦|男女混合)/i.test(t)) return null;
-
-  if (/(オールレディース|レディースチャンピオン|レディースオールスター|クイーンズクライマックス|ヴィーナス(?:シリーズ)?|女子リーグ|女子王座(?:決定戦)?|賞金女王(?:決定戦)?|スピードクイーンメモリアル|女子レーサー)/i.test(t)) return true;
-  if (/(女子|レディース|クイーンズ)/i.test(t)) return true;
-  return false;
+  if (/(^|[^A-Z])Ladies([^A-Z]|$)/i.test(t)) return true;
+  if (/(レディース|女子)/i.test(t)) return true;
+  return null;
 }
 
 function inferRaceTypeFromText(text) {
@@ -2765,7 +2769,12 @@ function parseRaceIndexMeta(html) {
   );
   if (titleCandidates.length) eventName = normalizeRaceMetaText(titleCandidates[0]).slice(0, 120);
 
-  const metaText = `${eventName} ${text.slice(0, 5000)}`;
+  // V123: ページ全体からグレード文字を拾うと、別大会やメニュー文言で誤判定する。
+  // そのため、候補行と明示的なグレード/レディース表記がある行だけを使う。
+  const literalMetaLines = lines.filter((l) =>
+    inferGradeFromText(l) || inferLadiesFromText(l) === true || /(初日|2日目|３日目|3日目|４日目|4日目|５日目|5日目|最終日|優勝戦|準優勝戦|準優|ドリーム|選抜|特選|予選|一般)/.test(l)
+  ).slice(0, 40);
+  const metaText = [eventName, ...literalMetaLines].filter(Boolean).join(" ");
   const grade = inferGradeFromText(metaText);
   const isLadies = inferLadiesFromText(metaText);
   const raceType = inferRaceTypeFromText(metaText);
@@ -2797,12 +2806,13 @@ function raceMetaRowsFromSchedule({ venue, ymd, schedule, meta = {}, raceNo = nu
       metadata_captured_at: new Date().toISOString(),
     };
 
-    if (meta.grade) row.grade = meta.grade;
+    // V123: グレードは誤判定より未設定(null)を優先する。
+    // 再取得時に古い誤判定(PG1/SGなど)を残さないため、nullも明示的に送る。
+    row.grade = meta.grade || null;
     if (meta.eventName) row.race_title = meta.eventName;
     if (meta.raceType) row.race_type = meta.raceType;
 
-    if (typeof meta.isLadies === "boolean") row.is_ladies = meta.isLadies;
-    if (allFemale) row.is_ladies = true;
+    row.is_ladies = allFemale ? true : (typeof meta.isLadies === "boolean" ? meta.isLadies : null);
 
     rows.push(row);
   }
@@ -3213,6 +3223,21 @@ export default async function handler(req, res) {
 
     if (action === "result") {
       res.setHeader("Cache-Control", "no-store");
+
+      // GitHub Actions などの結果取り込み処理だけを保護する。
+      // CAPTURE_TOKEN が未設定の環境では従来動作を維持し、段階的に導入できるようにする。
+      const expectedCaptureToken = String(process.env.CAPTURE_TOKEN || "");
+      if (expectedCaptureToken) {
+        const rawCaptureToken = req.headers?.["x-capture-token"];
+        const receivedCaptureToken = Array.isArray(rawCaptureToken)
+          ? String(rawCaptureToken[0] || "")
+          : String(rawCaptureToken || "");
+        if (receivedCaptureToken !== expectedCaptureToken) {
+          res.status(401).json({ ok: false, error: "Unauthorized capture request" });
+          return;
+        }
+      }
+
       if (!venue) {
         res.status(400).json({ ok: false, error: "venue を指定してください" });
         return;
