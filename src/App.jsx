@@ -1556,6 +1556,12 @@ export default function App() {
   // 集計の絞り込み（的中率・AI収支・自分の収支に共通で適用）
   const [statPeriod, setStatPeriod] = useState("all");   // "all" | "month" | "last30"
   const [statVenue, setStatVenue] = useState("all");     // "all" | 場名
+  const [breakdownFixedOrder, setBreakdownFixedOrder] = useState(() => {
+    try { return localStorage.getItem("hunaken_breakdown_fixed_order_v1") === "1"; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("hunaken_breakdown_fixed_order_v1", breakdownFixedOrder ? "1" : "0"); } catch { /* noop */ }
+  }, [breakdownFixedOrder]);
   // 各買い目で実際に買う点数（このレース用）。未設定キーは「全点」扱い
   const [betLimits, setBetLimits] = useState({}); // {本線:6, 対抗:4, 穴:8, 超穴:3}
   const setBetLimit = (label, n) => setBetLimits((p) => ({ ...p, [label]: n }));
@@ -4331,7 +4337,6 @@ export default function App() {
       { key: "h_a", name: "本線＋穴", parts: ["本線", "穴"] },
       { key: "t_a", name: "対抗＋穴", parts: ["対抗", "穴"] },
       { key: "h_t_a", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
-      { key: "all", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
     ];
     const stats = {};
     for (const p of patterns) stats[p.key] = { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
@@ -5934,7 +5939,7 @@ export default function App() {
             {aiEval && (
               <div style={{ marginBottom: 16 }}>
                 <div style={{
-                  display: "flex", alignItems: "center", gap: 8, marginBottom: 10,
+                  display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap",
                 }}>
                   <span style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8" }}>
                     総合AI評価（全要素を加味したランキング）
@@ -5943,6 +5948,21 @@ export default function App() {
                     fontSize: 11, fontWeight: 800, padding: "3px 10px",
                     borderRadius: 999, background: aiEval.badgeColor, color: "#fff",
                   }}>{aiEval.badge}</span>
+                  <label style={{
+                    display: "inline-flex", alignItems: "center", gap: 5, marginLeft: "auto",
+                    fontSize: 10, fontWeight: 800, color: breakdownFixedOrder ? "#5dd39e" : "#9db5cc",
+                    background: breakdownFixedOrder ? "rgba(46,158,107,0.18)" : "#102238",
+                    border: `1px solid ${breakdownFixedOrder ? "rgba(93,211,158,0.45)" : "#284766"}`,
+                    borderRadius: 999, padding: "4px 9px", cursor: "pointer",
+                  }}>
+                    <input
+                      type="checkbox"
+                      checked={breakdownFixedOrder}
+                      onChange={(e) => setBreakdownFixedOrder(e.target.checked)}
+                      style={{ width: 13, height: 13, margin: 0, accentColor: "#5dd39e" }}
+                    />
+                    項目順
+                  </label>
                 </div>
                 <div style={{ fontSize: 11, color: "#7da3c8", background: "#16273c", border: "1px solid #243a55", borderRadius: 8, padding: "8px 10px", marginBottom: 10, lineHeight: 1.6 }}>
                   並び順（◎○△✕）は枠・決まり手まで含めた<b style={{ color: "#cfe0f0" }}>総合的な本命度</b>です。各艇の<b style={{ color: "#cfe0f0" }}>合計点</b>は当日の6項目（成績・展示・ﾓｰﾀｰ・ST・枠基準・風）の出来を点数化したもので、<b style={{ color: "#cfe0f0" }}>別軸</b>です。印は下位でも合計点が高い艇は「機力・スタートは良い＝一発の妙味」、その逆は「枠の利で買われている」と読めます。
@@ -6017,9 +6037,11 @@ export default function App() {
                       {/* 評価の内訳（項目別配点） */}
                       {r.points && (() => {
                         const maxOf = { 成績: 20, 展示: 20, モーター: 20, ST: 20, 枠基準: 10, 風: 10 };
-                        const items = ["成績", "展示", "モーター", "枠基準", "ST", "風"]
-                          .map((k) => ({ k, pt: r.points[k] ?? 0, max: maxOf[k] }))
-                          .sort((a, b) => (b.pt / b.max) - (a.pt / a.max)); // 達成率の高い順
+                        const fixedOrder = ["成績", "展示", "モーター", "ST", "枠基準", "風"];
+                        const items = fixedOrder.map((k) => ({ k, pt: r.points[k] ?? 0, max: maxOf[k] }));
+                        if (!breakdownFixedOrder) {
+                          items.sort((a, b) => (b.pt / b.max) - (a.pt / a.max)); // 達成率の高い順
+                        }
                         const color = (ratio) => ratio >= 0.7 ? "#5dd39e" : "#7db0e0";
                         return (
                           <div style={{ marginTop: 9, background: "#0e1b2c", borderRadius: 8, padding: "8px 10px" }}>
