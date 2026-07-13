@@ -9,10 +9,10 @@ const CACHE_MS = STATIC_CACHE_MS;
 
 // Vercelの同一実行環境内で共有するキャッシュ。
 // 同じ場・日付・RはTTL内ならBOATCASTへ再アクセスせず、取得中は他ユーザーへ古いキャッシュを返す。
-const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V124__ || new Map();
-globalThis.__HUNAKEN_YOSO_CACHE_V124__ = cacheStore;
-const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V124__ || new Map();
-globalThis.__HUNAKEN_YOSO_INFLIGHT_V124__ = inFlightStore;
+const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V125__ || new Map();
+globalThis.__HUNAKEN_YOSO_CACHE_V125__ = cacheStore;
+const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V125__ || new Map();
+globalThis.__HUNAKEN_YOSO_INFLIGHT_V125__ = inFlightStore;
 
 const SUPABASE_REST_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -208,7 +208,7 @@ async function fetchBoatcastPreRaceStatusPayload(venue, raceNo, ymd) {
   return {
     ok: true,
     action: "prerace",
-    appVersion: "v124",
+    appVersion: "v125",
     venue,
     race: Number(raceNo),
     date: ymd,
@@ -2724,7 +2724,7 @@ function gradeTokensFromText(text) {
     if (re.test(t) && !found.includes(grade)) found.push(grade);
   };
 
-  // 大会名では推測しない。表示されているグレード文字だけ拾う。
+  // 大会名から推測せず、表示されているグレード文字だけ拾う。
   has("PG1", /(^|[^A-Z0-9])P\s*G\s*1([^A-Z0-9]|$)/i);
   has("SG", /(^|[^A-Z0-9])S\s*G([^A-Z0-9]|$)/i);
   has("G1", /(^|[^A-Z0-9])G\s*1([^A-Z0-9]|$)/i);
@@ -2763,28 +2763,91 @@ function isWeakRaceMetaLine(line) {
   if (!t) return true;
   if (/^(本日のレース|レース一覧|競走一覧|出走表|オッズ|結果|払戻金|トップ|メニュー)$/i.test(t)) return true;
   if (/(一覧|発売|締切|オッズ|結果|出走表|投票|ログイン|更新|トップ|メニュー|ニュース|キャンペーン|ヘルプ|ガイド|データ|ランキング|開催日程)/.test(t)) return true;
-  // 「SG・PG1・G1・G2・G3一覧」系の説明行を採用しない。
   if (gradeTokensFromText(t).length >= 2) return true;
   return false;
+}
+
+function isGradeOnlyLine(line) {
+  const t = normalizeRaceMetaText(line).replace(/[\s.・･:：｜|\-ー‐―]+/g, "");
+  return /^(SG|PG1|G1|G2|G3)$/i.test(t);
+}
+
+function isGenericRaceCategoryLine(line) {
+  const t = normalizeRaceMetaText(line).replace(/[\s.・･:：｜|\-ー‐―]+/g, "");
+  return /^(SG|PG1|G1|G2|G3|一般|一般戦|グレードレース|ヴィーナスシリーズ|ルーキーシリーズ|マスターズリーグ|オールレディース|企業杯|イースタンヤング|ウエスタンヤング|モーターボート大賞)$/i.test(t);
+}
+
+function isLikelyRaceEventTitleLine(line) {
+  const t = normalizeRaceMetaText(line);
+  if (isWeakRaceMetaLine(t)) return false;
+  if (isGradeOnlyLine(t) || isGenericRaceCategoryLine(t)) return false;
+  if (t.length < 5) return false;
+  return /(杯|選手権|競走|大会|大賞|記念|シリーズ|リーグ|ヴィーナス|レディース|女子|ルーキー|周年|タイトル|クイーンズ|グランプリ|ダービー|チャンピオン|クラシック|メモリアル|オールスター|甲子園|王座|賞金女王|BBC|トーナメント)/.test(t);
+}
+
+function raceMetaWindow(lines, idx, radius = 2) {
+  const start = Math.max(0, idx - radius);
+  const end = Math.min(lines.length, idx + radius + 1);
+  return lines.slice(start, end);
+}
+
+function pickGradeMetaFromLines(lines) {
+  const hits = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (isWeakRaceMetaLine(line)) continue;
+    const grade = inferGradeFromText(line);
+    if (!grade) continue;
+
+    const win = raceMetaWindow(lines, i, 2).filter((l) => !isWeakRaceMetaLine(l));
+    const titleLine = win.find(isLikelyRaceEventTitleLine) || "";
+    const lineHasTitle = isLikelyRaceEventTitleLine(line);
+
+    // 「G3」単独 + 「ヴィーナスシリーズ」単独のようなナビ・カテゴリ表示は採用しない。
+    if (!lineHasTitle && !titleLine) continue;
+
+    const sourceLine = lineHasTitle ? line : `${line} ${titleLine}`.trim();
+    const score = (lineHasTitle ? 10 : 6) + (isGradeOnlyLine(line) ? 0 : 2) + (inferLadiesFromText(sourceLine) ? 1 : 0);
+    hits.push({ grade, sourceLine, titleLine: titleLine || line, score, idx: i });
+  }
+
+  hits.sort((a, b) => b.score - a.score || a.idx - b.idx);
+  return hits[0] || null;
+}
+
+function pickLadiesMetaFromLines(lines, gradeHit = null) {
+  if (gradeHit && inferLadiesFromText(`${gradeHit.sourceLine} ${gradeHit.titleLine}`)) {
+    return { isLadies: true, sourceLine: gradeHit.sourceLine || gradeHit.titleLine || "" };
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (isWeakRaceMetaLine(line) || isGenericRaceCategoryLine(line)) continue;
+    if (!inferLadiesFromText(line)) continue;
+
+    const win = raceMetaWindow(lines, i, 2).filter((l) => !isWeakRaceMetaLine(l));
+    const titleLine = win.find(isLikelyRaceEventTitleLine) || "";
+
+    // 「ヴィーナスシリーズ」だけのカテゴリ表示は採用しない。
+    if (!isLikelyRaceEventTitleLine(line) && !titleLine) continue;
+    return { isLadies: true, sourceLine: isLikelyRaceEventTitleLine(line) ? line : `${line} ${titleLine}`.trim() };
+  }
+
+  return { isLadies: false, sourceLine: "" };
 }
 
 function parseRaceIndexMeta(html) {
   const decoded = decodeEntities(String(html || ""));
   const lines = textLinesFromHtml(decoded).map(normalizeRaceMetaText).filter(Boolean);
-  const candidates = lines.filter((l) => !isWeakRaceMetaLine(l));
+  const gradeHit = pickGradeMetaFromLines(lines);
+  const ladiesHit = pickLadiesMetaFromLines(lines, gradeHit);
 
-  const gradeLine = candidates.find((l) => inferGradeFromText(l));
-  const ladiesLine = candidates.find((l) => inferLadiesFromText(l));
-  const titleLine = candidates.find((l) =>
-    (inferGradeFromText(l) || inferLadiesFromText(l) || /(杯|選手権|競走|ヴィーナス|ルーキー|周年|タイトル|クイーンズ|グランプリ|ダービー)/.test(l))
-    && !/^(本日のレース)$/i.test(l)
-  );
+  const grade = gradeHit ? gradeHit.grade : null;
+  const isLadies = !!ladiesHit.isLadies;
+  const eventName = gradeHit?.titleLine ? normalizeRaceMetaText(gradeHit.titleLine).slice(0, 120) : "";
 
-  const grade = gradeLine ? inferGradeFromText(gradeLine) : null;
-  const isLadies = !!ladiesLine;
-  const eventName = titleLine ? normalizeRaceMetaText(titleLine).slice(0, 120) : "";
-
-  const daySource = [gradeLine, ladiesLine, titleLine].filter(Boolean).join(" ");
+  const daySource = [gradeHit?.sourceLine, ladiesHit?.sourceLine, eventName].filter(Boolean).join(" ");
   const dayMatch = daySource.match(/(初日|2日目|3日目|4日目|5日目|最終日)/);
   const eventDay = dayMatch ? dayMatch[1] : "";
 
@@ -2795,8 +2858,11 @@ function parseRaceIndexMeta(html) {
     eventName,
     isLadies,
     raceType: "",
-    gradeSourceLine: gradeLine || "",
-    ladiesSourceLine: ladiesLine || "",
+    gradeSourceLine: gradeHit?.sourceLine || "",
+    ladiesSourceLine: ladiesHit.sourceLine || "",
+    metaDebugLines: lines
+      .filter((l) => !isWeakRaceMetaLine(l) && (gradeTokensFromText(l).length || inferLadiesFromText(l) || isLikelyRaceEventTitleLine(l)))
+      .slice(0, 30),
   };
 }
 
@@ -2952,7 +3018,7 @@ async function fetchSchedulePayload(venue, ymd) {
     return {
       ok: true,
       action: "schedule",
-      appVersion: "v124",
+      appVersion: "v125",
       venue,
       date: ymd,
       url,
@@ -3080,7 +3146,7 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
       });
       return {
         ok: true,
-        appVersion: "v124",
+        appVersion: "v125",
         venue,
         race: raceNo,
         date: ymd,
@@ -3214,7 +3280,7 @@ export default async function handler(req, res) {
       res.status(200).json({
         ok: true,
         action: "schedules",
-        appVersion: "v124",
+        appVersion: "v125",
         date: ymd,
         statusesByVenue,
         fetchedAt: new Date().toISOString(),
@@ -3288,7 +3354,7 @@ export default async function handler(req, res) {
         return {
           ok: true,
           action: "odds",
-          appVersion: "v124",
+          appVersion: "v125",
           venue,
           race: raceNo,
           date: ymd,
