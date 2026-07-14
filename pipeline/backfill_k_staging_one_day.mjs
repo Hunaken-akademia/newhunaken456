@@ -1,8 +1,9 @@
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { writeFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import iconv from "iconv-lite";
 
-const VERSION = "k-backfill-staging-v5-rank00-other-fix";
+const VERSION = "k-backfill-staging-v6-date-and-duplicate-guard";
 const argDate = process.argv[2];
 const dryArg = process.argv.find((a) => a.startsWith("--dry="));
 const DRY = dryArg ? dryArg.split("=")[1] !== "false" : true;
@@ -360,11 +361,63 @@ async function download(url, dest) {
   console.log("  saved", buf.length, "bytes");
 }
 
-function unpack(lzhPath, tmpDir) {
+function expectedKTxtName(isoDate) {
+  const [Y, M, D] = isoDate.split("-");
+  return `k${Y.slice(2)}${M}${D}.txt`;
+}
+
+function unpack(lzhPath, tmpDir, expectedDate) {
   execSync(`lha xfw=${tmpDir} ${lzhPath}`, { stdio: "inherit" });
-  const txt = readdirSync(tmpDir).find((f) => /\.txt$/i.test(f));
-  if (!txt) throw new Error("解凍後のテキストが見つかりません");
+  const txtFiles = readdirSync(tmpDir).filter((f) => /\.txt$/i.test(f));
+  if (!txtFiles.length) throw new Error("解凍後のテキストが見つかりません");
+
+  // 同じ古いK票を別日付として読まないため、展開されたTXT名も日付一致を必須にします。
+  const expected = expectedKTxtName(expectedDate).toLowerCase();
+  const txt = txtFiles.find((f) => f.toLowerCase() === expected);
+  if (!txt) {
+    throw new Error(`安全停止: 解凍TXTの日付が一致しません expected=${expected} found=${txtFiles.join(",")}`);
+  }
   return `${tmpDir}/${txt}`;
+}
+
+function normalizeFullWidthDigits(s) {
+  return String(s || "").replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0));
+}
+
+function explicitDateHintFromText(text) {
+  const t = normalizeFullWidthDigits(text);
+  const m = t.match(/(20\d{2})\s*[\/\-年.]\s*(\d{1,2})\s*[\/\-月.]\s*(\d{1,2})\s*日?/);
+  if (!m) return null;
+  const y = m[1];
+  const mo = String(Number(m[2])).padStart(2, "0");
+  const d = String(Number(m[3])).padStart(2, "0");
+  return `${y}-${mo}-${d}`;
+}
+
+function assertTextDateIfPresent(text, expectedDate) {
+  const hint = explicitDateHintFromText(text);
+  // K票本文に明確な日付がある場合だけ照合します。無い形式のファイルはTXT名ガードで守ります。
+  if (hint && hint !== expectedDate) {
+    throw new Error(`安全停止: K票本文の日付が指定日と一致しません expected=${expectedDate} actual=${hint}`);
+  }
+  return hint;
+}
+
+function resultSignatureHash(rows) {
+  const sig = rows
+    .map((r) => [
+      r.place_no,
+      r.race_no,
+      r.boat_no,
+      r.course ?? "",
+      r.regno ?? "",
+      r.finish_order ?? r.official_rank_text ?? "",
+      r.st ?? "",
+      r.result_status ?? "",
+    ].join(":"))
+    .sort()
+    .join("|");
+  return createHash("sha256").update(sig).digest("hex").slice(0, 16);
 }
 
 async function supabaseRequest(path, options = {}) {
@@ -383,6 +436,55 @@ async function supabaseRequest(path, options = {}) {
   const text = await res.text();
   if (!res.ok) throw new Error(`Supabase ${path} failed ${res.status}: ${text}`);
   return text ? JSON.parse(text) : null;
+}
+
+function appendEq(qs, key, value) {
+  if (value == null || value === "") return false;
+  qs.append(key, `eq.${value}`);
+  return true;
+}
+
+async function findExistingDuplicateSignatures(rows, targetDate) {
+  // 同じ「選手・場・R・艇・進入・着順・ST」が別日で大量に出るのは通常あり得ない。
+  // 既にstagingが汚れている時や、同じK票を日付だけ変えて保存しようとした時に止めます。
+  const limitDates = Number(process.env.K_DUPLICATE_SIGNATURE_DATES || "3");
+  const candidates = rows
+    .filter((r) => r.regno && r.place_no && r.race_no && r.boat_no && r.course != null && r.finish_order != null && r.st != null)
+    .slice(0, 80);
+
+  const suspicious = [];
+  for (const r of candidates) {
+    const qs = new URLSearchParams();
+    qs.append("select", "race_date");
+    appendEq(qs, "regno", r.regno);
+    appendEq(qs, "place_no", r.place_no);
+    appendEq(qs, "race_no", r.race_no);
+    appendEq(qs, "boat_no", r.boat_no);
+    appendEq(qs, "course", r.course);
+    appendEq(qs, "finish_order", r.finish_order);
+    appendEq(qs, "st", r.st);
+    qs.append("race_date", `neq.${targetDate}`);
+    qs.append("limit", "20");
+
+    const existing = await supabaseRequest(`race_results_staging?${qs.toString()}`);
+    const dates = [...new Set((existing || []).map((x) => x.race_date).filter(Boolean))].filter((d) => d !== targetDate);
+    if (dates.length >= limitDates) {
+      suspicious.push({
+        regno: r.regno,
+        racer_name: r.racer_name,
+        place_no: r.place_no,
+        race_no: r.race_no,
+        boat_no: r.boat_no,
+        course: r.course,
+        finish_order: r.finish_order,
+        st: r.st,
+        existing_date_count: dates.length,
+        sample_dates: dates.slice(0, 10),
+      });
+    }
+    if (suspicious.length >= 3) break;
+  }
+  return suspicious;
 }
 
 async function insertCaptureRun(runId, date, summary = {}) {
@@ -456,8 +558,9 @@ async function upsertRows(rows, captureRunId) {
   try {
     const lzh = `${tmp}/${fname}`;
     await download(url, lzh);
-    const txtPath = unpack(lzh, tmp);
+    const txtPath = unpack(lzh, tmp, argDate);
     const text = iconv.decode(await import("node:fs").then((fs) => fs.readFileSync(txtPath)), "Shift_JIS");
+    const textDateHint = assertTextDateIfPresent(text, argDate);
     const parsed = parseRows(text, argDate);
     rows = parsed.rows;
     warnings = parsed.warnings;
@@ -468,6 +571,7 @@ async function upsertRows(rows, captureRunId) {
     const specialStatusRows = rows.filter((r) => r.result_status !== "NORMAL").length;
     const avgExcludedRows = rows.filter((r) => r.raw_data && r.raw_data.average_st_eligible === false).length;
     const rowsWithoutRaceTime = rows.filter((r) => !r.raw_data?.race_time).length;
+    const signatureHash = resultSignatureHash(rows);
 
     console.log("=== K票 1日分 staging保存 事前確認 ===");
     console.log(`date=${argDate}`);
@@ -476,6 +580,8 @@ async function upsertRows(rows, captureRunId) {
     console.log(`candidate_rows=${rows.length}`);
     console.log(`candidate_races=${raceCount}`);
     console.log(`candidate_venues=${venueCount}`);
+    console.log(`text_date_hint=${textDateHint || "none"}`);
+    console.log(`signature_hash=${signatureHash}`);
     console.log(`special_status_rows=${specialStatusRows}`);
     console.log(`average_st_excluded_rows=${avgExcludedRows}`);
     console.log(`rows_without_race_time=${rowsWithoutRaceTime}`);
@@ -490,6 +596,14 @@ async function upsertRows(rows, captureRunId) {
       process.exit(2);
     }
 
+    const duplicateSignatures = await findExistingDuplicateSignatures(rows, argDate);
+    console.log(`duplicate_signature_hits=${duplicateSignatures.length}`);
+    if (duplicateSignatures.length > 0) {
+      console.error("安全停止: 同一結果が別日付で複数回見つかりました。K票の取り違え/日付コピーの疑いがあるためDB保存しません。");
+      console.error(JSON.stringify(duplicateSignatures, null, 2));
+      process.exit(3);
+    }
+
     if (DRY) {
       console.log("DB_WRITE=NONE");
       console.log("dry=true のため、stagingにも本番にも書き込んでいません。");
@@ -498,6 +612,8 @@ async function upsertRows(rows, captureRunId) {
 
     await insertCaptureRun(runId, argDate, {
       source_url: url,
+      signature_hash: signatureHash,
+      text_date_hint: textDateHint,
       candidate_rows: rows.length,
       candidate_races: raceCount,
       candidate_venues: venueCount,
@@ -514,6 +630,8 @@ async function upsertRows(rows, captureRunId) {
       failed_count: 0,
       summary: {
         source_url: url,
+        signature_hash: signatureHash,
+        text_date_hint: textDateHint,
         candidate_rows: rows.length,
         candidate_races: raceCount,
         candidate_venues: venueCount,
