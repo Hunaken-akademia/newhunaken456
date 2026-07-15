@@ -1461,8 +1461,8 @@ function buildRaceResultRows({ venue, raceNo, ymd, resultHtml, racers, sttRaw = 
       race_no: Number(raceNo),
       boat: Number(fr.boat),
       course: course >= 1 && course <= 6 ? course : Number(fr.boat),
-      rank: Number(fr.rank) >= 1 && Number(fr.rank) <= 6 ? Number(fr.rank) : 7,
-      kimarite: kimarite || null,
+      rank: Number(fr.rank) >= 1 && Number(fr.rank) <= 6 ? Number(fr.rank) : null,
+      kimarite: Number(fr.rank) === 1 ? (kimarite || null) : null,
       regno: fr.regno || (racer?.regNo ? Number(racer.regNo) : null),
       st: Number.isFinite(Number(st)) ? Number(st) : null,
       is_f: status === "F" || sr?.isF === true || Number(st) < 0,
@@ -1473,7 +1473,13 @@ function buildRaceResultRows({ venue, raceNo, ymd, resultHtml, racers, sttRaw = 
   const expected = racerCount >= 4 && racerCount <= 6 ? racerCount : 6;
   const uniqueBoats = new Set(rows.map((r) => r.boat));
   const startCount = rows.filter((r) => Number.isFinite(r.st)).length;
-  const validCore = rows.every((r) => r.regno && r.course >= 1 && r.course <= 6 && r.rank >= 1);
+  const recognizedSpecialStatuses = new Set(["F", "L", "欠", "失", "転", "落", "妨", "不"]);
+  const validCore = rows.every((r, index) => {
+    const status = String(finishRows[index]?.status || "").trim();
+    const hasValidRank = Number(r.rank) >= 1 && Number(r.rank) <= 6;
+    const hasRecognizedSpecialStatus = r.rank == null && recognizedSpecialStatuses.has(status);
+    return r.regno && r.course >= 1 && r.course <= 6 && (hasValidRank || hasRecognizedSpecialStatus);
+  });
   const coreComplete = rows.length >= expected && uniqueBoats.size >= expected && validCore;
   // 公式結果で欠場・失格等があると、着順6艇に対して実STが5艇だけのケースがある。
   // その1艇のために着順・他5艇のSTまで破棄しない。ST欠損はnullで保存し、再取得で補修する。
@@ -2142,15 +2148,32 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
   const urls = boatcastRaceUrls(venue, raceNo, dateStr);
   if (!urls) throw new Error(`${venue}の場コードが見つかりません`);
 
+  // v127速度改善:
+  // ・以前は「6本並列 → 公式beforeinfoを直列 → オッズを直列」だったため、
+  //   キャッシュミス時の待ち時間が合算されていた。全て最初から並列に開始する。
+  // ・気象/beforeinfoは補助データなのでタイムアウトを8秒に短縮
+  //   （本体の展示txtは従来どおり15秒）。1本の遅延で全体が引きずられにくくする。
+  // ・各フェーズの所要msを timingMs として返し、遅延原因を特定できるようにする。
+  const timingMs = {};
+  const tBatchStart = Date.now();
+
+  const officialBeforeInfoUrl = buildOfficialBeforeInfoUrl(venue, raceNo, dateStr);
+
+  // オッズも独立データなので同時に開始しておき、最後に待つ。
+  const oddsPromise = fetchBoatcastOddsForVenue(venue, raceNo, dateStr)
+    .catch((e) => ({ ok: false, error: e.message || String(e) }));
+
   const fetches = [
     fetchHtml(urls.str3),
     fetchHtml(urls.stt),
     fetchHtml(urls.oriten),
     fetchHtml(urls.tkz),
-    urls.weatherPrev ? fetchHtml(urls.weatherPrev) : Promise.resolve(""),
-    fetchHtml(urls.weatherCurrent),
+    urls.weatherPrev ? fetchHtml(urls.weatherPrev, { timeoutMs: 8000 }) : Promise.resolve(""),
+    fetchHtml(urls.weatherCurrent, { timeoutMs: 8000 }),
+    officialBeforeInfoUrl ? fetchHtml(officialBeforeInfoUrl, { timeoutMs: 8000 }) : Promise.resolve(""),
   ];
-  const [str3Res, sttRes, oritenRes, tkzRes, weatherPrevRes, weatherCurrentRes] = await Promise.allSettled(fetches);
+  const [str3Res, sttRes, oritenRes, tkzRes, weatherPrevRes, weatherCurrentRes, beforeInfoRes] = await Promise.allSettled(fetches);
+  timingMs.fetchBatch = Date.now() - tBatchStart;
 
   const str3 = str3Res.status === "fulfilled" ? str3Res.value : "";
   const stt = sttRes.status === "fulfilled" ? sttRes.value : "";
@@ -2161,12 +2184,7 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
 
   // 公式beforeinfoは展示公開前から最新の水面気象を持っていることが多い。
   // 風は点数に直結するため、BOATCASTの前レース結果txtよりこちらを優先する。
-  const officialBeforeInfoUrl = buildOfficialBeforeInfoUrl(venue, raceNo, dateStr);
-  let officialBeforeInfoHtml = "";
-  if (officialBeforeInfoUrl) {
-    try { officialBeforeInfoHtml = await fetchHtml(officialBeforeInfoUrl); }
-    catch (e) { officialBeforeInfoHtml = ""; }
-  }
+  const officialBeforeInfoHtml = beforeInfoRes.status === "fulfilled" ? beforeInfoRes.value : "";
 
   const racers = parseBoatcastRacerInfo(str3);
   const racersByBoat = {};
@@ -2253,7 +2271,9 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
   let exhibitionSaved = { ok: false, skipped: true, reason: "展示未取得" };
   if (rows) {
     rows = sanitizeDisplayRows(rows).map((r) => ({ ...r, racer: racersByBoat[r.boat] || null }));
+    const tSave = Date.now();
     exhibitionSaved = await saveExhibitionRows({ venue, raceNo, ymd: dateStr, rows, source: "BOATCAST" });
+    timingMs.saveExhibition = Date.now() - tSave;
   }
 
   // 風は「現在選択しているレースの公式beforeinfo」を最優先。
@@ -2290,9 +2310,11 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
   }
   weather.windKey = windKeyFromDirectionAndSpeed(weather.windDirection, weather.windSpeed);
 
-  let oddsInfo = null;
-  try { oddsInfo = await fetchBoatcastOddsForVenue(venue, raceNo, dateStr); }
-  catch (e) { oddsInfo = { ok: false, error: e.message || String(e) }; }
+  // v127: オッズは最初に並列開始済み。ここでは完了を待つだけ。
+  const tOdds = Date.now();
+  const oddsInfo = await oddsPromise;
+  timingMs.awaitOdds = Date.now() - tOdds;
+  timingMs.total = Date.now() - tBatchStart;
 
   const displayIssue = rows
     ? { code: "", message: "" }
@@ -2319,6 +2341,7 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
     oddsUrl: oddsInfo?.ok ? oddsInfo.url : null,
     oddsError: oddsInfo && !oddsInfo.ok ? oddsInfo.error : "",
     exhibitionSaved,
+    timingMs,
   };
 }
 
@@ -3170,15 +3193,20 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
   if (JCD[venue]) {
     try {
       const bc = await fetchBoatcastPayload(venue, raceNo, ymd);
-      const preRaceStatusSaved = await savePreRaceStatus({ venue, raceNo, ymd, racers: bc.racers, source: "BOATCAST" });
-      const raceMetaSaved = await saveRaceMetaRows({
-        venue,
-        ymd,
-        raceNo,
-        racers: bc.racers,
-        meta: {},
-        source: "BOATCAST_RACERS",
-      });
+      // v127: 直列だった2つのSupabase保存を並列化（応答までの待ちを短縮）。
+      const tSaves = Date.now();
+      const [preRaceStatusSaved, raceMetaSaved] = await Promise.all([
+        savePreRaceStatus({ venue, raceNo, ymd, racers: bc.racers, source: "BOATCAST" }),
+        saveRaceMetaRows({
+          venue,
+          ymd,
+          raceNo,
+          racers: bc.racers,
+          meta: {},
+          source: "BOATCAST_RACERS",
+        }),
+      ]);
+      if (bc.timingMs) bc.timingMs.saveStatusAndMeta = Date.now() - tSaves;
       return {
         ok: true,
         appVersion: "v126",
@@ -3204,6 +3232,7 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
         oddsCount: bc.oddsCount,
         oddsUrl: bc.oddsUrl,
         oddsError: bc.oddsError,
+        timingMs: bc.timingMs || null,
         fetchedAt: new Date().toISOString(),
       };
     } catch (e) {
