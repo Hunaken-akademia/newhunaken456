@@ -1,5 +1,21 @@
 // ============================================================
-// K票（競走成績）取り込みスクリプト — racesテーブル対応・修正版
+// K票（競走成績）取り込みスクリプト — v127 レビュー修正版
+//
+// v127での修正点:
+// 1) 会場判定の根本修正:
+//    旧版は「行内に場名を含むだけ」で場を切り替えていたため、
+//    ・「唐津」より先に「津」がマッチして place_no=9 に化ける
+//    ・選手名に「戸田」「大村」等を含む行でも場が切り替わる
+//    という汚染が起きていた。
+//    staging用パーサと同じ「ボートレース○○」を含む行だけを
+//    場ヘッダとして扱い、場名は長い順に照合する。
+// 2) 特殊着順行（F/L/K欠場/失格/転覆/落水/妨害/不完走/S）も
+//    1レース6艇の1行として保存する（rank=null, is_fフラグ）。
+//    staging用パーサ(parseResultLine)と同じロジックを移植し、
+//    staging→本番反映後のデータと表現を揃える。
+//    ※Fの st は staging と同じ「正の数値 + is_f=true」で保存する。
+// 3) download / upsert の fetch にタイムアウトを追加（ハング防止）。
+//
 // 使い方:
 //   node ingest_k.mjs 2026-07-02
 //   node ingest_k.mjs 2026-07-02 --dry
@@ -31,9 +47,23 @@ const TMP = "./_tmp_k";
 rmSync(TMP, { recursive: true, force: true });
 mkdirSync(TMP, { recursive: true });
 
+// v127: ハングした接続で処理が止まらないよう、全fetchにタイムアウトを付ける。
+async function fetchWithTimeout(url, options = {}, timeoutMs = 60000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (e?.name === "AbortError") throw new Error(`timeout ${timeoutMs}ms: ${url}`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function download(url, dest) {
   console.log("↓ download:", url);
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, {}, 60000);
   if (!res.ok) throw new Error(`ダウンロード失敗 ${res.status} ${url}`);
   const buf = Buffer.from(await res.arrayBuffer());
   writeFileSync(dest, buf);
@@ -52,6 +82,143 @@ function normalizeName(s) {
     .replace(/\s+/g, "")
     .replace(/　/g, "")
     .trim();
+}
+
+// ============================================================
+// v127: 以下は backfill_k_staging_one_day.mjs と同一ロジックの移植。
+// F/L/K欠場/失格/転覆/落水/妨害/不完走/S などの特殊着順行も
+// 1レース6艇の1行として認識する。
+// ============================================================
+
+function compactAll(s) {
+  return String(s || "").replace(/[\s　]+/g, "");
+}
+
+function normalizeNumberText(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s || s === "." || /^\.\s*\.$/.test(s)) return null;
+  if (/^\.\d+$/.test(s)) return `0${s}`;
+  return s;
+}
+
+function parseNumeric(v) {
+  const normalized = normalizeNumberText(v);
+  if (normalized == null) return null;
+  const n = Number(normalized);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseStText(stText) {
+  const raw = String(stText || "").trim();
+  const numeric = raw.replace(/^[FL]/i, "");
+  return parseNumeric(numeric);
+}
+
+function resultStatusFromRankAndSt(rankText, stText) {
+  const r = String(rankText || "").trim().toUpperCase();
+  const st = String(stText || "").trim().toUpperCase().replace(/\s+/g, "");
+  if (r.startsWith("F") || st.startsWith("F")) return "F";
+  if (r.startsWith("L") || st.startsWith("L")) return "L";
+  if (r.startsWith("K")) return "SCRATCHED";
+  if (r.startsWith("欠")) return "ABSENT";
+  if (r.startsWith("失")) return "DISQUALIFIED";
+  if (r.startsWith("転")) return "CAPSIZED";
+  if (r.startsWith("落")) return "FELL";
+  if (r.startsWith("妨")) return "OBSTRUCTION";
+  if (r.startsWith("不")) return "DID_NOT_FINISH";
+  if (r.startsWith("S")) return "OTHER";
+  if (r === "00") return "OTHER";
+  if (/^\d{2}$/.test(r)) return "NORMAL";
+  return "UNKNOWN";
+}
+
+function finishOrderFromRank(rankText, status) {
+  if (status !== "NORMAL") return null;
+  const n = Number(rankText);
+  return Number.isInteger(n) && n >= 1 && n <= 6 ? n : null;
+}
+
+function parseResultLine(line) {
+  const head = String(line || "").match(/^\s*(\d{2}|F\d?|L\d?|S\d?|K\d?|欠|失|転|落|妨|不)\s+([1-6])\s+(\d{4})\s+(.+)$/i);
+  if (!head) return null;
+
+  const rankText = String(head[1]).trim().toUpperCase();
+  const boatNo = Number(head[2]);
+  const regno = Number(head[3]);
+  const tail = head[4];
+
+  // K0/K1（欠場系）は展示・進入・STを持たない行として保持する。
+  if (/^K\d?$/.test(rankText)) {
+    const halfTail = tail.replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0));
+    const beforeScratchSuffix = halfTail
+      .replace(/\s+(?:K\s*\.|(?:0\.00|\d\.\d{2}))\s+K\s*\.\s+\.\s*\.\s*$/i, "")
+      .trimEnd();
+    const kMatch = beforeScratchSuffix.match(/^(.+?)\s+(\d{1,3})\s+(\d{1,3})$/);
+    if (!kMatch) return null;
+    return {
+      rankText,
+      boatNo,
+      regno,
+      racerName: compactAll(kMatch[1]),
+      motorNo: Number(kMatch[2]),
+      exhibitTime: null,
+      course: null,
+      st: null,
+      resultStatus: resultStatusFromRankAndSt(rankText, "K."),
+      finishOrder: null,
+    };
+  }
+
+  // 5・6着などでレースタイムが「.  .」になる行にも対応。
+  let metrics = tail.match(/\s(\d\.\d{2})\s+([1-6])\s+((?:[FLfl]\s*\.)|(?:[FLfl]?\s*(?:(?:\d\.\d{2})|(?:0?\.\d{2}))))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/i);
+  let metricsNoCourse = null;
+
+  // L1/F1 の一部は進入欄が空欄で ST欄だけ「L .」「F .」になる。
+  if (!metrics && /^[FL]\d?$/i.test(rankText)) {
+    metricsNoCourse = tail.match(/\s(\d\.\d{2})\s+((?:[FLfl]\s*\.))(?:\s+((?:\d\.\d{2}\.\d)|(?:\.\s*\.)))?\s*$/i);
+  }
+
+  if (!metrics && !metricsNoCourse) return null;
+
+  const metricIndex = metrics ? metrics.index : metricsNoCourse.index;
+  const beforeMetrics = tail.slice(0, metricIndex).trimEnd();
+  const nameMotorBoat = beforeMetrics.match(/^(.+?)\s+(\d{1,3})\s+(\d{1,3})$/);
+  const racerName = nameMotorBoat ? compactAll(nameMotorBoat[1]) : null;
+  const motorNo = nameMotorBoat ? Number(nameMotorBoat[2]) : null;
+
+  const course = metrics ? Number(metrics[2]) : null;
+  const officialStText = normalizeNumberText(String((metrics ? metrics[3] : metricsNoCourse[2]) || "").replace(/\s+/g, ""));
+  const st = parseStText(officialStText);
+  if (!officialStText) return null;
+
+  const resultStatus = resultStatusFromRankAndSt(rankText, officialStText);
+  if (st == null && resultStatus !== "F" && resultStatus !== "L") return null;
+  const finishOrder = finishOrderFromRank(rankText, resultStatus);
+
+  return {
+    rankText,
+    boatNo,
+    regno,
+    racerName,
+    motorNo,
+    exhibitTime: Number(metrics ? metrics[1] : metricsNoCourse[1]),
+    course,
+    st,
+    resultStatus,
+    finishOrder,
+  };
+}
+
+// v127: 場名は長い順に照合し、「ボートレース○○」を含む行だけを場ヘッダとする。
+// 選手名や決まり手の行で場が化ける事故を防ぐ。
+function detectVenuePlaceNo(line, placeMap, venuesSorted) {
+  const s = compactAll(line);
+  if (!s.includes("ボートレース")) return null;
+  for (const name of venuesSorted) {
+    if (s.includes(`ボートレース${name}`)) return placeMap[name];
+  }
+  return null;
 }
 
 function normalizeLine(s) {
@@ -148,8 +315,10 @@ function parseK(text) {
     "福岡": 22,
     "唐津": 23,
     "大村": 24,
-    "大　村": 24,
   };
+
+  // v127: 「唐津」より先に「津」がマッチしないよう、長い場名から照合する。
+  const venuesSorted = Object.keys(placeMap).sort((a, b) => b.length - a.length);
 
   function upsertRace() {
     if (!placeNo || !raceNo || !latestEnv) return;
@@ -171,14 +340,19 @@ function parseK(text) {
 
   for (const raw of lines) {
     const line = raw.replace(/\u3000/g, " ");
-    const compact = line.replace(/\s+/g, "");
 
-    for (const [name, no] of Object.entries(placeMap)) {
-      const n = name.replace(/\s+/g, "");
-      if (compact.includes(n)) {
-        placeNo = no;
-        break;
+    // v127: 「ボートレース○○」を含む行だけを場ヘッダとみなす。
+    // 場が切り替わったら前の場のレース番号・環境情報を引き継がない。
+    const detectedPlaceNo = detectVenuePlaceNo(raw, placeMap, venuesSorted);
+    if (detectedPlaceNo) {
+      if (detectedPlaceNo !== placeNo) {
+        placeNo = detectedPlaceNo;
+        raceNo = null;
+        currentKimarite = null;
+        latestEnv = null;
+        latestPostTime = null;
       }
+      continue;
     }
 
     const env = parseWeatherWindWave(line);
@@ -215,50 +389,26 @@ function parseK(text) {
       continue;
     }
 
-    // 着順行:
-    // 01  2 4724 吉　田　祐　貴 62   52  6.91   2    0.13     1.51.6
-    const m = line.match(/^\s*(\d{2})\s+(\d)\s+(\d{4})\s+(.+?)\s+(\d{1,3})\s+(\d{1,3})\s+(\d\.\d{2})\s+(\d)\s+([FLＦＬ]?\s*0?\.\d{2}|[FLＦＬ]?\.\d{2}|[FLＦＬ]?\d\.\d{2})\b/);
+    // v127: 着順行の解析を staging用パーサと同一ロジックへ差し替え。
+    // 通常着(01-06)に加え F/L/K欠場/失格/転覆/落水/妨害/不完走/S も
+    // 1レース6艇の1行として保存する（rank=nullで保持）。
+    // Fの st は staging と同じ「正の数値 + is_f=true」で保存する。
+    const parsed = parseResultLine(raw);
 
-    if (m && placeNo && raceNo) {
-      const rank = Number(m[1]);
-      const boat = Number(m[2]);
-      const regno = Number(m[3]);
-      const racerName = normalizeName(m[4]);
-      const motorNo = Number(m[5]);
-      const course = Number(m[8]);
-      const stRaw = String(m[9])
-        .replace(/\s+/g, "")
-        .replace(/Ｆ/g, "F")
-        .replace(/Ｌ/g, "L");
-
-      let st = null;
-      let isF = false;
-
-      if (/^F/i.test(stRaw)) {
-        const num = stRaw.replace(/^F/i, "");
-        st = Number(num.startsWith(".") ? `0${num}` : num);
-        if (Number.isFinite(st)) st = -Math.abs(st);
-        isF = true;
-      } else if (/^L/i.test(stRaw)) {
-        st = null;
-      } else {
-        st = Number(stRaw.startsWith(".") ? `0${stRaw}` : stRaw);
-        if (!Number.isFinite(st)) st = null;
-      }
-
+    if (parsed && placeNo && raceNo) {
       rows.push({
         race_date: argDate,
         place_no: placeNo,
         race_no: raceNo,
-        boat,
-        regno,
-        rank: rank >= 1 && rank <= 6 ? rank : null,
-        st,
-        is_f: isF,
-        kimarite: rank === 1 ? currentKimarite : null,
-        course: course >= 1 && course <= 6 ? course : null,
-        motor_no: Number.isFinite(motorNo) ? motorNo : null,
-        racer_name: racerName || null,
+        boat: parsed.boatNo,
+        regno: parsed.regno,
+        rank: parsed.finishOrder,
+        st: parsed.resultStatus === "F" && parsed.st != null ? -Math.abs(parsed.st) : parsed.st,
+        is_f: parsed.resultStatus === "F",
+        kimarite: parsed.finishOrder === 1 ? currentKimarite : null,
+        course: parsed.course != null && parsed.course >= 1 && parsed.course <= 6 ? parsed.course : null,
+        motor_no: Number.isFinite(parsed.motorNo) ? parsed.motorNo : null,
+        racer_name: parsed.racerName || null,
       });
     }
   }
@@ -293,7 +443,7 @@ async function upsertTable(table, rows, conflictCols) {
   for (let i = 0; i < rows.length; i += chunk) {
     const batch = rows.slice(i, i + chunk);
 
-    const res = await fetch(`${SUPA}/rest/v1/${table}?on_conflict=${conflictCols}`, {
+    const res = await fetchWithTimeout(`${SUPA}/rest/v1/${table}?on_conflict=${conflictCols}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -302,7 +452,7 @@ async function upsertTable(table, rows, conflictCols) {
         Prefer: "resolution=merge-duplicates,return=minimal",
       },
       body: JSON.stringify(batch),
-    });
+    }, 30000);
 
     if (!res.ok) {
       throw new Error(`${table} 投入失敗 ${res.status}: ${await res.text()}`);
