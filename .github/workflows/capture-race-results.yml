@@ -1,5 +1,8 @@
 name: capture-race-results
 
+# 旧HTML解析方式は自動実行しない。
+# 毎日の確定結果は daily-ingest.yml が前日分のK票から race_results へ保存する。
+# このWorkflowは調査・手動補修用として workflow_dispatch のみ残す。
 on:
   workflow_dispatch:
     inputs:
@@ -10,23 +13,19 @@ on:
       mode:
         description: 'today=当日 / yesterday=前日補修'
         required: true
-        default: 'today'
+        default: 'yesterday'
         type: choice
         options:
-          - today
           - yesterday
+          - today
       dry:
         description: 'trueならURL確認のみ / falseなら保存実行'
         required: true
-        default: 'false'
+        default: 'true'
         type: choice
         options:
           - 'true'
           - 'false'
-
-  schedule:
-    - cron: '35 14 * * *'
-    - cron: '40 23 * * *'
 
 jobs:
   capture:
@@ -51,13 +50,12 @@ jobs:
           DATE_INPUT='${{ github.event.inputs.date }}'
           MODE_INPUT='${{ github.event.inputs.mode }}'
           DRY_INPUT='${{ github.event.inputs.dry }}'
-          SCHEDULE_EXPR='${{ github.event.schedule }}'
 
           CMD="node pipeline/capture_race_results.mjs"
 
           if [ -n "$DATE_INPUT" ]; then
             CMD="$CMD $DATE_INPUT"
-          elif [ "$MODE_INPUT" = "yesterday" ] || [ "$SCHEDULE_EXPR" = "40 23 * * *" ]; then
+          elif [ "$MODE_INPUT" = "yesterday" ]; then
             CMD="$CMD --yesterday"
           fi
 
