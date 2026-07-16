@@ -1,0 +1,55 @@
+name: backfill-race-metadata-staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "開始日 YYYY-MM-DD"
+        required: true
+        default: "2025-07-16"
+      days:
+        description: "日数（1〜31）。過去1年は月単位で分割実行"
+        required: true
+        default: "3"
+      dry:
+        description: "true=取得確認のみ / false=races_stagingへ保存"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      continue_on_error:
+        description: "一部の場で失敗しても最後まで続行"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Backfill race metadata to staging only
+        env:
+          PUBLIC_APP_URL: ${{ vars.PUBLIC_APP_URL || 'https://newhunaken456.vercel.app' }}
+          CAPTURE_TOKEN: ${{ secrets.CAPTURE_TOKEN }}
+          METADATA_CONCURRENCY: "3"
+        run: |
+          CMD="node pipeline/backfill_race_metadata_staging.mjs '${{ github.event.inputs.start_date }}' '${{ github.event.inputs.days }}'"
+          if [ '${{ github.event.inputs.dry }}' = 'true' ]; then CMD="$CMD --dry=true"; fi
+          if [ '${{ github.event.inputs.continue_on_error }}' = 'true' ]; then CMD="$CMD --continue-on-error=true"; fi
+          echo "$CMD"
+          eval "$CMD"
