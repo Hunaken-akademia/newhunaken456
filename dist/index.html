@@ -9,5 +9,38 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+new MutationObserver(() => {
+  document.querySelectorAll("div").forEach((h) => {
+    if (
+      h.children.length ||
+      !String(h.textContent || "").trim().startsWith("AI予想の収支（")
+    ) return;
+
+    const grid = [...h.parentElement.children].find((e) =>
+      e.children.length > 1 &&
+      [...e.children].every((r) => r.children.length >= 3)
+    );
+
+    if (!grid) return;
+
+    const seen = new Set();
+
+    [...grid.children].forEach((row) => {
+      const name = String(
+        row.firstElementChild?.textContent || ""
+      ).trim();
+
+      if (!name) return;
+
+      if (seen.has(name)) row.remove();
+      else seen.add(name);
+    });
+  });
+}).observe(document.getElementById("root"), {
+  childList: true,
+  subtree: true
+});
+</script>
   </body>
 </html>
