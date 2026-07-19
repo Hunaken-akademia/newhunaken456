@@ -1283,6 +1283,44 @@ const FIELDS = [
 
 const empty = () => ({ tenji: "", isshu: "", mawari: "", chokusen: "" });
 
+// 取得データを1〜6号艇の完全な6行へ正規化する。
+// 艇番の重複・欠落がある古いキャッシュは、そのまま画面へ反映しない。
+// ただし6行すべてに展示・1周・回り足がある場合は、行順を1〜6号艇として救済する。
+function normalizeFetchedDisplayRows(rows) {
+  if (!Array.isArray(rows)) return [];
+
+  const complete = rows.filter((r) => {
+    const b = Number(r?.boat);
+    return b >= 1 && b <= 6
+      && String(r?.tenji ?? "").trim() !== ""
+      && String(r?.isshu ?? "").trim() !== ""
+      && String(r?.mawari ?? "").trim() !== "";
+  });
+
+  const byBoat = new Map();
+  for (const row of complete) {
+    const b = Number(row.boat);
+    if (!byBoat.has(b)) byBoat.set(b, row);
+  }
+
+  const exact = [1, 2, 3, 4, 5, 6].map((b) => byBoat.get(b));
+  if (exact.every(Boolean)) {
+    return exact.map((r, i) => ({ ...r, boat: i + 1 }));
+  }
+
+  // BOATCASTの一部形式で艇番列だけ崩れた時の保険。
+  // 6行が完全に揃っている場合だけ、公式の掲載順＝1〜6号艇として復元する。
+  if (complete.length >= 6) {
+    return complete.slice(0, 6).map((r, i) => ({
+      ...r,
+      boat: i + 1,
+      course: Number(r?.course) >= 1 && Number(r?.course) <= 6 ? Number(r.course) : i + 1,
+    }));
+  }
+
+  return [];
+}
+
 // 平均ST選択肢 0.00〜0.40
 const ST_OPTIONS = Array.from({ length: 41 }, (_, i) => (i / 100).toFixed(2));
 
@@ -1628,35 +1666,14 @@ export default function App() {
       console.warn("betRecords save skipped: next value is not an array");
       return false;
     }
-
-    let json = "";
-    try { json = JSON.stringify(next); } catch (e) { return false; }
-    if (!json || json === "undefined") return false;
-
-    let saved = false;
-
-    // Vercel版では localStorage を主保存先にして、書き戻し確認まで行う。
-    try {
-      localStorage.setItem("hunaken_betRecords", json);
-      saved = localStorage.getItem("hunaken_betRecords") === json;
-    } catch (e) {
-      console.warn("hunaken_betRecords localStorage save failed", e);
-    }
-
-    // window.storage がある環境では予備保存も行う。
-    if (window.storage?.set) {
-      try {
-        await window.storage.set("betRecords", json);
-        saved = true;
-      } catch (e) {
-        console.warn("betRecords window.storage save failed", e);
-      }
-    }
-
-    if (!saved) return false;
+    const json = JSON.stringify(next);
+    if (json === undefined || json === "undefined") return false;
     betRecordsRef.current = next;
     setBetRecords(next);
-    return true;
+    let saved = false;
+    try { await window.storage.set("betRecords", json); saved = true; } catch (e) { /* noop */ }
+    try { localStorage.setItem("hunaken_betRecords", json); saved = true; } catch (e) { /* noop */ }
+    return saved;
   };
   const setResultDigit = (k, v) => setResultDigits((p) => ({ ...p, [k]: v }));
 
@@ -1702,35 +1719,14 @@ export default function App() {
       console.warn("records save skipped: next value is not an array");
       return false;
     }
-
-    let json = "";
-    try { json = JSON.stringify(next); } catch (e) { return false; }
-    if (!json || json === "undefined") return false;
-
-    let saved = false;
-
-    // Vercel版では localStorage を主保存先にして、書き戻し確認まで行う。
-    try {
-      localStorage.setItem("hunaken_records", json);
-      saved = localStorage.getItem("hunaken_records") === json;
-    } catch (e) {
-      console.warn("hunaken_records localStorage save failed", e);
-    }
-
-    // window.storage がある環境では予備保存も行う。
-    if (window.storage?.set) {
-      try {
-        await window.storage.set("records", json);
-        saved = true;
-      } catch (e) {
-        console.warn("records window.storage save failed", e);
-      }
-    }
-
-    if (!saved) return false;
+    const json = JSON.stringify(next);
+    if (json === undefined || json === "undefined") return false;
     recordsRef.current = next;
     setRecords(next);
-    return true;
+    let saved = false;
+    try { await window.storage.set("records", json); saved = true; } catch (e) { /* noop */ }
+    try { localStorage.setItem("hunaken_records", json); saved = true; } catch (e) { /* noop */ }
+    return saved;
   };
 
   // ── データのバックアップ（エクスポート/インポート） ──
@@ -2123,14 +2119,16 @@ export default function App() {
     return `／データ取得済・${age}`;
   };
   const applyBoatcastRows = (rows, { displayDisabled = false } = {}) => {
-    if (!Array.isArray(rows) || !rows.length || displayDisabled) return;
+    if (!Array.isArray(rows) || !rows.length || displayDisabled) return false;
+    const safeRows = normalizeFetchedDisplayRows(rows);
+    if (safeRows.length !== 6) return false;
 
     setInputs((prev) => {
       const next = { ...prev };
       for (let b = 1; b <= 6; b++) {
         next[b] = { ...next[b], tenji: "", isshu: "", mawari: "", chokusen: "" };
       }
-      rows.forEach((r) => {
+      safeRows.forEach((r) => {
         const b = Number(r.boat);
         if (!b || b < 1 || b > 6) return;
         next[b] = {
@@ -2147,7 +2145,7 @@ export default function App() {
     const nextWeights = { 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" };
     const nextTilts = { 1: "", 2: "", 3: "", 4: "", 5: "", 6: "" };
     const nextCourses = { 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6 };
-    rows.forEach((r) => {
+    safeRows.forEach((r) => {
       const b = Number(r.boat);
       if (!b || b < 1 || b > 6) return;
       nextWeights[b] = r.weight || "";
@@ -2160,6 +2158,7 @@ export default function App() {
     setWeights(nextWeights);
     setTilts(nextTilts);
     setCourses(nextCourses);
+    return true;
   };
 
 
@@ -2236,6 +2235,8 @@ export default function App() {
         venue: targetVenue,
         race: String(targetRaceNo),
         date: targetDate,
+        // 展示未完成中は1分単位でURLを変え、CDNの公開待ちキャッシュに張り付かないようにする。
+        refresh: String(Math.floor(Date.now() / 60000)),
       });
       const res = await fetch(`/api/yoso?${qs.toString()}`);
       const data = await res.json().catch(() => ({}));
@@ -2258,18 +2259,25 @@ export default function App() {
 
       const rows = data.rows || [];
       const displayDisabled = data.displayDisabled || !usesDisplayCorrection(targetVenue);
-      if (!displayDisabled && rows.length < 6) {
+      const safeRows = displayDisabled ? rows : normalizeFetchedDisplayRows(rows);
+      if (!displayDisabled && safeRows.length !== 6) {
         const reasonCode = data.displayReasonCode || "";
-        let msg = `${targetVenue}${targetRaceNo}Rは公開展示待ちです。`;
+        const completeBoats = new Set((rows || []).filter((r) =>
+          String(r?.tenji ?? "").trim() !== ""
+          && String(r?.isshu ?? "").trim() !== ""
+          && String(r?.mawari ?? "").trim() !== ""
+        ).map((r) => Number(r.boat)));
+        const missing = [1, 2, 3, 4, 5, 6].filter((b) => !completeBoats.has(b));
+        let msg = `${targetVenue}${targetRaceNo}Rは公開展示待ちです。1分後に再確認します。`;
         if (reasonCode === "five_boat") msg = `${targetVenue}${targetRaceNo}R：エラー。5艇レースのため。`;
-        else if (reasonCode === "display_shortage") msg = `${targetVenue}${targetRaceNo}R：エラー。展示情報不足のため。`;
+        else if (reasonCode === "display_shortage") msg = `${targetVenue}${targetRaceNo}R：展示情報不足${missing.length ? `（未取得：${missing.join("・")}号艇）` : ""}。1分後に再確認します。`;
         setPMsg("tenji", msg);
         setAutoMsg(msg);
         setAutoRefreshInfo(msg);
         return;
       }
 
-      applyBoatcastRows(rows, { displayDisabled });
+      applyBoatcastRows(safeRows, { displayDisabled });
 
       const simpleFetchMsg = `${targetVenue}${targetRaceNo}Rのデータを取得しました${cacheNote}。`;
       setPMsg("tenji", simpleFetchMsg);
@@ -2308,7 +2316,7 @@ export default function App() {
 
 
 
-  const prefetchStorageKey = (v, d, r) => `hunaken_prefetch_yoso_v109_${v}_${d}_${r}`;
+  const prefetchStorageKey = (v, d, r) => `hunaken_prefetch_yoso_v127_${v}_${d}_${r}`;
 
   const storePrefetchPayload = (v, d, r, data) => {
     try {
@@ -2322,6 +2330,10 @@ export default function App() {
       if (!raw) return null;
       const parsed = JSON.parse(raw);
       if (!parsed || !parsed.data || Date.now() - Number(parsed.savedAt || 0) > 4 * 60 * 1000) return null;
+      if (!parsed.data.displayDisabled && normalizeFetchedDisplayRows(parsed.data.rows || []).length !== 6) {
+        localStorage.removeItem(prefetchStorageKey(v, d, r));
+        return null;
+      }
       return parsed.data;
     } catch (e) {
       return null;
@@ -2330,9 +2342,11 @@ export default function App() {
 
   const applyPrefetchedYosoPayload = (data, targetVenue, targetRaceNo, targetDate) => {
     const rows = data?.rows || [];
-    if (!Array.isArray(rows) || rows.length < 6) return false;
+    const displayDisabled = !!data?.displayDisabled || !usesDisplayCorrection(targetVenue);
+    const safeRows = displayDisabled ? rows : normalizeFetchedDisplayRows(rows);
+    if (!displayDisabled && safeRows.length !== 6) return false;
 
-    applyBoatcastRows(rows, { displayDisabled: !!data?.displayDisabled || !usesDisplayCorrection(targetVenue) });
+    applyBoatcastRows(safeRows, { displayDisabled });
 
     applyBoatcastMeta(data);
 
@@ -2362,7 +2376,7 @@ export default function App() {
     return deadlineMin - (now.getHours() * 60 + now.getMinutes());
   };
 
-  // 締切15分前から、対応場の次Rをサーバー側キャッシュへ先読みする。
+  // 締切20分前から、対応場の次Rをサーバー側キャッシュへ先読みする。
   // 画面を開いている間だけ動く。ユーザーが場をタップした時は、通常取得でも3分キャッシュから即返りやすくなる。
   const prefetchApproachingAutoRaces = async (statuses, targetDate = todayDateValue()) => {
     if (!autoRefreshEnabledRef.current || document.hidden) return;
@@ -2371,7 +2385,7 @@ export default function App() {
     const candidates = raw
       .filter((st) => st && AUTO_FETCH_VENUES.includes(st.venue) && !st.noRace && !st.allClosed && st.nextRace && st.nextDeadline)
       .map((st) => ({ ...st, leftMin: minutesUntilDeadline(st.nextDeadline) }))
-      .filter((st) => st.leftMin != null && st.leftMin <= 15 && st.leftMin >= -1)
+      .filter((st) => st.leftMin != null && st.leftMin <= 20 && st.leftMin >= -1)
       .sort((a, b) => a.leftMin - b.leftMin)
       .slice(0, 8);
 
@@ -2385,12 +2399,13 @@ export default function App() {
       const key = `${st.venue}_${targetDate}_${st.nextRace}`;
       const nowMs = Date.now();
       if (prefetchBusyKeysRef.current.has(key)) continue;
-      if (lastPrefetchAtByKeyRef.current[key] && nowMs - lastPrefetchAtByKeyRef.current[key] < 150000) continue;
+      if (lastPrefetchAtByKeyRef.current[key] && nowMs - lastPrefetchAtByKeyRef.current[key] < 60000) continue;
       prefetchBusyKeysRef.current.add(key);
       lastPrefetchAtByKeyRef.current[key] = nowMs;
       try {
         const existing = readPrefetchPayload(st.venue, targetDate, st.nextRace);
-        if (existing && Array.isArray(existing.rows) && existing.rows.length >= 6) {
+        const existingRows = existing?.displayDisabled ? (existing.rows || []) : normalizeFetchedDisplayRows(existing?.rows || []);
+        if (existing && (existing.displayDisabled || existingRows.length === 6)) {
           const qs = new URLSearchParams({ action: "odds", venue: st.venue, race: String(st.nextRace), date: targetDate });
           const res = await fetch(`/api/yoso?${qs.toString()}`);
           const data = await res.json().catch(() => ({}));
@@ -2399,16 +2414,22 @@ export default function App() {
             done.push(`${st.venue}${st.nextRace}Rオッズ`);
           }
         } else {
-          const qs = new URLSearchParams({ venue: st.venue, race: String(st.nextRace), date: targetDate });
+          const qs = new URLSearchParams({
+            venue: st.venue,
+            race: String(st.nextRace),
+            date: targetDate,
+            refresh: String(Math.floor(Date.now() / 60000)),
+          });
           const res = await fetch(`/api/yoso?${qs.toString()}`);
           const data = await res.json().catch(() => ({}));
-          if (res.ok && data.ok && Array.isArray(data.rows) && data.rows.length >= 6) {
-            storePrefetchPayload(st.venue, targetDate, st.nextRace, data);
+          const fetchedRows = data?.displayDisabled ? (data.rows || []) : normalizeFetchedDisplayRows(data?.rows || []);
+          if (res.ok && data.ok && (data.displayDisabled || fetchedRows.length === 6)) {
+            storePrefetchPayload(st.venue, targetDate, st.nextRace, { ...data, rows: fetchedRows });
             done.push(`${st.venue}${st.nextRace}R`);
           }
         }
       } catch (e) {
-        // 15分前でも場によってはまだ展示が出ていないことがあるため、失敗は次回3分後に再試行する。
+        // 20分前ではまだ展示が出ていない場もあるため、失敗は次回の先読みで再試行する。
       } finally {
         prefetchBusyKeysRef.current.delete(key);
       }
@@ -2572,7 +2593,9 @@ export default function App() {
       fetchOfficialYoso({ venue, raceNo: targetRace, raceDate: today, background: true, force, ignoreSalesEnded: true, oddsOnly: hasCompleteAutoStaticData() });
     };
     run(true);
-    const id = window.setInterval(() => run(false), 180000);
+    // 展示未公開・一部欠落中も早めに拾えるよう、選択中レースは1分ごとに確認する。
+    // 6艇分が揃った後は fetchOfficialYoso 側がオッズ更新だけへ切り替える。
+    const id = window.setInterval(() => run(false), 60000);
     const onFocus = () => run(false);
     const onVisibility = () => { if (!document.hidden) run(false); };
     window.addEventListener("focus", onFocus);
@@ -4140,11 +4163,7 @@ export default function App() {
       result: null, // 結果は後から入力
       savedAt: Date.now(),
     };
-    const saved = await persistRecords((prev) => [rec, ...prev.filter((r) => r.key !== key)]);
-    if (!saved) {
-      setSaveMsg("✗ 予想の保存に失敗しました。Safariのプライベートブラウズや端末容量を確認してください");
-      return;
-    }
+    await persistRecords((prev) => [rec, ...prev.filter((r) => r.key !== key)]);
     setSaveMsg(`✓ ${key} を保存しました`);
   };
 
@@ -4171,7 +4190,7 @@ export default function App() {
     }) : [];
     const curRanked = aiEval ? aiEval.ranked.map((r) => ({ boat: r.boat, mark: r.mark })) : [];
 
-    const resultSaved = await persistRecords((prev) => {
+    await persistRecords((prev) => {
       const idx = prev.findIndex((r) => r.key === key);
       if (idx >= 0) {
         const copy = [...prev];
@@ -4187,14 +4206,9 @@ export default function App() {
       return [{ key, date: raceDate, venue, race: raceNo, ranked: curRanked, bets: curBets, result: trio, payoutOdds: odds, betLimits: { ...betLimits }, savedAt: Date.now() }, ...prev];
     });
 
-    if (!resultSaved) {
-      setSaveMsg("✗ 結果・配当の保存に失敗しました。ページを閉じずに、もう一度お試しください");
-      return;
-    }
-
     // 同じ日付・場・レースの「自分の舟券記録」にも結果・配当を反映
     const sameRace = (b) => b.date === raceDate && b.venue === (venue || "—") && b.race === raceNo;
-    const betsSynced = await persistBets((prev) => prev.some(sameRace)
+    await persistBets((prev) => prev.some(sameRace)
       ? prev.map((b) => {
           if (!sameRace(b)) return b;
           const hit = b.tickets.includes(trio);
@@ -4204,11 +4218,7 @@ export default function App() {
         })
       : prev);
 
-    setSaveMsg(
-      betsSynced
-        ? `✓ ${key} の結果 ${trio}${odds ? `（配当${odds}）` : ""} を保存しました`
-        : `△ 結果は保存しましたが、自分の舟券記録への反映に失敗しました`
-    );
+    setSaveMsg(`✓ ${key} の結果 ${trio}${odds ? `（配当${odds}）` : ""} を保存しました`);
   };
 
   // ── 集計の絞り込み（期間・場）を records / betRecords に適用 ──
@@ -4392,10 +4402,7 @@ export default function App() {
       { key: "h_a", name: "本線＋穴", parts: ["本線", "穴"] },
       { key: "t_a", name: "対抗＋穴", parts: ["対抗", "穴"] },
       { key: "h_t_a", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
-].filter(
-  (p, index, arr) =>
-    index === arr.findIndex((x) => x.name === p.name)
-);
+    ];
     const stats = {};
     for (const p of patterns) stats[p.key] = { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
 
@@ -6855,7 +6862,7 @@ export default function App() {
                 結果・配当を保存したレースを対象に、AIの買い目を機械的に買った場合の回収率です（自分の収支とは別）。
               </div>
               <div style={{ display: "grid", gap: 6 }}>
-                {[...new Map(aiLedger.patterns.map((p) => [p.key, p])).values()].map((p) => {
+                {aiLedger.patterns.map((p) => {
                   const s = aiLedger.stats[p.key];
                   if (!s || s.races === 0) return null;
                   const roi = s.spent ? (s.ret / s.spent * 100) : 0;
@@ -7317,4 +7324,3 @@ export default function App() {
     </div>
   );
 }
- 
