@@ -1,18 +1,18 @@
-const STATIC_CACHE_MS = 3 * 60 * 1000;
+const STATIC_CACHE_MS = 45 * 1000;
 const SCHEDULE_CACHE_MS = 3 * 60 * 1000;
 const ODDS_CACHE_MS = 60 * 1000;
 const STALE_CACHE_MS = 30 * 60 * 1000;
-// 復習用：発売終了後も翌朝の朝一レース前まで共有キャッシュを返す。
-// 正確な翌朝1R時刻が取れない場合に備え、JST翌日09:00まで保持する。
-const REVIEW_CACHE_STALE_MS = 18 * 60 * 60 * 1000;
+// 復習用：発売終了後もJST翌日08:00まで共有キャッシュを返す。
+// 08:00以降は当日開催へ切り替える。
+const REVIEW_CACHE_STALE_MS = 17 * 60 * 60 * 1000;
 const CACHE_MS = STATIC_CACHE_MS;
 
 // Vercelの同一実行環境内で共有するキャッシュ。
 // 同じ場・日付・RはTTL内ならBOATCASTへ再アクセスせず、取得中は他ユーザーへ古いキャッシュを返す。
-const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V126__ || new Map();
-globalThis.__HUNAKEN_YOSO_CACHE_V126__ = cacheStore;
-const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V126__ || new Map();
-globalThis.__HUNAKEN_YOSO_INFLIGHT_V126__ = inFlightStore;
+const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V127__ || new Map();
+globalThis.__HUNAKEN_YOSO_CACHE_V127__ = cacheStore;
+const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V127__ || new Map();
+globalThis.__HUNAKEN_YOSO_INFLIGHT_V127__ = inFlightStore;
 
 const SUPABASE_REST_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -41,11 +41,10 @@ function ymdToDate(ymd) {
 function nextMorningReviewExpiryIso(ymd) {
   const raceDate = ymdToDate(ymd);
   if (!raceDate) return new Date(Date.now() + REVIEW_CACHE_STALE_MS).toISOString();
-  // JST翌日09:00 = UTC同日24:00相当ではなく、Date.UTCでJSTを補正
+  // JST翌日08:00 = レース日当日のUTC 23:00
   const [y, m, d] = raceDate.split('-').map(Number);
-  const utc = Date.UTC(y, m - 1, d + 1, 0, 0, 0); // JST翌日09:00
-  const t = Math.max(utc, Date.now() + STALE_CACHE_MS);
-  return new Date(t).toISOString();
+  const utc = Date.UTC(y, m - 1, d, 23, 0, 0);
+  return new Date(utc).toISOString();
 }
 
 function persistentStaleExpiryForKey(key, ttlMs, staleMs) {
@@ -208,7 +207,7 @@ async function fetchBoatcastPreRaceStatusPayload(venue, raceNo, ymd) {
   return {
     ok: true,
     action: "prerace",
-    appVersion: "v126",
+    appVersion: "v127",
     venue,
     race: Number(raceNo),
     date: ymd,
@@ -1461,8 +1460,8 @@ function buildRaceResultRows({ venue, raceNo, ymd, resultHtml, racers, sttRaw = 
       race_no: Number(raceNo),
       boat: Number(fr.boat),
       course: course >= 1 && course <= 6 ? course : Number(fr.boat),
-      rank: Number(fr.rank) >= 1 && Number(fr.rank) <= 6 ? Number(fr.rank) : null,
-      kimarite: Number(fr.rank) === 1 ? (kimarite || null) : null,
+      rank: Number(fr.rank) >= 1 && Number(fr.rank) <= 6 ? Number(fr.rank) : 7,
+      kimarite: kimarite || null,
       regno: fr.regno || (racer?.regNo ? Number(racer.regNo) : null),
       st: Number.isFinite(Number(st)) ? Number(st) : null,
       is_f: status === "F" || sr?.isF === true || Number(st) < 0,
@@ -1473,13 +1472,7 @@ function buildRaceResultRows({ venue, raceNo, ymd, resultHtml, racers, sttRaw = 
   const expected = racerCount >= 4 && racerCount <= 6 ? racerCount : 6;
   const uniqueBoats = new Set(rows.map((r) => r.boat));
   const startCount = rows.filter((r) => Number.isFinite(r.st)).length;
-  const recognizedSpecialStatuses = new Set(["F", "L", "欠", "失", "転", "落", "妨", "不"]);
-  const validCore = rows.every((r, index) => {
-    const status = String(finishRows[index]?.status || "").trim();
-    const hasValidRank = Number(r.rank) >= 1 && Number(r.rank) <= 6;
-    const hasRecognizedSpecialStatus = r.rank == null && recognizedSpecialStatuses.has(status);
-    return r.regno && r.course >= 1 && r.course <= 6 && (hasValidRank || hasRecognizedSpecialStatus);
-  });
+  const validCore = rows.every((r) => r.regno && r.course >= 1 && r.course <= 6 && r.rank >= 1);
   const coreComplete = rows.length >= expected && uniqueBoats.size >= expected && validCore;
   // 公式結果で欠場・失格等があると、着順6艇に対して実STが5艇だけのケースがある。
   // その1艇のために着順・他5艇のSTまで破棄しない。ST欠損はnullで保存し、再取得で補修する。
@@ -2011,7 +2004,7 @@ function parseBoatcastDisplay(raw) {
 
   const setRow = (boat, picked) => {
     boat = Number(boat);
-    if (!boat || boat < 1 || boat > 6 || !picked || rowsByBoat.has(boat)) return;
+    if (!Number.isInteger(boat) || boat < 1 || boat > 6 || !picked || rowsByBoat.has(boat)) return;
     if (!picked.tenji || !picked.isshu || !picked.mawari) return;
     rowsByBoat.set(boat, { boat, course: boat, ...picked });
   };
@@ -2148,32 +2141,15 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
   const urls = boatcastRaceUrls(venue, raceNo, dateStr);
   if (!urls) throw new Error(`${venue}の場コードが見つかりません`);
 
-  // v127速度改善:
-  // ・以前は「6本並列 → 公式beforeinfoを直列 → オッズを直列」だったため、
-  //   キャッシュミス時の待ち時間が合算されていた。全て最初から並列に開始する。
-  // ・気象/beforeinfoは補助データなのでタイムアウトを8秒に短縮
-  //   （本体の展示txtは従来どおり15秒）。1本の遅延で全体が引きずられにくくする。
-  // ・各フェーズの所要msを timingMs として返し、遅延原因を特定できるようにする。
-  const timingMs = {};
-  const tBatchStart = Date.now();
-
-  const officialBeforeInfoUrl = buildOfficialBeforeInfoUrl(venue, raceNo, dateStr);
-
-  // オッズも独立データなので同時に開始しておき、最後に待つ。
-  const oddsPromise = fetchBoatcastOddsForVenue(venue, raceNo, dateStr)
-    .catch((e) => ({ ok: false, error: e.message || String(e) }));
-
   const fetches = [
     fetchHtml(urls.str3),
     fetchHtml(urls.stt),
     fetchHtml(urls.oriten),
     fetchHtml(urls.tkz),
-    urls.weatherPrev ? fetchHtml(urls.weatherPrev, { timeoutMs: 8000 }) : Promise.resolve(""),
-    fetchHtml(urls.weatherCurrent, { timeoutMs: 8000 }),
-    officialBeforeInfoUrl ? fetchHtml(officialBeforeInfoUrl, { timeoutMs: 8000 }) : Promise.resolve(""),
+    urls.weatherPrev ? fetchHtml(urls.weatherPrev) : Promise.resolve(""),
+    fetchHtml(urls.weatherCurrent),
   ];
-  const [str3Res, sttRes, oritenRes, tkzRes, weatherPrevRes, weatherCurrentRes, beforeInfoRes] = await Promise.allSettled(fetches);
-  timingMs.fetchBatch = Date.now() - tBatchStart;
+  const [str3Res, sttRes, oritenRes, tkzRes, weatherPrevRes, weatherCurrentRes] = await Promise.allSettled(fetches);
 
   const str3 = str3Res.status === "fulfilled" ? str3Res.value : "";
   const stt = sttRes.status === "fulfilled" ? sttRes.value : "";
@@ -2184,7 +2160,12 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
 
   // 公式beforeinfoは展示公開前から最新の水面気象を持っていることが多い。
   // 風は点数に直結するため、BOATCASTの前レース結果txtよりこちらを優先する。
-  const officialBeforeInfoHtml = beforeInfoRes.status === "fulfilled" ? beforeInfoRes.value : "";
+  const officialBeforeInfoUrl = buildOfficialBeforeInfoUrl(venue, raceNo, dateStr);
+  let officialBeforeInfoHtml = "";
+  if (officialBeforeInfoUrl) {
+    try { officialBeforeInfoHtml = await fetchHtml(officialBeforeInfoUrl); }
+    catch (e) { officialBeforeInfoHtml = ""; }
+  }
 
   const racers = parseBoatcastRacerInfo(str3);
   const racersByBoat = {};
@@ -2255,9 +2236,19 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
         const officialRows = parseDisplayRowsByLines(officialHtml, venue);
         if (validRows(officialRows)) {
           const sttRows = parseBoatcastSttRows(stt);
+          const tkzRows = parseBoatcastTkzRows(tkz);
           rows = sanitizeDisplayRows(officialRows.map((r) => {
-            const st = sttRows.find((x) => Number(x.boat) === Number(r.boat));
-            return st ? { ...r, course: st.course || r.course || r.boat } : r;
+            const boat = Number(r.boat);
+            const st = sttRows.find((x) => Number(x.boat) === boat);
+            const tk = tkzRows.find((x) => Number(x.boat) === boat);
+            return {
+              ...r,
+              course: st?.course || r.course || boat,
+              tenji: tk?.tenji || r.tenji,
+              weight: tk?.weight || r.weight || "",
+              adjust_weight: tk?.adjust_weight || r.adjust_weight || "",
+              tilt: tk?.tilt || r.tilt || "",
+            };
           }));
         } else {
           rowErrors.push(`official-beforeinfo: ${officialRows?.length || 0}艇`);
@@ -2271,9 +2262,7 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
   let exhibitionSaved = { ok: false, skipped: true, reason: "展示未取得" };
   if (rows) {
     rows = sanitizeDisplayRows(rows).map((r) => ({ ...r, racer: racersByBoat[r.boat] || null }));
-    const tSave = Date.now();
     exhibitionSaved = await saveExhibitionRows({ venue, raceNo, ymd: dateStr, rows, source: "BOATCAST" });
-    timingMs.saveExhibition = Date.now() - tSave;
   }
 
   // 風は「現在選択しているレースの公式beforeinfo」を最優先。
@@ -2310,11 +2299,9 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
   }
   weather.windKey = windKeyFromDirectionAndSpeed(weather.windDirection, weather.windSpeed);
 
-  // v127: オッズは最初に並列開始済み。ここでは完了を待つだけ。
-  const tOdds = Date.now();
-  const oddsInfo = await oddsPromise;
-  timingMs.awaitOdds = Date.now() - tOdds;
-  timingMs.total = Date.now() - tBatchStart;
+  let oddsInfo = null;
+  try { oddsInfo = await fetchBoatcastOddsForVenue(venue, raceNo, dateStr); }
+  catch (e) { oddsInfo = { ok: false, error: e.message || String(e) }; }
 
   const displayIssue = rows
     ? { code: "", message: "" }
@@ -2341,7 +2328,6 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
     oddsUrl: oddsInfo?.ok ? oddsInfo.url : null,
     oddsError: oddsInfo && !oddsInfo.ok ? oddsInfo.error : "",
     exhibitionSaved,
-    timingMs,
   };
 }
 
@@ -2731,42 +2717,38 @@ function parseRaceIndexSchedule(html) {
 
 function normalizeRaceMetaText(s) {
   return decodeEntities(String(s || ""))
-    .replace(/[！-～]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
-    .replace(/[ⅠＩ]/g, "1")
-    .replace(/Ⅱ/g, "2")
-    .replace(/Ⅲ/g, "3")
-    .replace(/[．。・･]/g, ".")
+    .replace(/[Ｓ]/g, "S")
+    .replace(/[Ｇ]/g, "G")
+    .replace(/[ⅠＩⅡⅢ]/g, (ch) => ({ "Ⅰ": "1", "Ｉ": "1", "Ⅱ": "2", "Ⅲ": "3" }[ch] || ch))
+    .replace(/Ｇ/g, "G")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function gradeTokensFromText(text) {
-  const t = normalizeRaceMetaText(text);
-  const found = [];
-  const has = (grade, re) => {
-    if (re.test(t) && !found.includes(grade)) found.push(grade);
-  };
-
-  // 大会名から推測せず、表示されているグレード文字だけ拾う。
-  has("PG1", /(^|[^A-Z0-9])P\s*G\s*1([^A-Z0-9]|$)/i);
-  has("SG", /(^|[^A-Z0-9])S\s*G([^A-Z0-9]|$)/i);
-  has("G1", /(^|[^A-Z0-9])G\s*1([^A-Z0-9]|$)/i);
-  has("G2", /(^|[^A-Z0-9])G\s*2([^A-Z0-9]|$)/i);
-  has("G3", /(^|[^A-Z0-9])G\s*3([^A-Z0-9]|$)/i);
-  return found;
-}
-
 function inferGradeFromText(text) {
-  const found = gradeTokensFromText(text);
-  // SG/G1/G2/G3 が並ぶ説明文・メニュー文は採用しない。
-  if (found.length !== 1) return null;
-  return found[0];
+  const t = normalizeRaceMetaText(text);
+
+  // 固有大会名を一般的な語（オールスター/ダービー等）より先に判定する。
+  // 例: レディースオールスターをSG、ヤングダービーをSGと誤判定しない。
+  if (/(レディースオールスター|女子オールスター)/i.test(t)) return "G2";
+  if (/(PG1|P G1|プレミアムG1|BBCトーナメント|バトルチャンピオントーナメント|ヤングダービー|クイーンズクライマックス|レディースチャンピオン|女子王座(?:決定戦)?|賞金女王(?:決定戦)?|スピードクイーンメモリアル|マスターズチャンピオン)/i.test(t)) return "PG1";
+  if (/(G3|G 3|オールレディース|企業杯|マスターズリーグ|イースタンヤング|ウエスタンヤング)/i.test(t)) return "G3";
+  if (/(G2|G 2|モーターボート大賞|秩父宮妃記念杯|全国ボートレース甲子園)/i.test(t)) return "G2";
+  if (/(SG|S G|グランプリ|賞金王|ボートレースクラシック|総理大臣杯|ボートレースオールスター|笹川賞|グランドチャンピオン|グラチャン|オーシャンカップ|ボートレースメモリアル|モーターボート記念|ボートレースダービー|全日本選手権|チャレンジカップ)/i.test(t)) return "SG";
+  if (/(G1|G 1|周年|地区選手権|高松宮記念|ダイヤモンドカップ)/i.test(t)) return "G1";
+  return "一般";
 }
 
 function inferLadiesFromText(text) {
   const t = normalizeRaceMetaText(text);
-  // Ladies/レディース/女子の表示がある時だけ女子戦扱い。
-  return /(^|[^A-Z])LADIES([^A-Z]|$)|レディース|女子|ヴィーナス/i.test(t);
+
+  // 男女混合企画は大会名だけで全レースを女子戦扱いしない。
+  // そのレースの6艇が全員女子選手の時だけ、後段の allFemale 判定で女子戦にする。
+  if (/(レディース\s*(?:VS|対)\s*ルーキーズ|男女W優勝戦|男女ダブル優勝戦|男女混合)/i.test(t)) return null;
+
+  if (/(オールレディース|レディースチャンピオン|レディースオールスター|クイーンズクライマックス|ヴィーナス(?:シリーズ)?|女子リーグ|女子王座(?:決定戦)?|賞金女王(?:決定戦)?|スピードクイーンメモリアル|女子レーサー)/i.test(t)) return true;
+  if (/(女子|レディース|クイーンズ)/i.test(t)) return true;
+  return false;
 }
 
 function inferRaceTypeFromText(text) {
@@ -2781,147 +2763,26 @@ function inferRaceTypeFromText(text) {
   return "";
 }
 
-function isWeakRaceMetaLine(line) {
-  const t = normalizeRaceMetaText(line);
-  if (!t) return true;
-  if (/^(本日のレース|レース一覧|競走一覧|出走表|オッズ|結果|払戻金|トップ|メニュー)$/i.test(t)) return true;
-
-  // 公式ページのサイドメニュー・説明文・カテゴリ導線は、大会メタとして採用しない。
-  // 例: 「G3スケジュール ヴィーナスシリーズ」は開催名ではなくナビなので除外。
-  if (/(一覧|発売|締切|オッズ|結果|出走表|投票|ログイン|更新|トップ|メニュー|ニュース|キャンペーン|ヘルプ|ガイド|データ|ランキング|開催日程|スケジュール|特設サイト|検索|女子レーサーには|表示されます)/.test(t)) return true;
-
-  // グレード・カテゴリの羅列は除外。実開催名なら、普通は大会名や冠名が同じ行/近傍に出る。
-  if (gradeTokensFromText(t).length >= 2) return true;
-  return false;
-}
-
-function isGradeOnlyLine(line) {
-  const t = normalizeRaceMetaText(line).replace(/[\s.・･:：｜|\-ー‐―]+/g, "");
-  return /^(SG|PG1|G1|G2|G3)$/i.test(t);
-}
-
-function isGenericRaceCategoryLine(line) {
-  const t = normalizeRaceMetaText(line).replace(/[\s.・･:：｜|\-ー‐―]+/g, "");
-  if (/^(SG|PG1|G1|G2|G3|一般|一般戦|グレードレース|ヴィーナスシリーズ|ルーキーシリーズ|マスターズリーグ|オールレディース|企業杯|イースタンヤング|ウエスタンヤング|モーターボート大賞)$/i.test(t)) return true;
-  if (/^(SG|PG1|G1|G2|G3)(スケジュール|日程|一覧).*/i.test(t)) return true;
-  if (/^(ヴィーナスシリーズ|ルーキーシリーズ|マスターズリーグ).*(スケジュール|日程|一覧)?$/i.test(t)) return true;
-  return false;
-}
-
-function isLikelyRaceEventTitleLine(line) {
-  const t = normalizeRaceMetaText(line);
-  if (isWeakRaceMetaLine(t)) return false;
-  if (isGradeOnlyLine(t) || isGenericRaceCategoryLine(t)) return false;
-  if (t.length < 5) return false;
-  return /(杯|選手権|競走|大会|大賞|記念|シリーズ|リーグ|ヴィーナス|レディース|女子|ルーキー|周年|タイトル|クイーンズ|グランプリ|ダービー|チャンピオン|クラシック|メモリアル|オールスター|甲子園|王座|賞金女王|BBC|トーナメント)/.test(t);
-}
-
-function raceMetaWindow(lines, idx, radius = 2) {
-  const start = Math.max(0, idx - radius);
-  const end = Math.min(lines.length, idx + radius + 1);
-  return lines.slice(start, end);
-}
-
-function raceMetaAttributeLinesFromHtml(html) {
-  const raw = String(html || "");
-  const lines = [];
-  const attrRe = /\b(?:alt|title|aria-label|content|data-title|data-name|data-grade)=(["'])([\s\S]{0,240}?)\1/gi;
-  let m;
-  while ((m = attrRe.exec(raw)) !== null) {
-    const v = normalizeRaceMetaText(m[2]);
-    if (!v) continue;
-    if (/(SG|PG1|G\s*[123]|G[123]|レディース|女子|ヴィーナス|杯|選手権|競走|大会|大賞|記念|シリーズ|リーグ|周年|タイトル|クイーンズ|グランプリ|ダービー|チャンピオン|クラシック|メモリアル|オールスター|甲子園|王座|賞金女王|BBC|トーナメント)/i.test(v)) {
-      lines.push(v);
-    }
-  }
-  return [...new Set(lines)].slice(0, 120);
-}
-
-function raceMetaProbeLines(lines, attrLines) {
-  return [...new Set([...(lines || []), ...(attrLines || [])])]
-    .filter((l) => gradeTokensFromText(l).length || inferLadiesFromText(l) || isLikelyRaceEventTitleLine(l))
-    .slice(0, 60);
-}
-
-function pickGradeMetaFromLines(lines) {
-  const hits = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (isWeakRaceMetaLine(line)) continue;
-    const grade = inferGradeFromText(line);
-    if (!grade) continue;
-
-    const win = raceMetaWindow(lines, i, 2).filter((l) => !isWeakRaceMetaLine(l));
-    const titleLine = win.find(isLikelyRaceEventTitleLine) || "";
-    const lineHasTitle = isLikelyRaceEventTitleLine(line);
-
-    // 「G3」単独 + 「ヴィーナスシリーズ」単独のようなナビ・カテゴリ表示は採用しない。
-    if (!lineHasTitle && !titleLine) continue;
-
-    const sourceLine = lineHasTitle ? line : `${line} ${titleLine}`.trim();
-    const score = (lineHasTitle ? 10 : 6) + (isGradeOnlyLine(line) ? 0 : 2) + (inferLadiesFromText(sourceLine) ? 1 : 0);
-    hits.push({ grade, sourceLine, titleLine: titleLine || line, score, idx: i });
-  }
-
-  hits.sort((a, b) => b.score - a.score || a.idx - b.idx);
-  return hits[0] || null;
-}
-
-function pickLadiesMetaFromLines(lines, gradeHit = null) {
-  if (gradeHit && inferLadiesFromText(`${gradeHit.sourceLine} ${gradeHit.titleLine}`)) {
-    return { isLadies: true, sourceLine: gradeHit.sourceLine || gradeHit.titleLine || "" };
-  }
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (isWeakRaceMetaLine(line) || isGenericRaceCategoryLine(line)) continue;
-    if (!inferLadiesFromText(line)) continue;
-
-    const win = raceMetaWindow(lines, i, 2).filter((l) => !isWeakRaceMetaLine(l));
-    const titleLine = win.find(isLikelyRaceEventTitleLine) || "";
-
-    // 「ヴィーナスシリーズ」だけのカテゴリ表示は採用しない。
-    if (!isLikelyRaceEventTitleLine(line) && !titleLine) continue;
-    return { isLadies: true, sourceLine: isLikelyRaceEventTitleLine(line) ? line : `${line} ${titleLine}`.trim() };
-  }
-
-  return { isLadies: false, sourceLine: "" };
-}
-
 function parseRaceIndexMeta(html) {
-  const decoded = decodeEntities(String(html || ""));
-  const textOnlyLines = textLinesFromHtml(decoded).map(normalizeRaceMetaText).filter(Boolean);
-  const attrLines = raceMetaAttributeLinesFromHtml(decoded);
+  const lines = textLinesFromHtml(html);
+  const text = lines.join(" ");
 
-  // テキスト本文だけだと公式の画像alt等を落とす場合があるため、属性候補も見る。
-  // ただし「G3スケジュール」「ヴィーナスシリーズ」などのナビ行は isWeakRaceMetaLine で除外する。
-  const lines = [...new Set([...textOnlyLines, ...attrLines])];
-  const gradeHit = pickGradeMetaFromLines(lines);
-  const ladiesHit = pickLadiesMetaFromLines(lines, gradeHit);
+  let eventName = "";
+  const titleCandidates = lines.filter((l) =>
+    /(杯|選手権|競走|レース|ヴィーナス|ルーキー|周年|タイトル|オールレディース|クイーンズ|グランプリ|ダービー)/.test(l)
+    && !/(一覧|発売|締切|オッズ|結果|出走表|投票|ログイン|更新|トップ|メニュー)/.test(l)
+  );
+  if (titleCandidates.length) eventName = normalizeRaceMetaText(titleCandidates[0]).slice(0, 120);
 
-  const grade = gradeHit ? gradeHit.grade : null;
-  const isLadies = !!ladiesHit.isLadies;
-  const eventName = gradeHit?.titleLine ? normalizeRaceMetaText(gradeHit.titleLine).slice(0, 120) : "";
+  const metaText = `${eventName} ${text.slice(0, 5000)}`;
+  const grade = inferGradeFromText(metaText);
+  const isLadies = inferLadiesFromText(metaText);
+  const raceType = inferRaceTypeFromText(metaText);
 
-  const daySource = [gradeHit?.sourceLine, ladiesHit?.sourceLine, eventName].filter(Boolean).join(" ");
-  const dayMatch = daySource.match(/(初日|2日目|3日目|4日目|5日目|最終日)/);
-  const eventDay = dayMatch ? dayMatch[1] : "";
+  const dayMatch = metaText.match(/(初日|2日目|３日目|3日目|４日目|4日目|５日目|5日目|最終日)/);
+  const eventDay = dayMatch ? dayMatch[1].replace(/[３４５]/g, (ch) => ({ "３":"3", "４":"4", "５":"5" }[ch] || ch)) : "";
 
-  // raceindexは開催全体のページなので、ドリーム等のレース種別は全12Rに保存しない。
-  return {
-    grade,
-    eventDay,
-    eventName,
-    isLadies,
-    raceType: "",
-    gradeSourceLine: gradeHit?.sourceLine || "",
-    ladiesSourceLine: ladiesHit.sourceLine || "",
-    metaDebugLines: lines
-      .filter((l) => !isWeakRaceMetaLine(l) && (gradeTokensFromText(l).length || inferLadiesFromText(l) || isLikelyRaceEventTitleLine(l)))
-      .slice(0, 40),
-    metaProbeLines: raceMetaProbeLines(textOnlyLines, attrLines),
-  };
+  return { grade, eventDay, eventName, isLadies, raceType };
 }
 
 function raceMetaRowsFromSchedule({ venue, ymd, schedule, meta = {}, raceNo = null, racers = null, source = "BOATCAST_RACEINDEX" }) {
@@ -2945,20 +2806,11 @@ function raceMetaRowsFromSchedule({ venue, ymd, schedule, meta = {}, raceNo = nu
       metadata_captured_at: new Date().toISOString(),
     };
 
-    const isRaceIndexSource = source === "BOATCAST_RACEINDEX";
-    if (isRaceIndexSource) {
-      // raceindex由来は公式表示を正として、無い時は古い誤判定を残さない。
-      row.grade = meta.grade || null;
-      row.race_title = meta.eventName || null;
-      row.race_type = meta.raceType || null;
-      row.is_ladies = typeof meta.isLadies === "boolean" ? meta.isLadies : false;
-    } else {
-      if (meta.grade) row.grade = meta.grade;
-      if (meta.eventName) row.race_title = meta.eventName;
-      if (meta.raceType) row.race_type = meta.raceType;
-      if (typeof meta.isLadies === "boolean") row.is_ladies = meta.isLadies;
-    }
+    if (meta.grade) row.grade = meta.grade;
+    if (meta.eventName) row.race_title = meta.eventName;
+    if (meta.raceType) row.race_type = meta.raceType;
 
+    if (typeof meta.isLadies === "boolean") row.is_ladies = meta.isLadies;
     if (allFemale) row.is_ladies = true;
 
     rows.push(row);
@@ -3062,7 +2914,7 @@ function scheduleSummary(payload) {
 
 async function fetchSchedulePayload(venue, ymd) {
   if (!venue) throw new Error("venue を指定してください");
-  const key = `schedule:v126:${venue}:${ymd}`;
+  const key = `schedule:${venue}:${ymd}`;
   pruneCache();
   return await withSharedCache(key, SCHEDULE_CACHE_MS, async () => {
     const url = buildRaceIndexUrl(venue, ymd);
@@ -3076,7 +2928,7 @@ async function fetchSchedulePayload(venue, ymd) {
     return {
       ok: true,
       action: "schedule",
-      appVersion: "v126",
+      appVersion: "v127",
       venue,
       date: ymd,
       url,
@@ -3175,7 +3027,25 @@ async function fetchHtml(url, options = {}) {
 }
 
 function validRows(rows) {
-  return Array.isArray(rows) && rows.length >= 6 && rows.every((r) => r.boat && r.tenji && r.isshu && r.mawari);
+  if (!Array.isArray(rows) || rows.length !== 6) return false;
+
+  const boats = rows.map((r) => Number(r?.boat));
+  if (
+    !boats.every((b) => Number.isInteger(b) && b >= 1 && b <= 6) ||
+    new Set(boats).size !== 6 ||
+    ![1, 2, 3, 4, 5, 6].every((b) => boats.includes(b))
+  ) {
+    return false;
+  }
+
+  return rows.every((r) => {
+    const lapOk = inRange(r.isshu, 30, 45) || inRange(r.isshu, 15, 25);
+    return (
+      inRange(r.tenji, 5.5, 7.8) &&
+      lapOk &&
+      inRange(r.mawari, 4, 15)
+    );
+  });
 }
 
 function pruneCache() {
@@ -3193,23 +3063,18 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
   if (JCD[venue]) {
     try {
       const bc = await fetchBoatcastPayload(venue, raceNo, ymd);
-      // v127: 直列だった2つのSupabase保存を並列化（応答までの待ちを短縮）。
-      const tSaves = Date.now();
-      const [preRaceStatusSaved, raceMetaSaved] = await Promise.all([
-        savePreRaceStatus({ venue, raceNo, ymd, racers: bc.racers, source: "BOATCAST" }),
-        saveRaceMetaRows({
-          venue,
-          ymd,
-          raceNo,
-          racers: bc.racers,
-          meta: {},
-          source: "BOATCAST_RACERS",
-        }),
-      ]);
-      if (bc.timingMs) bc.timingMs.saveStatusAndMeta = Date.now() - tSaves;
+      const preRaceStatusSaved = await savePreRaceStatus({ venue, raceNo, ymd, racers: bc.racers, source: "BOATCAST" });
+      const raceMetaSaved = await saveRaceMetaRows({
+        venue,
+        ymd,
+        raceNo,
+        racers: bc.racers,
+        meta: {},
+        source: "BOATCAST_RACERS",
+      });
       return {
         ok: true,
-        appVersion: "v126",
+        appVersion: "v127",
         venue,
         race: raceNo,
         date: ymd,
@@ -3232,7 +3097,6 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
         oddsCount: bc.oddsCount,
         oddsUrl: bc.oddsUrl,
         oddsError: bc.oddsError,
-        timingMs: bc.timingMs || null,
         fetchedAt: new Date().toISOString(),
       };
     } catch (e) {
@@ -3314,7 +3178,7 @@ export default async function handler(req, res) {
     const ymd = yyyymmdd(date);
 
     if (action === "schedule") {
-      res.setHeader("Cache-Control", "public, s-maxage=180, stale-while-revalidate=600");
+      res.setHeader("Cache-Control", "public, s-maxage=30, stale-while-revalidate=30");
       if (!venue) {
         res.status(400).json({ ok: false, error: "venue を指定してください" });
         return;
@@ -3344,7 +3208,7 @@ export default async function handler(req, res) {
       res.status(200).json({
         ok: true,
         action: "schedules",
-        appVersion: "v126",
+        appVersion: "v127",
         date: ymd,
         statusesByVenue,
         fetchedAt: new Date().toISOString(),
@@ -3410,7 +3274,7 @@ export default async function handler(req, res) {
         res.status(400).json({ ok: false, error: "venue を指定してください" });
         return;
       }
-      const oddsKey = `odds:v115:${venue}:${raceNo}:${ymd}`;
+      const oddsKey = `odds:v127:${venue}:${raceNo}:${ymd}`;
       pruneCache();
       const payload = await withSharedCache(oddsKey, ODDS_CACHE_MS, async () => {
         const oddsInfo = await fetchOddsForVenue(venue, raceNo, ymd);
@@ -3418,7 +3282,7 @@ export default async function handler(req, res) {
         return {
           ok: true,
           action: "odds",
-          appVersion: "v126",
+          appVersion: "v127",
           venue,
           race: raceNo,
           date: ymd,
@@ -3433,7 +3297,7 @@ export default async function handler(req, res) {
     }
 
     res.setHeader("Cache-Control", "public, s-maxage=180, stale-while-revalidate=600");
-    const key = `full:v115:${venue}:${raceNo}:${ymd}`;
+    const key = `full:v127:${venue}:${raceNo}:${ymd}`;
     pruneCache();
     const payload = await withSharedCache(key, STATIC_CACHE_MS, async () => buildFullYosoPayload(venue, raceNo, ymd), { allowStale: false });
     res.status(200).json(payload);
