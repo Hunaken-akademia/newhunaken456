@@ -1628,14 +1628,35 @@ export default function App() {
       console.warn("betRecords save skipped: next value is not an array");
       return false;
     }
-    const json = JSON.stringify(next);
-    if (json === undefined || json === "undefined") return false;
+
+    let json = "";
+    try { json = JSON.stringify(next); } catch (e) { return false; }
+    if (!json || json === "undefined") return false;
+
+    let saved = false;
+
+    // Vercel版では localStorage を主保存先にして、書き戻し確認まで行う。
+    try {
+      localStorage.setItem("hunaken_betRecords", json);
+      saved = localStorage.getItem("hunaken_betRecords") === json;
+    } catch (e) {
+      console.warn("hunaken_betRecords localStorage save failed", e);
+    }
+
+    // window.storage がある環境では予備保存も行う。
+    if (window.storage?.set) {
+      try {
+        await window.storage.set("betRecords", json);
+        saved = true;
+      } catch (e) {
+        console.warn("betRecords window.storage save failed", e);
+      }
+    }
+
+    if (!saved) return false;
     betRecordsRef.current = next;
     setBetRecords(next);
-    let saved = false;
-    try { await window.storage.set("betRecords", json); saved = true; } catch (e) { /* noop */ }
-    try { localStorage.setItem("hunaken_betRecords", json); saved = true; } catch (e) { /* noop */ }
-    return saved;
+    return true;
   };
   const setResultDigit = (k, v) => setResultDigits((p) => ({ ...p, [k]: v }));
 
@@ -1681,14 +1702,35 @@ export default function App() {
       console.warn("records save skipped: next value is not an array");
       return false;
     }
-    const json = JSON.stringify(next);
-    if (json === undefined || json === "undefined") return false;
+
+    let json = "";
+    try { json = JSON.stringify(next); } catch (e) { return false; }
+    if (!json || json === "undefined") return false;
+
+    let saved = false;
+
+    // Vercel版では localStorage を主保存先にして、書き戻し確認まで行う。
+    try {
+      localStorage.setItem("hunaken_records", json);
+      saved = localStorage.getItem("hunaken_records") === json;
+    } catch (e) {
+      console.warn("hunaken_records localStorage save failed", e);
+    }
+
+    // window.storage がある環境では予備保存も行う。
+    if (window.storage?.set) {
+      try {
+        await window.storage.set("records", json);
+        saved = true;
+      } catch (e) {
+        console.warn("records window.storage save failed", e);
+      }
+    }
+
+    if (!saved) return false;
     recordsRef.current = next;
     setRecords(next);
-    let saved = false;
-    try { await window.storage.set("records", json); saved = true; } catch (e) { /* noop */ }
-    try { localStorage.setItem("hunaken_records", json); saved = true; } catch (e) { /* noop */ }
-    return saved;
+    return true;
   };
 
   // ── データのバックアップ（エクスポート/インポート） ──
@@ -4098,7 +4140,11 @@ export default function App() {
       result: null, // 結果は後から入力
       savedAt: Date.now(),
     };
-    await persistRecords((prev) => [rec, ...prev.filter((r) => r.key !== key)]);
+    const saved = await persistRecords((prev) => [rec, ...prev.filter((r) => r.key !== key)]);
+    if (!saved) {
+      setSaveMsg("✗ 予想の保存に失敗しました。Safariのプライベートブラウズや端末容量を確認してください");
+      return;
+    }
     setSaveMsg(`✓ ${key} を保存しました`);
   };
 
@@ -4125,7 +4171,7 @@ export default function App() {
     }) : [];
     const curRanked = aiEval ? aiEval.ranked.map((r) => ({ boat: r.boat, mark: r.mark })) : [];
 
-    await persistRecords((prev) => {
+    const resultSaved = await persistRecords((prev) => {
       const idx = prev.findIndex((r) => r.key === key);
       if (idx >= 0) {
         const copy = [...prev];
@@ -4141,9 +4187,14 @@ export default function App() {
       return [{ key, date: raceDate, venue, race: raceNo, ranked: curRanked, bets: curBets, result: trio, payoutOdds: odds, betLimits: { ...betLimits }, savedAt: Date.now() }, ...prev];
     });
 
+    if (!resultSaved) {
+      setSaveMsg("✗ 結果・配当の保存に失敗しました。ページを閉じずに、もう一度お試しください");
+      return;
+    }
+
     // 同じ日付・場・レースの「自分の舟券記録」にも結果・配当を反映
     const sameRace = (b) => b.date === raceDate && b.venue === (venue || "—") && b.race === raceNo;
-    await persistBets((prev) => prev.some(sameRace)
+    const betsSynced = await persistBets((prev) => prev.some(sameRace)
       ? prev.map((b) => {
           if (!sameRace(b)) return b;
           const hit = b.tickets.includes(trio);
@@ -4153,7 +4204,11 @@ export default function App() {
         })
       : prev);
 
-    setSaveMsg(`✓ ${key} の結果 ${trio}${odds ? `（配当${odds}）` : ""} を保存しました`);
+    setSaveMsg(
+      betsSynced
+        ? `✓ ${key} の結果 ${trio}${odds ? `（配当${odds}）` : ""} を保存しました`
+        : `△ 結果は保存しましたが、自分の舟券記録への反映に失敗しました`
+    );
   };
 
   // ── 集計の絞り込み（期間・場）を records / betRecords に適用 ──
@@ -6797,7 +6852,7 @@ export default function App() {
                 結果・配当を保存したレースを対象に、AIの買い目を機械的に買った場合の回収率です（自分の収支とは別）。
               </div>
               <div style={{ display: "grid", gap: 6 }}>
-                {aiLedger.patterns.map((p) => {
+                {[...new Map(aiLedger.patterns.map((p) => [p.key, p])).values()].map((p) => {
                   const s = aiLedger.stats[p.key];
                   if (!s || s.races === 0) return null;
                   const roi = s.spent ? (s.ret / s.spent * 100) : 0;
