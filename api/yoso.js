@@ -383,31 +383,15 @@ async function readRaceSettlement({ venue, raceNo, ymd }) {
     };
   }
 
-  // 公式払戻欄が一時的に取れない場合だけ、確定オッズをフォールバックとして使う。
-  const storedOdds = review?.odds || review?.snapshot?.odds || {};
-  let decimalOdds = Number(storedOdds?.[result]);
-  let oddsSource = decimalOdds > 0 ? "saved_snapshot_fallback" : "";
-  if (!(Number.isFinite(decimalOdds) && decimalOdds > 0)) {
-    try {
-      const fetched = await fetchOddsForVenue(venue, race, ymd);
-      const fetchedOdds = Number(fetched?.odds?.[result]);
-      if (fetched?.ok && Number.isFinite(fetchedOdds) && fetchedOdds > 0) {
-        decimalOdds = fetchedOdds;
-        oddsSource = "official_fixed_odds_fallback";
-      }
-    } catch (e) {
-      // 結果だけ取得済み・払戻未取得なら、次回の自動精算で再試行する。
-    }
-  }
-
-  const payoutReady = Number.isFinite(decimalOdds) && decimalOdds > 0;
+  // 精算額にオッズ換算は使わない。公式結果ページの払戻金が取れるまで未精算として再試行する。
+  // これにより締切前オッズ・丸め済みオッズによる誤差を完全に排除する。
   return {
     completed: true,
-    settlementReady: payoutReady,
+    settlementReady: false,
     result,
-    payoutOdds: payoutReady ? decimalOdds : null,
-    payoutPer100: payoutReady ? Math.round(decimalOdds * 100) : null,
-    oddsSource,
+    payoutOdds: null,
+    payoutPer100: null,
+    oddsSource: "official_payout_pending",
     finalized: !!review?.is_final,
     finalizedAt: review?.finalized_at || review?.updated_at || "",
   };
@@ -1808,39 +1792,94 @@ function parseKimariteFromResultHtml(html) {
   return m ? m[1] : "";
 }
 
+function normalizeOfficialPayoutText(value) {
+  return decodeEntities(String(value || ""))
+    .replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+    .replace(/[，､]/g, ",")
+    .replace(/[￥]/g, "¥")
+    .replace(/[‐‑‒–—―ー−]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseOfficialPayoutAmount(value) {
+  const text = normalizeOfficialPayoutText(value);
+  // 公式結果ページは「8,220円」と「¥8,220」の両形式がある。
+  const marked = [...text.matchAll(/(?:¥\s*([0-9][0-9,]*)|([0-9][0-9,]*)\s*円)/g)];
+  for (const match of marked) {
+    const amount = Number(String(match[1] || match[2] || "").replace(/,/g, ""));
+    if (Number.isFinite(amount) && amount >= 100) return amount;
+  }
+  return null;
+}
+
 function parseOfficialTrifectaPayout(html, expectedResult = "") {
-  const dash = "[-‐‑‒–—―ー−]";
   const expected = String(expectedResult || "").replace(/[^1-6-]/g, "");
-  const lines = textLinesFromHtml(html).map(normalizeResultToken).filter(Boolean);
+  const expectedParts = expected.split("-").filter(Boolean);
   const candidates = [];
 
-  for (let i = 0; i < lines.length; i++) {
-    if (!/(?:3連単|3連勝単式)/.test(lines[i])) continue;
-    const block = lines.slice(i, Math.min(lines.length, i + 14)).join(" ");
-    let combo = null;
+  const pushCandidate = (result, payoutPer100) => {
+    const normalizedResult = String(result || "").replace(/[^1-6-]/g, "");
+    const amount = Number(payoutPer100);
+    if (!/^([1-6])-([1-6])-([1-6])$/.test(normalizedResult)) return;
+    if (!Number.isFinite(amount) || amount < 100) return;
+    if (!candidates.some((x) => x.result === normalizedResult && x.payoutPer100 === amount)) {
+      candidates.push({ result: normalizedResult, payoutPer100: Math.round(amount) });
+    }
+  };
 
-    if (expected) {
-      const [a, b, c] = expected.split("-");
-      if (a && b && c) {
-        const expectedRe = new RegExp(`${a}\\D{0,8}${b}\\D{0,8}${c}`);
-        const hit = block.match(expectedRe);
-        if (hit) combo = { 0: hit[0], 1: a, 2: b, 3: c, index: hit.index || 0 };
+  // 最優先：公式ページの「3連単」行をHTMLの表構造のまま直接解析する。
+  // テキスト化の過程で「¥」やセル境界が失われても、各tdセルから拾える。
+  for (const row of htmlTableRows(String(html || ""))) {
+    const rowText = normalizeOfficialPayoutText(row.text);
+    if (!/(?:3連単|3連勝単式)/.test(rowText)) continue;
+
+    const cells = (row.cells || []).map(normalizeOfficialPayoutText).filter(Boolean);
+    const joined = cells.join(" | ");
+    let result = "";
+
+    if (expectedParts.length === 3) {
+      const [a, b, c] = expectedParts;
+      const expectedRe = new RegExp(`${a}\\D{0,20}${b}\\D{0,20}${c}`);
+      if (expectedRe.test(joined)) result = expected;
+    }
+
+    if (!result) {
+      const combo = joined.match(/([1-6])\s*-\s*([1-6])\s*-\s*([1-6])/)
+        || joined.match(/([1-6])\D{0,8}([1-6])\D{0,8}([1-6])/);
+      if (combo) result = `${combo[1]}-${combo[2]}-${combo[3]}`;
+    }
+
+    let payoutPer100 = null;
+    for (const cell of cells) {
+      const amount = parseOfficialPayoutAmount(cell);
+      if (amount != null) {
+        payoutPer100 = amount;
+        break;
       }
     }
+    if (payoutPer100 == null) payoutPer100 = parseOfficialPayoutAmount(joined);
+    pushCandidate(result, payoutPer100);
+  }
 
-    if (!combo) {
-      const comboRe = new RegExp(`([1-6])\\s*${dash}\\s*([1-6])\\s*${dash}\\s*([1-6])`);
-      combo = block.match(comboRe);
+  // 表構造が変更された場合のフォールバック：3連単の周辺HTMLを直接解析。
+  const raw = normalizeOfficialPayoutText(String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " "));
+  const markers = [...raw.matchAll(/(?:3連単|3連勝単式)/g)];
+  for (const marker of markers) {
+    const block = raw.slice(marker.index, marker.index + 500);
+    let result = "";
+    if (expectedParts.length === 3) {
+      const [a, b, c] = expectedParts;
+      if (new RegExp(`${a}\\D{0,30}${b}\\D{0,30}${c}`).test(block)) result = expected;
     }
-    if (!combo) continue;
-
-    const result = `${combo[1]}-${combo[2]}-${combo[3]}`;
-    const afterCombo = block.slice((combo.index || 0) + combo[0].length);
-    const yen = afterCombo.match(/([0-9][0-9,]*)\s*円/);
-    if (!yen) continue;
-    const payoutPer100 = Number(String(yen[1]).replace(/,/g, ""));
-    if (!Number.isFinite(payoutPer100) || payoutPer100 <= 0) continue;
-    candidates.push({ result, payoutPer100 });
+    if (!result) {
+      const combo = block.match(/([1-6])\s*-\s*([1-6])\s*-\s*([1-6])/);
+      if (combo) result = `${combo[1]}-${combo[2]}-${combo[3]}`;
+    }
+    pushCandidate(result, parseOfficialPayoutAmount(block));
   }
 
   const exact = expected ? candidates.find((x) => x.result === expected) : null;
