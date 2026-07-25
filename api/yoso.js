@@ -359,13 +359,33 @@ async function readRaceSettlement({ venue, raceNo, ymd }) {
   if (finish.length < 3) return { completed: false, result: null, payoutOdds: null, payoutPer100: null };
   const result = finish.slice(0, 3).map((r) => Number(r.boat)).join("-");
   const review = Array.isArray(reviewRows) ? reviewRows[0] : null;
-  const oddsMap = review?.odds || review?.snapshot?.odds || {};
-  const decimalOdds = Number(oddsMap?.[result]);
+  const storedOdds = review?.odds || review?.snapshot?.odds || {};
+  let decimalOdds = Number(storedOdds?.[result]);
+  let oddsSource = decimalOdds > 0 ? "saved_snapshot" : "";
+
+  // 過去日の舟券記録は、復習スナップショットにオッズが無くても
+  // 公式の確定オッズを直接取り直して精算できるようにする。
+  if (!(Number.isFinite(decimalOdds) && decimalOdds > 0)) {
+    try {
+      const fetched = await fetchOddsForVenue(venue, race, ymd);
+      const fetchedOdds = Number(fetched?.odds?.[result]);
+      if (fetched?.ok && Number.isFinite(fetchedOdds) && fetchedOdds > 0) {
+        decimalOdds = fetchedOdds;
+        oddsSource = "official_fixed_odds";
+      }
+    } catch (e) {
+      // 結果だけ取得済み・オッズ未取得なら、次回の自動精算で再試行する。
+    }
+  }
+
+  const payoutReady = Number.isFinite(decimalOdds) && decimalOdds > 0;
   return {
     completed: true,
+    settlementReady: payoutReady,
     result,
-    payoutOdds: Number.isFinite(decimalOdds) && decimalOdds > 0 ? decimalOdds : null,
-    payoutPer100: Number.isFinite(decimalOdds) && decimalOdds > 0 ? Math.round(decimalOdds * 100) : null,
+    payoutOdds: payoutReady ? decimalOdds : null,
+    payoutPer100: payoutReady ? Math.round(decimalOdds * 100) : null,
+    oddsSource,
     finalized: !!review?.is_final,
     finalizedAt: review?.finalized_at || review?.updated_at || "",
   };
@@ -381,11 +401,15 @@ const VENUE_LEDGER_PATTERNS = [
   { key: "h_t_a", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
 ];
 
-async function buildVenueAiLedger({ venue, ymd, points = 6 }) {
+async function buildVenueAiLedger({ venue, ymd, honmeiPoints = 6, taikouPoints = 12, anaPoints = 12 }) {
   if (!venue || !JCD[venue]) throw new Error("開催場を指定してください");
   const raceDate = ymdToDate(yyyymmdd(ymd));
   const placeNo = Number(JCD[venue]);
-  const pointLimit = Math.max(1, Math.min(12, Number(points) || 6));
+  const pointLimits = {
+    "本線": Math.max(1, Math.min(6, Number(honmeiPoints) || 6)),
+    "対抗": Math.max(1, Math.min(12, Number(taikouPoints) || 12)),
+    "穴": Math.max(1, Math.min(12, Number(anaPoints) || 12)),
+  };
   const [reviewItems, predictions, resultRows] = await Promise.all([
     readReviewSnapshotsForDay(ymd, venue),
     supabaseCacheRequest(
@@ -427,7 +451,8 @@ async function buildVenueAiLedger({ venue, ymd, points = 6 }) {
       for (const part of pattern.parts) {
         const bet = pred.bets.find((b) => String(b?.label) === part);
         if (!bet) continue;
-        for (const t of (Array.isArray(bet.tickets) ? bet.tickets : []).slice(0, pointLimit)) tickets.add(String(t));
+        const limit = pointLimits[part] || 12;
+        for (const t of (Array.isArray(bet.tickets) ? bet.tickets : []).slice(0, limit)) tickets.add(String(t));
       }
       if (!tickets.size) continue;
       const s = stats[pattern.key];
@@ -446,7 +471,7 @@ async function buildVenueAiLedger({ venue, ymd, points = 6 }) {
     action: "venue_ai_ledger",
     date: ymd,
     venue,
-    points: pointLimit,
+    pointLimits,
     finalizedRaces: details.length,
     predictedRaces: details.filter((d) => d.predictionSaved).length,
     missingPredictions,
@@ -3487,6 +3512,26 @@ export default async function handler(req, res) {
       return;
     }
 
+    if (action === "venue_ai_ledger") {
+      res.setHeader("Cache-Control", "private, max-age=20");
+      const payload = await buildVenueAiLedger({
+        venue,
+        ymd,
+        honmeiPoints: req.query?.honmeiPoints,
+        taikouPoints: req.query?.taikouPoints,
+        anaPoints: req.query?.anaPoints,
+      });
+      res.status(200).json(payload);
+      return;
+    }
+
+    if (action === "review_day") {
+      res.setHeader("Cache-Control", "private, max-age=30");
+      const items = await readReviewSnapshotsForDay(ymd, venue);
+      res.status(200).json({ ok: true, action: "review_day", appVersion: "v131", date: ymd, venue: venue || "", count: items.length, items, fetchedAt: new Date().toISOString() });
+      return;
+    }
+
     const race = String(req.query.race || "").replace(/\D/g, "");
     const raceNo = Number(race);
     if (!raceNo || raceNo < 1 || raceNo > 12) {
@@ -3580,19 +3625,6 @@ export default async function handler(req, res) {
       return;
     }
 
-    if (action === "venue_ai_ledger") {
-      res.setHeader("Cache-Control", "private, max-age=20");
-      const payload = await buildVenueAiLedger({ venue, ymd, points: req.query?.points });
-      res.status(200).json(payload);
-      return;
-    }
-
-    if (action === "review_day") {
-      res.setHeader("Cache-Control", "private, max-age=30");
-      const items = await readReviewSnapshotsForDay(ymd, venue);
-      res.status(200).json({ ok: true, action: "review_day", appVersion: "v130", date: ymd, venue: venue || "", count: items.length, items, fetchedAt: new Date().toISOString() });
-      return;
-    }
 
     if (action === "odds") {
       res.setHeader("Cache-Control", "public, s-maxage=60, stale-while-revalidate=180");

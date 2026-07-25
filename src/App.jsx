@@ -1628,12 +1628,25 @@ export default function App() {
   const SHOW_RECORDS = true;
   const [betRecords, setBetRecords] = useState([]); // 確定した購入履歴
   const [venueLedgerPoints, setVenueLedgerPoints] = useState(() => {
-    try { return Math.max(1, Math.min(12, Number(localStorage.getItem("hunaken_venue_ledger_points_v1") || 6))); } catch { return 6; }
+    try {
+      const parsed = JSON.parse(localStorage.getItem("hunaken_venue_ledger_points_v2") || "null");
+      if (parsed && typeof parsed === "object") {
+        return {
+          honmei: Math.max(1, Math.min(12, Number(parsed.honmei) || 6)),
+          taikou: Math.max(1, Math.min(12, Number(parsed.taikou) || 12)),
+          ana: Math.max(1, Math.min(12, Number(parsed.ana) || 12)),
+        };
+      }
+      const legacy = Math.max(1, Math.min(12, Number(localStorage.getItem("hunaken_venue_ledger_points_v1") || 6)));
+      return { honmei: legacy, taikou: legacy, ana: legacy };
+    } catch {
+      return { honmei: 6, taikou: 12, ana: 12 };
+    }
   });
   const [venueLedger, setVenueLedger] = useState(null);
   const [venueLedgerLoading, setVenueLedgerLoading] = useState(false);
   const [venueLedgerError, setVenueLedgerError] = useState("");
-  const [aiCaptureQueue, setAiCaptureQueue] = useState([]);
+  const [aiCaptureQueue, setAiCaptureQueue] = useState([]); // [{date,venue,race}] 全開催場の締切前AI予想を順次保存
   const aiCaptureAttemptRef = useRef(new Map());
   const predictionSaveRef = useRef("");
   const betRecordsRef = useRef([]);              // 保存処理用の最新値ミラー
@@ -4383,23 +4396,24 @@ export default function App() {
   const loadVenueAiLedger = async ({ quiet = false } = {}) => {
     if (!venue || !raceDate) {
       setVenueLedger(null);
-      setAiCaptureQueue([]);
       return null;
     }
     if (!quiet) setVenueLedgerLoading(true);
     setVenueLedgerError("");
     try {
-      const qs = new URLSearchParams({ action: "venue_ai_ledger", venue, date: raceDate, points: String(venueLedgerPoints), t: String(Date.now()) });
+      const qs = new URLSearchParams({
+        action: "venue_ai_ledger",
+        venue,
+        date: raceDate,
+        honmeiPoints: String(venueLedgerPoints.honmei),
+        taikouPoints: String(venueLedgerPoints.taikou),
+        anaPoints: String(venueLedgerPoints.ana),
+        t: String(Date.now()),
+      });
       const res = await fetch(`/api/yoso?${qs.toString()}`, { cache: "no-store" });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) throw new Error(data.error || "開催場AI収支の取得に失敗しました");
       setVenueLedger(data);
-      const now = Date.now();
-      const queue = (data.missingPredictions || []).filter((r) => {
-        const key = `${raceDate}_${venue}_${r}`;
-        return now - Number(aiCaptureAttemptRef.current.get(key) || 0) > 10 * 60 * 1000;
-      });
-      setAiCaptureQueue(queue);
       return data;
     } catch (e) {
       setVenueLedgerError(e?.message || String(e));
@@ -4410,38 +4424,61 @@ export default function App() {
   };
 
   useEffect(() => {
-    try { localStorage.setItem("hunaken_venue_ledger_points_v1", String(venueLedgerPoints)); } catch { /* noop */ }
+    try { localStorage.setItem("hunaken_venue_ledger_points_v2", JSON.stringify(venueLedgerPoints)); } catch { /* noop */ }
     loadVenueAiLedger();
     const timer = window.setInterval(() => loadVenueAiLedger({ quiet: true }), 60000);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [venue, raceDate, venueLedgerPoints]);
+  }, [venue, raceDate, venueLedgerPoints.honmei, venueLedgerPoints.taikou, venueLedgerPoints.ana]);
 
   useEffect(() => {
     const onMessage = (event) => {
       if (event.origin !== window.location.origin || event.data?.type !== "hunaken-ai-prediction-saved") return;
       const key = `${event.data.date}_${event.data.venue}_${event.data.race}`;
       aiCaptureAttemptRef.current.set(key, Date.now());
-      setAiCaptureQueue((q) => q.filter((r) => Number(r) !== Number(event.data.race)));
-      loadVenueAiLedger({ quiet: true });
+      setAiCaptureQueue((q) => q.filter((x) => `${x.date}_${x.venue}_${x.race}` !== key));
+      if (event.data.date === raceDate && event.data.venue === venue) loadVenueAiLedger({ quiet: true });
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [venue, raceDate, venueLedgerPoints]);
+  }, [venue, raceDate, venueLedgerPoints.honmei, venueLedgerPoints.taikou, venueLedgerPoints.ana]);
+
+  // ログイン済みのツールが開いている間、全開催場の「次R」を締切30分前から自動保存する。
+  // 場を手動選択する必要はなく、各場の次Rが進むたびに1R〜12Rを順次処理する。
+  useEffect(() => {
+    if (captureAiMode || document.hidden) return;
+    const today = todayDateValue();
+    const now = Date.now();
+    const candidates = Object.values(venueStatuses || {})
+      .filter((st) => st && st.venue && st.nextRace && !st.noRace && !st.allClosed)
+      .map((st) => {
+        const left = Number.isFinite(Number(st.nextDeadlineMinutes))
+          ? Number(st.nextDeadlineMinutes)
+          : minutesUntilDeadline(st.nextDeadline);
+        return { date: today, venue: st.venue, race: Number(st.nextRace), left };
+      })
+      .filter((x) => x.race >= 1 && x.race <= 12 && x.left != null && x.left <= 30 && x.left >= 1)
+      .filter((x) => now - Number(aiCaptureAttemptRef.current.get(`${x.date}_${x.venue}_${x.race}`) || 0) > 2 * 60 * 1000)
+      .sort((a, b) => a.left - b.left);
+    if (!candidates.length) return;
+    setAiCaptureQueue((prev) => {
+      const map = new Map(prev.map((x) => [`${x.date}_${x.venue}_${x.race}`, x]));
+      for (const x of candidates) map.set(`${x.date}_${x.venue}_${x.race}`, x);
+      return Array.from(map.values()).sort((a, b) => a.left - b.left).slice(0, 24);
+    });
+  }, [venueStatuses, captureAiMode]);
 
   useEffect(() => {
-    if (!aiCaptureQueue.length || !venue || !raceDate) return;
-    const race = aiCaptureQueue[0];
-    const key = `${raceDate}_${venue}_${race}`;
+    if (!aiCaptureQueue.length || captureAiMode) return;
+    const current = aiCaptureQueue[0];
+    const key = `${current.date}_${current.venue}_${current.race}`;
+    aiCaptureAttemptRef.current.set(key, Date.now());
     const timer = window.setTimeout(() => {
-      aiCaptureAttemptRef.current.set(key, Date.now());
-      setAiCaptureQueue((q) => q.filter((x) => Number(x) !== Number(race)));
-      loadVenueAiLedger({ quiet: true });
-    }, 30000);
+      setAiCaptureQueue((q) => q.filter((x) => `${x.date}_${x.venue}_${x.race}` !== key));
+    }, 45000);
     return () => window.clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [aiCaptureQueue, venue, raceDate]);
+  }, [aiCaptureQueue, captureAiMode]);
 
   // 結果未確定で記録した舟券とAI予想を、結果確定後に自動精算する。
   useEffect(() => {
@@ -4461,9 +4498,11 @@ export default function App() {
           const qs = new URLSearchParams({ action: "settlement", date: rec.date, venue: rec.venue, race: String(rec.race), t: String(Date.now()) });
           const res = await fetch(`/api/yoso?${qs.toString()}`, { cache: "no-store" });
           const data = await res.json().catch(() => ({}));
-          if (!res.ok || !data.ok || !data.completed || !data.result) continue;
-          const trio = data.result;
           const payoutPer100 = Number(data.payoutPer100 || 0);
+          // 結果だけで精算済みにすると、的中時に配当0円で確定して再試行されなくなる。
+          // 出目と確定オッズの両方が揃った時だけ舟券記録へ反映する。
+          if (!res.ok || !data.ok || !data.completed || !data.result || !(payoutPer100 > 0)) continue;
+          const trio = data.result;
           await persistRecords((prev) => prev.map((r) =>
             r.date === rec.date && r.venue === rec.venue && String(r.race) === String(rec.race)
               ? { ...r, result: trio, payoutOdds: payoutPer100 || null, autoSettled: true }
@@ -5278,18 +5317,29 @@ export default function App() {
           </select>
 
           <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
               <div>
                 <div style={{ fontSize: 12, fontWeight: 900, color: "#fff" }}>開催場AI予想収支</div>
                 <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 2 }}>選択日のうち、結果確定済みレースまでを自動集計</div>
               </div>
-              <label style={{ fontSize: 10, color: "#9db5cc", display: "flex", alignItems: "center", gap: 6 }}>
-                各項目
-                <select value={venueLedgerPoints} onChange={(e) => setVenueLedgerPoints(Number(e.target.value))}
-                  style={{ padding: "6px 8px", borderRadius: 7, background: "#0e1b2c", color: "#fff", border: "1px solid #2c4762" }}>
-                  {Array.from({ length: 12 }, (_, i) => i + 1).map((n) => <option key={n} value={n}>{n}点</option>)}
-                </select>
-              </label>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6, width: "100%", marginTop: 8 }}>
+                {[
+                  ["honmei", "本線", 6],
+                  ["taikou", "対抗", 12],
+                  ["ana", "穴", 12],
+                ].map(([key, label, max]) => (
+                  <label key={key} style={{ fontSize: 10, color: "#9db5cc", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 4, background: "#0e1b2c", borderRadius: 7, padding: "6px 7px" }}>
+                    <span>{label}</span>
+                    <select
+                      value={venueLedgerPoints[key]}
+                      onChange={(e) => setVenueLedgerPoints((p) => ({ ...p, [key]: Number(e.target.value) }))}
+                      style={{ padding: "4px 5px", borderRadius: 6, background: "#16273c", color: "#fff", border: "1px solid #2c4762", minWidth: 55 }}
+                    >
+                      {Array.from({ length: max }, (_, i) => i + 1).map((n) => <option key={n} value={n}>{n}点</option>)}
+                    </select>
+                  </label>
+                ))}
+              </div>
             </div>
             {!venue ? (
               <div style={{ fontSize: 11, color: "#7da3c8" }}>開催場を選択すると表示されます。</div>
@@ -5301,7 +5351,7 @@ export default function App() {
               <>
                 <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 8 }}>
                   {venue}：結果確定 {venueLedger.finalizedRaces || 0}R／AI予想保存 {venueLedger.predictedRaces || 0}R
-                  {(venueLedger.missingPredictions || []).length > 0 && <span>（不足分を自動作成中）</span>}
+                  {(venueLedger.missingPredictions || []).length > 0 && <span>（AI予想未保存 {venueLedger.missingPredictions.length}R）</span>}
                 </div>
                 <div style={{ display: "grid", gap: 6 }}>
                   {(venueLedger.patterns || []).map((p) => {
@@ -5318,7 +5368,7 @@ export default function App() {
                     );
                   })}
                 </div>
-                {!venueLedger.predictedRaces && <div style={{ fontSize: 10, color: "#7da3c8" }}>確定済みレースのAI予想を自動作成しています。少し待つと反映されます。</div>}
+                {!venueLedger.predictedRaces && <div style={{ fontSize: 10, color: "#7da3c8" }}>本アップデート以降、締切前に自動保存できたレースから集計されます。</div>}
               </>
             ) : null}
           </div>
@@ -7653,11 +7703,11 @@ export default function App() {
         </div>
         </>)}
 
-        {!captureAiMode && aiCaptureQueue.length > 0 && venue && raceDate && (
+        {!captureAiMode && aiCaptureQueue.length > 0 && (
           <iframe
-            key={`${raceDate}_${venue}_${aiCaptureQueue[0]}`}
+            key={`${aiCaptureQueue[0].date}_${aiCaptureQueue[0].venue}_${aiCaptureQueue[0].race}`}
             title="AI予想自動保存"
-            src={`${window.location.pathname}?capture_ai=1&date=${encodeURIComponent(raceDate)}&venue=${encodeURIComponent(venue)}&race=${encodeURIComponent(aiCaptureQueue[0])}`}
+            src={`${window.location.pathname}?capture_ai=1&date=${encodeURIComponent(aiCaptureQueue[0].date)}&venue=${encodeURIComponent(aiCaptureQueue[0].venue)}&race=${encodeURIComponent(aiCaptureQueue[0].race)}`}
             style={{ position: "fixed", width: 1, height: 1, opacity: 0, pointerEvents: "none", left: -9999, top: -9999, border: 0 }}
           />
         )}

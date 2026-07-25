@@ -43,8 +43,8 @@ for (const s of schedules) {
   if (!s?.venue || s.noRace || !Array.isArray(s.schedule)) continue;
   for (const r of s.schedule) {
     const left = Number(r.deadlineMinutes) - now.minutes;
-    // 展示公開前後は繰り返し取得。締切後は確定オッズを2回まで拾える幅を取る。
-    if (left <= 30 && left >= -15) jobs.push({ venue:s.venue, race:Number(r.race), left, final:left <= -1 });
+    // 展示公開前後は繰り返し取得。締切後も90分間は結果・確定オッズを再確認する。
+    if (left <= 30 && left >= -90) jobs.push({ venue:s.venue, race:Number(r.race), left, final:left <= -1 });
   }
 }
 
@@ -60,8 +60,30 @@ const results = await mapLimit(jobs, CONCURRENCY, async j => {
     data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
     rows = Array.isArray(data.rows) ? data.rows.length : 0;
   }
-  console.log(`OK ${j.venue}${j.race}R left=${j.left} final=${j.final} rows=${rows} odds=${data.oddsCount||0}`);
-  return {ok:true,...j,rows,odds:data.oddsCount||0};
+  let resultCompleted = false;
+  let resultReason = "";
+  if (j.final) {
+    const fetchResult = async () => {
+      const rq = new URLSearchParams({ action: "result", venue: j.venue, race: String(j.race), date: now.date, t: String(Date.now()) });
+      return await getJson(`${BASE}/api/yoso?${rq}`, TOKEN ? { "x-capture-token": TOKEN } : {});
+    };
+    try {
+      let resultData = await fetchResult();
+      resultCompleted = !!resultData.completed;
+      resultReason = resultData.reason || "";
+      // 締切直後で未確定なら同じrun内でもう一度だけ確認する。
+      if (!resultCompleted && j.left >= -20) {
+        await new Promise((resolve) => setTimeout(resolve, 20000));
+        resultData = await fetchResult();
+        resultCompleted = !!resultData.completed;
+        resultReason = resultData.reason || resultReason;
+      }
+    } catch (e) {
+      resultReason = e.message || String(e);
+    }
+  }
+  console.log(`OK ${j.venue}${j.race}R left=${j.left} final=${j.final} rows=${rows} odds=${data.oddsCount||0} result=${resultCompleted ? "confirmed" : (j.final ? "pending" : "-")}`);
+  return {ok:true,...j,rows,odds:data.oddsCount||0,resultCompleted,resultReason};
 });
 
 const ok=results.filter(x=>x?.ok).length;
