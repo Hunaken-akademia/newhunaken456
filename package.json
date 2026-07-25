@@ -1,6 +1,6 @@
 {
   "name": "hunaken-academia-paid-auto",
-  "version": "1.5.1-wake-prob-build-safe",
+  "version": "1.5.2-wake-prob-install-fix",
   "private": true,
   "type": "module",
   "scripts": {
@@ -15,6 +15,6 @@
   },
   "devDependencies": {},
   "engines": {
-    "node": ">=20 <25"
+    "node": "22.x"
   }
 }
