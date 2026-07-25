@@ -275,6 +275,188 @@ async function readReviewSnapshotsForDay(ymd, venue = "") {
   }));
 }
 
+
+function normalizePredictionBets(rawBets) {
+  if (!Array.isArray(rawBets)) return [];
+  const labels = new Set(["本線", "対抗", "穴", "超穴"]);
+  const ticketRe = /^[1-6]-[1-6]-[1-6]$/;
+  return rawBets
+    .filter((b) => labels.has(String(b?.label || "")))
+    .map((b) => {
+      const seen = new Set();
+      const tickets = [];
+      for (const t of Array.isArray(b?.tickets) ? b.tickets : []) {
+        const v = String(t || "");
+        if (!ticketRe.test(v)) continue;
+        const parts = v.split("-");
+        if (new Set(parts).size !== 3 || seen.has(v)) continue;
+        seen.add(v);
+        tickets.push(v);
+      }
+      return { label: String(b.label), tickets: tickets.slice(0, 120) };
+    })
+    .filter((b) => b.tickets.length > 0);
+}
+
+async function saveAiPredictionSnapshot({ venue, raceNo, ymd, bets, ranked, modelVersion = "" }) {
+  if (!ENABLE_PERSISTENT_CACHE || !venue || !JCD[venue]) {
+    return { ok: false, skipped: true, reason: "保存条件不足" };
+  }
+  const normalizedBets = normalizePredictionBets(bets);
+  if (!normalizedBets.length) return { ok: false, skipped: true, reason: "買い目なし" };
+  const raceDate = ymdToDate(yyyymmdd(ymd));
+  const placeNo = Number(JCD[venue]);
+  const race = Number(raceNo);
+  if (!raceDate || !(race >= 1 && race <= 12)) return { ok: false, skipped: true, reason: "日付・レース不正" };
+
+  // 公式取得済みレースだけ保存対象にする。任意レースの偽データ保存を防ぐ最低限のガード。
+  const existing = await supabaseCacheRequest(
+    `race_review_snapshots?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&race_no=eq.${race}&select=race_no&limit=1`
+  );
+  if (!Array.isArray(existing) || !existing.length) {
+    return { ok: false, skipped: true, reason: "公式スナップショット未保存" };
+  }
+
+  const safeRanked = Array.isArray(ranked)
+    ? ranked.slice(0, 6).map((r) => ({ boat: Number(r?.boat), mark: String(r?.mark || "") }))
+      .filter((r) => r.boat >= 1 && r.boat <= 6)
+    : [];
+  const nowIso = new Date().toISOString();
+  await supabaseCacheRequest("ai_prediction_snapshots?on_conflict=race_date,place_no,race_no", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{
+      race_date: raceDate,
+      place_no: placeNo,
+      race_no: race,
+      venue,
+      bets: normalizedBets,
+      ranked: safeRanked,
+      model_version: String(modelVersion || "").slice(0, 80),
+      captured_at: nowIso,
+      updated_at: nowIso,
+    }]),
+  });
+  return { ok: true, count: normalizedBets.length };
+}
+
+async function readRaceSettlement({ venue, raceNo, ymd }) {
+  if (!ENABLE_PERSISTENT_CACHE || !venue || !JCD[venue]) return null;
+  const raceDate = ymdToDate(yyyymmdd(ymd));
+  const placeNo = Number(JCD[venue]);
+  const race = Number(raceNo);
+  const [resultRows, reviewRows] = await Promise.all([
+    supabaseCacheRequest(
+      `race_results?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&race_no=eq.${race}&select=boat,rank,status&order=rank.asc`
+    ),
+    supabaseCacheRequest(
+      `race_review_snapshots?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&race_no=eq.${race}&select=odds,snapshot,is_final,finalized_at,updated_at&limit=1`
+    ),
+  ]);
+  const finish = (Array.isArray(resultRows) ? resultRows : [])
+    .filter((r) => Number(r.rank) >= 1 && Number(r.rank) <= 3 && Number(r.boat) >= 1 && Number(r.boat) <= 6)
+    .sort((a, b) => Number(a.rank) - Number(b.rank));
+  if (finish.length < 3) return { completed: false, result: null, payoutOdds: null, payoutPer100: null };
+  const result = finish.slice(0, 3).map((r) => Number(r.boat)).join("-");
+  const review = Array.isArray(reviewRows) ? reviewRows[0] : null;
+  const oddsMap = review?.odds || review?.snapshot?.odds || {};
+  const decimalOdds = Number(oddsMap?.[result]);
+  return {
+    completed: true,
+    result,
+    payoutOdds: Number.isFinite(decimalOdds) && decimalOdds > 0 ? decimalOdds : null,
+    payoutPer100: Number.isFinite(decimalOdds) && decimalOdds > 0 ? Math.round(decimalOdds * 100) : null,
+    finalized: !!review?.is_final,
+    finalizedAt: review?.finalized_at || review?.updated_at || "",
+  };
+}
+
+const VENUE_LEDGER_PATTERNS = [
+  { key: "honmei", name: "本線", parts: ["本線"] },
+  { key: "taikou", name: "対抗", parts: ["対抗"] },
+  { key: "ana", name: "穴", parts: ["穴"] },
+  { key: "h_t", name: "本線＋対抗", parts: ["本線", "対抗"] },
+  { key: "h_a", name: "本線＋穴", parts: ["本線", "穴"] },
+  { key: "t_a", name: "対抗＋穴", parts: ["対抗", "穴"] },
+  { key: "h_t_a", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
+];
+
+async function buildVenueAiLedger({ venue, ymd, points = 6 }) {
+  if (!venue || !JCD[venue]) throw new Error("開催場を指定してください");
+  const raceDate = ymdToDate(yyyymmdd(ymd));
+  const placeNo = Number(JCD[venue]);
+  const pointLimit = Math.max(1, Math.min(12, Number(points) || 6));
+  const [reviewItems, predictions, resultRows] = await Promise.all([
+    readReviewSnapshotsForDay(ymd, venue),
+    supabaseCacheRequest(
+      `ai_prediction_snapshots?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&select=race_no,bets,ranked,model_version,captured_at,updated_at&order=race_no.asc`
+    ),
+    supabaseCacheRequest(
+      `race_results?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&select=race_no,boat,rank,status&order=race_no.asc,rank.asc`
+    ),
+  ]);
+
+  const predByRace = new Map((Array.isArray(predictions) ? predictions : []).map((r) => [Number(r.race_no), r]));
+  const resultByRace = new Map();
+  for (const row of Array.isArray(resultRows) ? resultRows : []) {
+    const race = Number(row.race_no);
+    if (!resultByRace.has(race)) resultByRace.set(race, []);
+    resultByRace.get(race).push(row);
+  }
+  const stats = Object.fromEntries(VENUE_LEDGER_PATTERNS.map((p) => [p.key, { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 }]));
+  const details = [];
+  const missingPredictions = [];
+
+  for (const item of reviewItems || []) {
+    const race = Number(item.race);
+    const pred = predByRace.get(race);
+    const finish = (resultByRace.get(race) || [])
+      .filter((r) => Number(r.rank) >= 1 && Number(r.rank) <= 3 && Number(r.boat) >= 1 && Number(r.boat) <= 6)
+      .sort((a, b) => Number(a.rank) - Number(b.rank));
+    if (finish.length < 3) continue;
+    const result = finish.slice(0, 3).map((r) => Number(r.boat)).join("-");
+    const oddsMap = item?.snapshot?.odds || {};
+    const decimalOdds = Number(oddsMap?.[result]);
+    if (!pred?.bets || !Array.isArray(pred.bets)) {
+      missingPredictions.push(race);
+      details.push({ race, result, predictionSaved: false, odds: Number.isFinite(decimalOdds) ? decimalOdds : null });
+      continue;
+    }
+    for (const pattern of VENUE_LEDGER_PATTERNS) {
+      const tickets = new Set();
+      for (const part of pattern.parts) {
+        const bet = pred.bets.find((b) => String(b?.label) === part);
+        if (!bet) continue;
+        for (const t of (Array.isArray(bet.tickets) ? bet.tickets : []).slice(0, pointLimit)) tickets.add(String(t));
+      }
+      if (!tickets.size) continue;
+      const s = stats[pattern.key];
+      s.races += 1;
+      s.spent += tickets.size * 100;
+      if (tickets.has(result)) {
+        s.hit += 1;
+        if (Number.isFinite(decimalOdds) && decimalOdds > 0) s.ret += Math.round(decimalOdds * 100);
+      }
+    }
+    details.push({ race, result, predictionSaved: true, odds: Number.isFinite(decimalOdds) ? decimalOdds : null });
+  }
+
+  return {
+    ok: true,
+    action: "venue_ai_ledger",
+    date: ymd,
+    venue,
+    points: pointLimit,
+    finalizedRaces: details.length,
+    predictedRaces: details.filter((d) => d.predictionSaved).length,
+    missingPredictions,
+    patterns: VENUE_LEDGER_PATTERNS,
+    stats,
+    details,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
 async function isRequestedRaceClosed(venue, raceNo, ymd) {
   const now = jstNowParts();
   const target = yyyymmdd(ymd);
@@ -3353,6 +3535,54 @@ export default async function handler(req, res) {
         return;
       }
       const payload = await fetchBoatcastRaceResultPayload(venue, raceNo, ymd);
+      res.status(200).json(payload);
+      return;
+    }
+
+
+    if (action === "save_ai_prediction") {
+      res.setHeader("Cache-Control", "no-store");
+      if (String(req.method || "GET").toUpperCase() !== "POST") {
+        res.status(405).json({ ok: false, error: "POST only" });
+        return;
+      }
+      let body = req.body;
+      if (typeof body === "string") {
+        try { body = JSON.parse(body); } catch { body = {}; }
+      }
+      const targetVenue = String(body?.venue || venue || "");
+      const targetRace = Number(body?.race || raceNo);
+      const targetDate = String(body?.date || ymd);
+      const saved = await saveAiPredictionSnapshot({
+        venue: targetVenue,
+        raceNo: targetRace,
+        ymd: targetDate,
+        bets: body?.bets,
+        ranked: body?.ranked,
+        modelVersion: body?.modelVersion,
+      });
+      res.status(saved.ok ? 200 : 400).json(saved);
+      return;
+    }
+
+    if (action === "settlement") {
+      res.setHeader("Cache-Control", "private, no-store");
+      if (!venue || !JCD[venue]) {
+        res.status(400).json({ ok: false, error: "開催場を指定してください" });
+        return;
+      }
+      let settlement = await readRaceSettlement({ venue, raceNo, ymd });
+      if (!settlement?.completed && await isRequestedRaceClosed(venue, raceNo, ymd)) {
+        try { await fetchBoatcastRaceResultPayload(venue, raceNo, ymd); } catch (e) { /* 次回再試行 */ }
+        settlement = await readRaceSettlement({ venue, raceNo, ymd });
+      }
+      res.status(200).json({ ok: true, action: "settlement", venue, race: Number(raceNo), date: ymd, ...(settlement || { completed: false }) });
+      return;
+    }
+
+    if (action === "venue_ai_ledger") {
+      res.setHeader("Cache-Control", "private, max-age=20");
+      const payload = await buildVenueAiLedger({ venue, ymd, points: req.query?.points });
       res.status(200).json(payload);
       return;
     }

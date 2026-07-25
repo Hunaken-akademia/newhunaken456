@@ -1553,6 +1553,9 @@ export default function App() {
   const [autoRefreshInfo, setAutoRefreshInfo] = useState("");
   const [salesEnded, setSalesEnded] = useState(false);
   const [reviewMode, setReviewMode] = useState(false);
+  const [captureAiMode] = useState(() => {
+    try { return new URLSearchParams(window.location.search).get("capture_ai") === "1"; } catch { return false; }
+  });
   const [venueNotHeld, setVenueNotHeld] = useState(false);
   const [officialSchedule, setOfficialSchedule] = useState(null);
   const [venueStatuses, setVenueStatuses] = useState({});
@@ -1620,10 +1623,19 @@ export default function App() {
   const [pickerAlloc, setPickerAlloc] = useState("even"); // 配分: "even"=均等ミックス / "solid"=堅い順優先 / "ana"=穴寄り
 
   // ── 舟券の収支記録 ──
-  // 記録関連（予想の保存・結果入力・的中率・AI収支・舟券収支・バックアップ）の表示フラグ。
+  // 記録関連（予想・的中率・収支・AI収支・舟券収支・バックアップ）の表示フラグ。
   // Webアプリ版（Vercel）では localStorage に永続保存されるため有効。
   const SHOW_RECORDS = true;
   const [betRecords, setBetRecords] = useState([]); // 確定した購入履歴
+  const [venueLedgerPoints, setVenueLedgerPoints] = useState(() => {
+    try { return Math.max(1, Math.min(12, Number(localStorage.getItem("hunaken_venue_ledger_points_v1") || 6))); } catch { return 6; }
+  });
+  const [venueLedger, setVenueLedger] = useState(null);
+  const [venueLedgerLoading, setVenueLedgerLoading] = useState(false);
+  const [venueLedgerError, setVenueLedgerError] = useState("");
+  const [aiCaptureQueue, setAiCaptureQueue] = useState([]);
+  const aiCaptureAttemptRef = useRef(new Map());
+  const predictionSaveRef = useRef("");
   const betRecordsRef = useRef([]);              // 保存処理用の最新値ミラー
   useEffect(() => { betRecordsRef.current = betRecords; }, [betRecords]);
   const [betMsg, setBetMsg] = useState("");
@@ -2450,6 +2462,30 @@ export default function App() {
     reviewDayFetchRef.current.set(d, task);
     return task;
   };
+
+  useEffect(() => {
+    if (!captureAiMode) return;
+    let cancelled = false;
+    const qs = new URLSearchParams(window.location.search);
+    const d = qs.get("date") || activeRaceDateValue();
+    const v = qs.get("venue") || "";
+    const r = qs.get("race") || "";
+    if (!v || !r) return;
+    setAutoRefreshEnabled(false);
+    setRaceDate(d);
+    setVenue(v);
+    setRaceNo(String(r));
+    setReviewMode(true);
+    preloadReviewSnapshots(d, { force: true }).then(() => {
+      if (cancelled) return;
+      if (!applyCachedReviewSnapshot(v, r, d)) {
+        fetchOfficialYoso({ venue: v, raceNo: r, raceDate: d, force: true, ignoreSalesEnded: true });
+      }
+    });
+    return () => { cancelled = true; };
+    // capture用iframeの初回だけ。通常画面の選択状態には影響させない。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captureAiMode]);
 
   const minutesUntilDeadline = (hhmm) => {
     const m = String(hhmm || "").match(/^(\d{1,2}):(\d{2})$/);
@@ -4311,6 +4347,143 @@ export default function App() {
     [result, sts, fHold, fSts, motors, tilts, wind, racerCat, kimari, kimariPeriod, nigeSim, odds]
   );
 
+
+  // AI買い目は結果確定前の時点でレース単位に保存。場別収支はこのスナップショットと確定結果を結合する。
+  useEffect(() => {
+    if (!aiEval?.bets?.length || !venue || !raceDate || !raceNo) return;
+    const payload = {
+      venue,
+      date: raceDate,
+      race: Number(raceNo),
+      bets: aiEval.bets.map((b) => ({ label: b.label, tickets: Array.isArray(b.tickets) ? b.tickets : [] })),
+      ranked: aiEval.ranked?.map((r) => ({ boat: r.boat, mark: r.mark })) || [],
+      modelVersion: "wake-prob-v1",
+    };
+    const signature = `${raceDate}_${venue}_${raceNo}_${JSON.stringify(payload.bets)}`;
+    if (predictionSaveRef.current === signature) return;
+    predictionSaveRef.current = signature;
+    let cancelled = false;
+    fetch("/api/yoso?action=save_ai_prediction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(async (res) => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || data.reason || "AI予想保存失敗");
+      if (!cancelled && captureAiMode && window.parent !== window) {
+        window.parent.postMessage({ type: "hunaken-ai-prediction-saved", date: raceDate, venue, race: Number(raceNo) }, window.location.origin);
+      }
+    }).catch((e) => {
+      predictionSaveRef.current = "";
+      if (captureAiMode) console.warn("AI予想自動保存:", e?.message || e);
+    });
+    return () => { cancelled = true; };
+  }, [aiEval, venue, raceDate, raceNo, captureAiMode]);
+
+  const loadVenueAiLedger = async ({ quiet = false } = {}) => {
+    if (!venue || !raceDate) {
+      setVenueLedger(null);
+      setAiCaptureQueue([]);
+      return null;
+    }
+    if (!quiet) setVenueLedgerLoading(true);
+    setVenueLedgerError("");
+    try {
+      const qs = new URLSearchParams({ action: "venue_ai_ledger", venue, date: raceDate, points: String(venueLedgerPoints), t: String(Date.now()) });
+      const res = await fetch(`/api/yoso?${qs.toString()}`, { cache: "no-store" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || "開催場AI収支の取得に失敗しました");
+      setVenueLedger(data);
+      const now = Date.now();
+      const queue = (data.missingPredictions || []).filter((r) => {
+        const key = `${raceDate}_${venue}_${r}`;
+        return now - Number(aiCaptureAttemptRef.current.get(key) || 0) > 10 * 60 * 1000;
+      });
+      setAiCaptureQueue(queue);
+      return data;
+    } catch (e) {
+      setVenueLedgerError(e?.message || String(e));
+      return null;
+    } finally {
+      if (!quiet) setVenueLedgerLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    try { localStorage.setItem("hunaken_venue_ledger_points_v1", String(venueLedgerPoints)); } catch { /* noop */ }
+    loadVenueAiLedger();
+    const timer = window.setInterval(() => loadVenueAiLedger({ quiet: true }), 60000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [venue, raceDate, venueLedgerPoints]);
+
+  useEffect(() => {
+    const onMessage = (event) => {
+      if (event.origin !== window.location.origin || event.data?.type !== "hunaken-ai-prediction-saved") return;
+      const key = `${event.data.date}_${event.data.venue}_${event.data.race}`;
+      aiCaptureAttemptRef.current.set(key, Date.now());
+      setAiCaptureQueue((q) => q.filter((r) => Number(r) !== Number(event.data.race)));
+      loadVenueAiLedger({ quiet: true });
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [venue, raceDate, venueLedgerPoints]);
+
+  useEffect(() => {
+    if (!aiCaptureQueue.length || !venue || !raceDate) return;
+    const race = aiCaptureQueue[0];
+    const key = `${raceDate}_${venue}_${race}`;
+    const timer = window.setTimeout(() => {
+      aiCaptureAttemptRef.current.set(key, Date.now());
+      setAiCaptureQueue((q) => q.filter((x) => Number(x) !== Number(race)));
+      loadVenueAiLedger({ quiet: true });
+    }, 30000);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aiCaptureQueue, venue, raceDate]);
+
+  // 結果未確定で記録した舟券とAI予想を、結果確定後に自動精算する。
+  useEffect(() => {
+    const pendingKeys = new Map();
+    for (const b of betRecordsRef.current || []) {
+      if (!b?.result && b?.date && b?.venue && b?.venue !== "—" && b?.race) pendingKeys.set(`${b.date}_${b.venue}_${b.race}`, b);
+    }
+    for (const r of recordsRef.current || []) {
+      if (!r?.result && r?.date && r?.venue && r?.race) pendingKeys.set(`${r.date}_${r.venue}_${r.race}`, r);
+    }
+    if (!pendingKeys.size) return;
+    let cancelled = false;
+    const settle = async () => {
+      for (const rec of pendingKeys.values()) {
+        if (cancelled) return;
+        try {
+          const qs = new URLSearchParams({ action: "settlement", date: rec.date, venue: rec.venue, race: String(rec.race), t: String(Date.now()) });
+          const res = await fetch(`/api/yoso?${qs.toString()}`, { cache: "no-store" });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.ok || !data.completed || !data.result) continue;
+          const trio = data.result;
+          const payoutPer100 = Number(data.payoutPer100 || 0);
+          await persistRecords((prev) => prev.map((r) =>
+            r.date === rec.date && r.venue === rec.venue && String(r.race) === String(rec.race)
+              ? { ...r, result: trio, payoutOdds: payoutPer100 || null, autoSettled: true }
+              : r
+          ));
+          await persistBets((prev) => prev.map((b) => {
+            if (!(b.date === rec.date && b.venue === rec.venue && String(b.race) === String(rec.race))) return b;
+            const hit = Array.isArray(b.tickets) && b.tickets.includes(trio);
+            const hitAmt = hit ? (b.perTicket ? Number(b.perTicket[trio] || 0) : Number(b.amountPerPoint || 0)) : 0;
+            const payout = hit && payoutPer100 > 0 ? Math.round((hitAmt / 100) * payoutPer100) : 0;
+            return { ...b, result: trio, hit, payoutOdds: payoutPer100 || null, payout, autoSettled: true };
+          }));
+        } catch (e) { /* 次回再試行 */ }
+      }
+    };
+    settle();
+    const timer = window.setInterval(settle, 60000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [records.length, betRecords.length]);
+
   // ── 予想＋買い目を保存 ──
   const saveRecord = async () => {
     if (!aiEval) { setSaveMsg("先に展示タイムなどを入力して評価を出してください"); return; }
@@ -4825,40 +4998,36 @@ export default function App() {
     return { pts, amt };
   }, [cart]);
 
-  // カートをこのレースの購入として確定（結果出目・配当を反映）
+  // カートをこのレースの購入として確定。結果・払戻は公式結果確定後に自動反映する。
   const commitCart = async () => {
     if (cart.length === 0) { setBetMsg("リストに買い目がありません"); return; }
-    // 結果は上の「結果の出目（3連単）」の選択を使用
-    const { first, second, third } = resultDigits;
-    const res = `${first}-${second}-${third}`;
-    const hasResult = /^[1-6]-[1-6]-[1-6]$/.test(res) && new Set([first, second, third]).size === 3;
-    const odds = Number(payoutOddsInput);
-    const recs = cart.map((l) => {
-      const amount = lineTotal(l);
-      const hit = hasResult && l.tickets.includes(res);
-      // 的中点の購入額（個別ならその点の金額、一律なら amountPerPoint）
-      const hitAmt = hit ? (l.perTicket ? (l.perTicket[res] || 0) : (l.amountPerPoint || 0)) : 0;
-      const payout = hit && odds > 0 ? Math.round((hitAmt / 100) * odds) : 0;
-      return {
-        id: l.id, date: raceDate, venue: venue || "—", race: raceNo,
-        label: l.label, points: l.tickets.length, tickets: l.tickets,
-        amountPerPoint: l.perTicket ? null : l.amountPerPoint,
-        perTicket: l.perTicket || null,
-        amount,
-        result: hasResult ? res : null,
-        hit: hasResult ? hit : null,
-        payoutOdds: odds > 0 ? odds : null,
-        payout,
-      };
-    });
+    if (!venue) { setBetMsg("開催場を選択してください"); return; }
+    const recs = cart.map((l) => ({
+      id: l.id, date: raceDate, venue, race: raceNo,
+      label: l.label, points: l.tickets.length, tickets: l.tickets,
+      amountPerPoint: l.perTicket ? null : l.amountPerPoint,
+      perTicket: l.perTicket || null,
+      amount: lineTotal(l),
+      result: null, hit: null, payoutOdds: null, payout: 0,
+      settlementStatus: "pending", recordedAt: Date.now(),
+    }));
     const saved = await persistBets((prev) => [...recs, ...prev]);
     if (!saved) {
       setBetMsg("✗ 買い目の保存に失敗しました。ページを閉じずに、もう一度お試しください");
       return;
     }
+    // AI予想側も結果待ちレコードとして保存し、自動精算後の的中率・収支へ反映する。
+    if (aiEval?.bets?.length) {
+      const key = `${raceDate}_${venue}_${raceNo}R`;
+      await persistRecords((prev) => [{
+        key, date: raceDate, venue, race: raceNo,
+        ranked: aiEval.ranked.map((r) => ({ boat: r.boat, mark: r.mark })),
+        bets: aiEval.bets.map((b) => ({ label: b.label, tickets: b.tickets })),
+        result: null, payoutOdds: null, betLimits: { ...betLimits }, savedAt: Date.now(),
+      }, ...prev.filter((r) => r.key !== key)]);
+    }
     const totalAmt = recs.reduce((a, r) => a + r.amount, 0);
-    const totalPay = recs.reduce((a, r) => a + (r.payout || 0), 0);
-    setBetMsg(`✓ ${recs.length}件・${totalAmt.toLocaleString()}円を記録${hasResult ? `／払戻 ${totalPay.toLocaleString()}円` : ""}`);
+    setBetMsg(`✓ ${recs.length}件・${totalAmt.toLocaleString()}円を記録しました。結果確定後に自動反映します`);
     setCart([]);
   };
 
@@ -5107,6 +5276,52 @@ export default function App() {
               return opts;
             })()}
           </select>
+
+          <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 900, color: "#fff" }}>開催場AI予想収支</div>
+                <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 2 }}>選択日のうち、結果確定済みレースまでを自動集計</div>
+              </div>
+              <label style={{ fontSize: 10, color: "#9db5cc", display: "flex", alignItems: "center", gap: 6 }}>
+                各項目
+                <select value={venueLedgerPoints} onChange={(e) => setVenueLedgerPoints(Number(e.target.value))}
+                  style={{ padding: "6px 8px", borderRadius: 7, background: "#0e1b2c", color: "#fff", border: "1px solid #2c4762" }}>
+                  {Array.from({ length: 12 }, (_, i) => i + 1).map((n) => <option key={n} value={n}>{n}点</option>)}
+                </select>
+              </label>
+            </div>
+            {!venue ? (
+              <div style={{ fontSize: 11, color: "#7da3c8" }}>開催場を選択すると表示されます。</div>
+            ) : venueLedgerLoading && !venueLedger ? (
+              <div style={{ fontSize: 11, color: "#7da3c8" }}>集計中…</div>
+            ) : venueLedgerError ? (
+              <div style={{ fontSize: 11, color: "#ff8a80" }}>{venueLedgerError}</div>
+            ) : venueLedger ? (
+              <>
+                <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 8 }}>
+                  {venue}：結果確定 {venueLedger.finalizedRaces || 0}R／AI予想保存 {venueLedger.predictedRaces || 0}R
+                  {(venueLedger.missingPredictions || []).length > 0 && <span>（不足分を自動作成中）</span>}
+                </div>
+                <div style={{ display: "grid", gap: 6 }}>
+                  {(venueLedger.patterns || []).map((p) => {
+                    const st = venueLedger.stats?.[p.key];
+                    if (!st || !st.races) return null;
+                    const roi = st.spent ? st.ret / st.spent * 100 : 0;
+                    const hitRate = st.races ? st.hit / st.races * 100 : 0;
+                    return (
+                      <div key={p.key} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr", gap: 6, alignItems: "center", background: "#0e1b2c", borderRadius: 8, padding: "8px 10px" }}>
+                        <span style={{ fontSize: 12, fontWeight: 700, color: "#cfe0f0" }}>{st.name}</span>
+                        <span style={{ fontSize: 11, color: "#9db5cc" }}>的中 {hitRate.toFixed(0)}% <span style={{ color: "#5e7a92" }}>({st.hit}/{st.races})</span></span>
+                        <span style={{ fontSize: 13, fontWeight: 800, textAlign: "right", color: roi >= 100 ? "#5dd39e" : "#ff8a80" }}>回収 {roi.toFixed(1)}%</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                {!venueLedger.predictedRaces && <div style={{ fontSize: 10, color: "#7da3c8" }}>確定済みレースのAI予想を自動作成しています。少し待つと反映されます。</div>}
+              </>
+            ) : null}
+          </div>
 
           <div style={{ fontSize: 11, color: "#7da3c8", marginBottom: 6 }}>開催場を選択</div>
           <select
@@ -6888,54 +7103,10 @@ export default function App() {
             対象：{raceDate}／{venue || "場未選択"}／{raceNo}R
           </div>
 
-          {/* 結果出目＋配当の入力（収支にも反映） */}
           <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
-            <div style={{ fontSize: 12, color: "#9db5cc", marginBottom: 8 }}>結果の出目（3連単）</div>
-            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-              {["first", "second", "third"].map((k, i) => (
-                <span key={k} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <select
-                    value={resultDigits[k]}
-                    onChange={(e) => setResultDigit(k, e.target.value)}
-                    style={{
-                      padding: "9px 10px", fontSize: 16, background: "#0e1b2c", color: "#fff",
-                      border: "1px solid #2c4762", borderRadius: 8, minWidth: 64,
-                    }}
-                  >
-                    <option value="">{i === 0 ? "1着" : i === 1 ? "2着" : "3着"}</option>
-                    {[1, 2, 3, 4, 5, 6].map((n) => (
-                      <option key={n} value={String(n)}>{n}</option>
-                    ))}
-                  </select>
-                  {i < 2 && <span style={{ color: "#7da3c8" }}>-</span>}
-                </span>
-              ))}
-            </div>
-
-            <div style={{ fontSize: 12, color: "#9db5cc", margin: "12px 0 6px" }}>配当（100円あたりの払戻額）</div>
-            <input
-              value={payoutOddsInput}
-              onChange={(e) => setPayoutOddsInput(e.target.value.replace(/[^\d.]/g, ""))}
-              inputMode="decimal" placeholder="例 580（100円→580円）"
-              style={{
-                width: "100%", boxSizing: "border-box", padding: "9px 10px", fontSize: 16, marginBottom: 10,
-                background: "#0e1b2c", color: "#fff", border: "1px solid #2c4762", borderRadius: 8,
-              }}
-            />
-
-            <button
-              onClick={saveResult}
-              style={{
-                padding: "9px 16px", borderRadius: 8, cursor: "pointer",
-                background: "#5a9e2e", color: "#fff", fontSize: 13, fontWeight: 700, border: "none",
-              }}
-            >
-              結果・配当を保存
-            </button>
-            <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 8, lineHeight: 1.6 }}>
-              <b style={{ color: "#5dd39e" }}>予想の保存ボタンを押し忘れても大丈夫です。</b>結果を入れて保存すれば、その予想ごと自動で記録されます（的中率・収支に反映）。<br />
-              ここで入れた結果の出目と配当が、下の舟券収支の払戻金・回収率にも自動で反映されます。
-              買い目リストの「このレースの購入を記録する」を押すと、この結果・配当を使って計算されます。
+            <div style={{ fontSize: 12, fontWeight: 800, color: "#fff", marginBottom: 4 }}>結果・払戻は自動反映</div>
+            <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.7 }}>
+              公式の結果出目と確定オッズを自動取得します。結果確定前に購入を記録した場合も、確定後に舟券収支・AI予想収支へ自動反映されます。
             </div>
           </div>
 
@@ -7039,7 +7210,7 @@ export default function App() {
                 AI予想の収支（全部1点100円で買ったら・{aiLedger.judged}レース）
               </div>
               <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 10 }}>
-                結果・配当を保存したレースを対象に、AIの買い目を機械的に買った場合の回収率です（自分の収支とは別）。
+                公式結果・確定オッズが取得できたレースを対象に、AIの買い目を機械的に買った場合の回収率です（自分の収支とは別）。
               </div>
               <div style={{ display: "grid", gap: 6 }}>
                 {aiLedger.patterns.map((p) => {
@@ -7090,7 +7261,7 @@ export default function App() {
                               結果 {r.result} {r.bets && r.bets.length ? (hit ? "的中" : "不的中") : ""}
                               {r.payoutOdds ? <span style={{ color: "#7da3c8", fontWeight: 400 }}>（配当{r.payoutOdds}）</span> : null}
                             </span>
-                          : <span style={{ color: "#7da3c8" }}>結果未入力</span>}
+                          : <span style={{ color: "#7da3c8" }}>結果確定待ち</span>}
                         <button
                           onClick={() => deleteRecord(r.key)}
                           style={{
@@ -7442,10 +7613,9 @@ export default function App() {
                   marginTop: 10, padding: "10px 16px", borderRadius: 8, cursor: "pointer",
                   background: "#5a9e2e", color: "#fff", fontSize: 13, fontWeight: 700, border: "none",
                 }}
-              >このレースの購入を記録する</button>
+              >買い目購入を記録する</button>
               <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 8, lineHeight: 1.6 }}>
-                上の「結果の出目（3連単）」と配当を入れてから押すと、払戻金・回収率まで反映されます。
-                結果が未確定なら、金額だけ決めて先に記録してもOK（払戻は0で記録されます）。
+                結果やオッズの入力は不要です。結果未確定でも先に記録でき、公式結果の確定後に払戻金・回収率へ自動反映されます。
               </div>
             </div>
           )}
@@ -7470,7 +7640,7 @@ export default function App() {
                           {b.result} {b.hit ? `的中 +${b.payout.toLocaleString()}円` : "不的中"}
                           {b.payoutOdds ? <span style={{ color: "#7da3c8", fontWeight: 400 }}>（配当{b.payoutOdds}）</span> : null}
                         </span>
-                      : <span style={{ color: "#7da3c8" }}>結果未入力</span>}
+                      : <span style={{ color: "#7da3c8" }}>結果確定待ち</span>}
                     <button
                       onClick={() => deleteBet(b.id)}
                       style={{ marginLeft: "auto", background: "none", border: "none", color: "#5e7a92", cursor: "pointer", fontSize: 12 }}
@@ -7482,6 +7652,15 @@ export default function App() {
           )}
         </div>
         </>)}
+
+        {!captureAiMode && aiCaptureQueue.length > 0 && venue && raceDate && (
+          <iframe
+            key={`${raceDate}_${venue}_${aiCaptureQueue[0]}`}
+            title="AI予想自動保存"
+            src={`${window.location.pathname}?capture_ai=1&date=${encodeURIComponent(raceDate)}&venue=${encodeURIComponent(venue)}&race=${encodeURIComponent(aiCaptureQueue[0])}`}
+            style={{ position: "fixed", width: 1, height: 1, opacity: 0, pointerEvents: "none", left: -9999, top: -9999, border: 0 }}
+          />
+        )}
 
         {/* ご利用にあたって */}
         <div style={{
