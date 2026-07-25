@@ -1,5 +1,11 @@
-Vercel build error fix:
-Top-level await is not available in target chrome87/edge88/es2020/etc.
+カバー率の表示削除パッチ
 
-Upload vite.config.js to the repository root and overwrite the existing file.
-No src/App.jsx, auth, paid_users, Stripe, Google login, or cloud data code is changed.
+上書き対象:
+src/App.jsx
+
+変更内容:
+- 本線・対抗・穴・超穴の説明文から「カバー率」を削除
+- 各買い目カードの合成オッズ横にあった「カバー率」を削除
+- オッズ未取得時に表示していた「カバー率」を削除
+
+買い目生成、probMap、EV計算、評価ロジック、認証、決済、クラウド保存には変更なし。

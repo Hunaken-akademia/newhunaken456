@@ -3825,10 +3825,9 @@ export default function App() {
         }
       }
     }
-    const honCoveragePct = Math.max(0, Math.min(100, coverage(honTickets) * 100));
     const honmei = {
       label: "本線",
-      desc: `1着率1位を1着固定／2・3着は推定確率上位（カバー率 ${honCoveragePct.toFixed(1)}%）`,
+      desc: "1着率1位を1着固定／2・3着は推定確率上位",
       tickets: honTickets,
     };
 
@@ -3926,12 +3925,11 @@ export default function App() {
       }
     }
 
-    const taikouCoveragePct = Math.max(0, Math.min(100, coverage(taikouTickets) * 100));
     const taikou = {
       label: "対抗",
       desc: hasUsableProbMap
-        ? `1着率2位＋展開濃厚艇を頭候補／推定確率上位・本線重複除外（カバー率 ${taikouCoveragePct.toFixed(1)}%）${taikouFlowNote}`
-        : `確率未取得のため従来ロジックで補完／本線重複除外（カバー率 ${taikouCoveragePct.toFixed(1)}%）${taikouFlowNote}`,
+        ? `1着率2位＋展開濃厚艇を頭候補／推定確率上位・本線重複除外${taikouFlowNote}`
+        : `確率未取得のため従来ロジックで補完／本線重複除外${taikouFlowNote}`,
       tickets: taikouTickets,
     };
 
@@ -4053,8 +4051,7 @@ export default function App() {
           : `EV条件該当なしのため評価2・3位頭の中穴へフォールバック`;
       }
 
-      const anaCoveragePct = Math.max(0, Math.min(100, coverage(tickets) * 100));
-      ana = { label: "穴", desc: `${desc}（カバー率 ${anaCoveragePct.toFixed(1)}%）`, tickets };
+      ana = { label: "穴", desc, tickets };
     }
 
     // 合成オッズ（オッズ貼り付け時）= 1 ÷ Σ(1/各点オッズ)
@@ -4084,10 +4081,9 @@ export default function App() {
         if (picked.length >= 12) break;
       }
       if (picked.length > 0) {
-        const pct = Math.max(0, Math.min(100, coverage(picked) * 100));
         choBet = {
           label: "超穴",
-          desc: `120通りからEV1.0以上・50倍以上をEV順／合成10倍以上を維持（カバー率 ${pct.toFixed(1)}%）`,
+          desc: "120通りからEV1.0以上・50倍以上をEV順／合成10倍以上を維持",
           tickets: picked,
         };
       } else {
@@ -4095,20 +4091,18 @@ export default function App() {
         const single = sortByEv(all120Tickets.filter((t) => Number(odds?.[t]) > 10))
           .slice(0, 3);
         const safeSingle = single.length ? single : sortByProb(all120Tickets).slice(0, 3);
-        const pct = Math.max(0, Math.min(100, coverage(safeSingle) * 100));
         choBet = {
           label: "超穴",
-          desc: `条件該当なしのため1点勝負（最大3点）（カバー率 ${pct.toFixed(1)}%）`,
+          desc: "条件該当なしのため1点勝負（最大3点）",
           tickets: safeSingle,
         };
       }
     } else {
       const cand = sortByProb(all120Tickets).slice(0, 3);
       const safeCand = cand.length ? cand : all120Tickets.slice(0, 3);
-      const pct = Math.max(0, Math.min(100, coverage(safeCand) * 100));
       choBet = {
         label: "超穴",
-        desc: `オッズ未取得のため推定確率上位を目安表示（カバー率 ${pct.toFixed(1)}%）`,
+        desc: "オッズ未取得のため推定確率上位を目安表示",
         tickets: safeCand,
       };
     }
@@ -6628,10 +6622,6 @@ export default function App() {
                         const lim = betLimits[bet.label] != null ? Math.min(betLimits[bet.label], maxPts) : maxPts;
                         const shown = baseTickets.slice(0, lim);
                         // 表示点数に応じた合成オッズ
-                        const shownCoverage = Math.max(0, Math.min(100, shown.reduce((sum, t) => {
-                          const p = Number(aiEval?.probMap?.[t]);
-                          return sum + (Number.isFinite(p) && p > 0 ? p : 0);
-                        }, 0) * 100));
                         let compShown = null;
                         if (odds) {
                           const vals = shown.map((t) => odds[t]).filter((o) => o != null && o > 0);
@@ -6676,7 +6666,6 @@ export default function App() {
                             {compShown ? (
                               <div style={{ fontSize: 12, color: "#5dd39e", fontWeight: 800, marginBottom: 6 }}>
                                 合成オッズ 約{compShown.odds.toFixed(1)}倍
-                                <span style={{ marginLeft: 8, color: "#9db5cc", fontWeight: 700 }}>カバー率 {shownCoverage.toFixed(1)}%</span>
                                 {compShown.covered < compShown.total && (
                                   <span style={{ fontSize: 10, color: "#7da3c8", fontWeight: 400 }}>
                                     （{compShown.covered}/{compShown.total}点のオッズで計算）
@@ -6686,7 +6675,6 @@ export default function App() {
                             ) : !odds ? (
                               <div style={{ fontSize: 10, color: "#8a98a8", marginBottom: 6 }}>
                                 オッズ未取得のため合成オッズは表示できません（自動取得できると計算されます）
-                                <span style={{ marginLeft: 8 }}>カバー率 {shownCoverage.toFixed(1)}%</span>
                               </div>
                             ) : null}
                             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
