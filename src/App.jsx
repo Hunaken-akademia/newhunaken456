@@ -3863,8 +3863,8 @@ export default function App() {
       }
     }
 
-    // 対抗（改善B・C）: 1着率2位を1着に置く＝本線(1位頭)の裏。
-    //   3連対率1位を軸に、2・3着はST速い艇＋上位で構成。本線と被る目は除外
+    // 対抗（確率モデル駆動）: 頭候補は現行どおり1着率2位＋展開濃厚艇。
+    //   各頭の20通りをprobMapの確率降順で採用し、本線と被る目は除外する。
     const honSet = new Set(honmei.tickets);
     const taikouTickets = [];
     const pushUnique = (t) => {
@@ -3872,51 +3872,66 @@ export default function App() {
       if (!taikouTickets.includes(t) && !honSet.has(t)) taikouTickets.push(t);
     };
     const a1 = r1[0], a2 = r1[1];      // 1着率1位・2位
-    const axis = r3[0];                // 3連対率1位（軸）
-    // 相手候補：3連対率上位＋ST速い艇（精度C）
+    const axis = r3[0];                // 3連対率1位（フォールバック用の軸）
     const partners2 = [...new Set([...r3.slice(0, 4), ...stRank.slice(0, 3), ...order.slice(0, 4)])].filter(Boolean);
-    // ⓪ 展開連動: 濃い攻め手艇（まくり/差し濃厚）を頭にした目を優先的に入れる
-    let taikouFlowNote = "";
-    if (scenarioHeads.length > 0) {
-      taikouFlowNote = `／展開濃厚艇${scenarioHeads.join("・")}号を頭に反映`;
-      for (const h of scenarioHeads) {
-        // 攻め手艇 → 1号艇 → 上位（1号艇を負かす本線の裏）
-        const others = partners2.filter((b) => b !== h);
-        for (const c of others) { if (c !== 1) pushUnique(`${h}-1-${c}`); if (taikouTickets.length >= 6) break; }
-        // 攻め手艇 → 上位 → 1号艇
-        for (const b of others) { if (b !== 1) pushUnique(`${h}-${b}-1`); if (taikouTickets.length >= 6) break; }
-        if (taikouTickets.length >= 6) break;
-      }
-    }
-    if (a2) {
-      // ① 主軸：1着率2位を1着に（本線の裏）。軸(3連対率1位)を絡める
-      const head = a2;
-      if (axis && axis !== head) {
-        for (const c of partners2) { if (c !== head && c !== axis) pushUnique(`${head}-${axis}-${c}`); if (taikouTickets.length >= 12) break; }
-        for (const b of partners2) { if (b !== head && b !== axis) pushUnique(`${head}-${b}-${axis}`); if (taikouTickets.length >= 12) break; }
-      }
-      // ② 1着率2位頭で相手に流す
-      if (taikouTickets.length < 12) {
-        for (const b of partners2) {
-          if (b === head) continue;
-          for (const c of partners2) { if (c !== head && c !== b) pushUnique(`${head}-${b}-${c}`); if (taikouTickets.length >= 12) break; }
+    const taikouHeads = [...new Set([a2, ...scenarioHeads].filter(Boolean))];
+    const hasUsableProbMap = probMap && Object.values(probMap).some((p) => Number.isFinite(Number(p)) && Number(p) > 0);
+    let taikouFlowNote = scenarioHeads.length > 0
+      ? `／展開濃厚艇${scenarioHeads.join("・")}号を頭に反映`
+      : "";
+
+    if (hasUsableProbMap && taikouHeads.length > 0) {
+      for (const head of taikouHeads) {
+        const others = [1, 2, 3, 4, 5, 6].filter((b) => b !== head);
+        const headCandidates = sortByProb(buildTickets([head], others, others, 20));
+        for (const t of headCandidates) {
+          pushUnique(t);
           if (taikouTickets.length >= 12) break;
         }
+        if (taikouTickets.length >= 12) break;
       }
     }
-    // ③ 1着率1位の折り返し（本線で拾えない2着づけ）も少し補完
-    if (taikouTickets.length < 12 && a1 && a2) {
-      for (const c of partners2) { if (c !== a1 && c !== a2) pushUnique(`${a2}-${a1}-${c}`); if (taikouTickets.length >= 12) break; }
-    }
-    // ③ それでも空きがあれば上位フォーメーションで補完
+
+    // probMapが空・全0、または確率候補だけで埋まらない場合は現行ヒューリスティックで補完する。
     if (taikouTickets.length < 12) {
-      const top4 = order.slice(0, 4);
-      const more = buildTickets(top4.slice(0, 2), top4, top4, 12);
-      for (const t of more) { pushUnique(t); if (taikouTickets.length >= 12) break; }
+      if (scenarioHeads.length > 0) {
+        for (const h of scenarioHeads) {
+          const others = partners2.filter((b) => b !== h);
+          for (const c of others) { if (c !== 1) pushUnique(`${h}-1-${c}`); if (taikouTickets.length >= 6) break; }
+          for (const b of others) { if (b !== 1) pushUnique(`${h}-${b}-1`); if (taikouTickets.length >= 6) break; }
+          if (taikouTickets.length >= 6) break;
+        }
+      }
+      if (a2 && taikouTickets.length < 12) {
+        const head = a2;
+        if (axis && axis !== head) {
+          for (const c of partners2) { if (c !== head && c !== axis) pushUnique(`${head}-${axis}-${c}`); if (taikouTickets.length >= 12) break; }
+          for (const b of partners2) { if (b !== head && b !== axis) pushUnique(`${head}-${b}-${axis}`); if (taikouTickets.length >= 12) break; }
+        }
+        if (taikouTickets.length < 12) {
+          for (const b of partners2) {
+            if (b === head) continue;
+            for (const c of partners2) { if (c !== head && c !== b) pushUnique(`${head}-${b}-${c}`); if (taikouTickets.length >= 12) break; }
+            if (taikouTickets.length >= 12) break;
+          }
+        }
+      }
+      if (taikouTickets.length < 12 && a1 && a2) {
+        for (const c of partners2) { if (c !== a1 && c !== a2) pushUnique(`${a2}-${a1}-${c}`); if (taikouTickets.length >= 12) break; }
+      }
+      if (taikouTickets.length < 12) {
+        const top4 = order.slice(0, 4);
+        const more = buildTickets(top4.slice(0, 2), top4, top4, 12);
+        for (const t of more) { pushUnique(t); if (taikouTickets.length >= 12) break; }
+      }
     }
+
+    const taikouCoveragePct = Math.max(0, Math.min(100, coverage(taikouTickets) * 100));
     const taikou = {
       label: "対抗",
-      desc: "1着率2位を1着に置く本線の裏／3連対率1位を軸＋ST反映（本線と被る目は除外）" + taikouFlowNote,
+      desc: hasUsableProbMap
+        ? `1着率2位＋展開濃厚艇を頭候補／推定確率上位・本線重複除外（カバー率 ${taikouCoveragePct.toFixed(1)}%）${taikouFlowNote}`
+        : `確率未取得のため従来ロジックで補完／本線重複除外（カバー率 ${taikouCoveragePct.toFixed(1)}%）${taikouFlowNote}`,
       tickets: taikouTickets,
     };
 
