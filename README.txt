@@ -1,15 +1,5 @@
-WAKE 改善① 手順0のみ
+Vercel build error fix:
+Top-level await is not available in target chrome87/edge88/es2020/etc.
 
-変更対象:
-- src/App.jsx
-
-変更内容:
-- winProb / probMap の計算ブロックを、買い目生成より前へ移動。
-- 移動先は項目別配点が確定した直後。
-- 確率式、score、配点、縮小推定、本線頭固定ルールは未変更。
-- 買い目の選び方はまだ未変更（次の手順で対応）。
-
-確認:
-- ranked / score / final1 / baseRate が確定後に確率計算される順序。
-- JSX構文チェック済み。
-- 括弧差分: {}=0, ()=0, []=0。
+Upload vite.config.js to the repository root and overwrite the existing file.
+No src/App.jsx, auth, paid_users, Stripe, Google login, or cloud data code is changed.
