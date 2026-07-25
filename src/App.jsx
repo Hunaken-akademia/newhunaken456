@@ -1566,6 +1566,9 @@ export default function App() {
   const reviewDayFetchRef = useRef(new Map());
   const lastAutoFetchKeyRef = useRef("");
   const lastAutoFetchAtRef = useRef(0);
+  // 周回短縮・天候等で展示項目が恒久的に不足するレースは、展示の再取得を停止する。
+  // 同じレースでもオッズ更新は継続できるよう、レース単位で記録する。
+  const terminalDisplayShortageKeysRef = useRef(new Set());
   const manualRaceSelectUntilRef = useRef(0);
   const prefetchBusyKeysRef = useRef(new Set());
   const lastPrefetchAtByKeyRef = useRef({});
@@ -2246,7 +2249,9 @@ export default function App() {
     const requestKey = `${targetVenue}_${targetDate}_${targetRaceNo}`;
     const nowMs = Date.now();
     if (!targetVenue) return;
-    if (override.oddsOnly || (override.background && hasCompleteAutoStaticData(targetVenue))) {
+    if (override.oddsOnly
+      || (override.background && hasCompleteAutoStaticData(targetVenue))
+      || (override.background && terminalDisplayShortageKeysRef.current.has(requestKey))) {
       return fetchOfficialOddsOnly(override);
     }
     if (salesEnded && !override.ignoreSalesEnded && override.background) {
@@ -2303,12 +2308,28 @@ export default function App() {
           && String(r?.mawari ?? "").trim() !== ""
         ).map((r) => Number(r.boat)));
         const missing = [1, 2, 3, 4, 5, 6].filter((b) => !completeBoats.has(b));
+        const hasPublishedDisplay = (rows || []).some((r) =>
+          String(r?.tenji ?? "").trim() !== ""
+          || String(r?.isshu ?? "").trim() !== ""
+          || String(r?.mawari ?? "").trim() !== ""
+          || String(r?.chokusen ?? r?.straight ?? "").trim() !== ""
+        );
+        const isTerminalShortage = reasonCode === "five_boat"
+          || (reasonCode === "display_shortage" && hasPublishedDisplay);
+
         let msg = `${targetVenue}${targetRaceNo}Rは公開展示待ちです。1分後に再確認します。`;
-        if (reasonCode === "five_boat") msg = `${targetVenue}${targetRaceNo}R：エラー。5艇レースのため。`;
-        else if (reasonCode === "display_shortage") msg = `${targetVenue}${targetRaceNo}R：展示情報不足${missing.length ? `（未取得：${missing.join("・")}号艇）` : ""}。1分後に再確認します。`;
+        if (reasonCode === "five_boat") {
+          msg = `${targetVenue}${targetRaceNo}R：5艇レースのため、展示データの再取得を停止しました。`;
+        } else if (isTerminalShortage) {
+          msg = `${targetVenue}${targetRaceNo}R：周回短縮・天候等による展示情報不足${missing.length ? `（未取得：${missing.join("・")}号艇）` : ""}のため、展示データの再取得を停止しました。`;
+        } else if (reasonCode === "display_shortage") {
+          msg = `${targetVenue}${targetRaceNo}Rは公開展示待ちです。1分後に再確認します。`;
+        }
+
+        if (isTerminalShortage) terminalDisplayShortageKeysRef.current.add(requestKey);
         setPMsg("tenji", msg);
         setAutoMsg(msg);
-        setAutoRefreshInfo(msg);
+        setAutoRefreshInfo(isTerminalShortage ? "" : msg);
         return;
       }
 
@@ -2738,8 +2759,9 @@ export default function App() {
       fetchOfficialYoso({ venue, raceNo: targetRace, raceDate: today, background: true, force, ignoreSalesEnded: true, oddsOnly: hasCompleteAutoStaticData() });
     };
     run(true);
-    // 展示未公開・一部欠落中も早めに拾えるよう、選択中レースは1分ごとに確認する。
-    // 6艇分が揃った後は fetchOfficialYoso 側がオッズ更新だけへ切り替える。
+    // 展示未公開中だけ1分ごとに確認する。
+    // 周回短縮・天候等で展示項目が不足するレースは、初回判定後に展示の再取得を停止し、オッズ更新だけへ切り替える。
+    // 6艇分が揃った場合も fetchOfficialYoso 側がオッズ更新だけへ切り替える。
     const id = window.setInterval(() => run(false), 60000);
     const onFocus = () => run(false);
     const onVisibility = () => { if (!document.hidden) run(false); };
