@@ -345,14 +345,20 @@ async function readRaceSettlement({ venue, raceNo, ymd }) {
   const raceDate = ymdToDate(yyyymmdd(ymd));
   const placeNo = Number(JCD[venue]);
   const race = Number(raceNo);
-  const [resultRows, reviewRows] = await Promise.all([
+  // race_results の本番テーブルには status 列が無い環境がある。
+  // 精算に必要なのは boat / rank のみなので、存在しない列は参照しない。
+  // さらに、キャッシュ読込が失敗しても公式結果の直接取得へ進めるよう、
+  // ここでは個別に失敗を吸収して未取得扱いにする。
+  const [resultRes, reviewRes] = await Promise.allSettled([
     supabaseCacheRequest(
-      `race_results?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&race_no=eq.${race}&select=boat,rank,status&order=rank.asc`
+      `race_results?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&race_no=eq.${race}&select=boat,rank&order=rank.asc`
     ),
     supabaseCacheRequest(
       `race_review_snapshots?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&race_no=eq.${race}&select=odds,snapshot,is_final,finalized_at,updated_at&limit=1`
     ),
   ]);
+  const resultRows = resultRes.status === "fulfilled" ? resultRes.value : [];
+  const reviewRows = reviewRes.status === "fulfilled" ? reviewRes.value : [];
   const finish = (Array.isArray(resultRows) ? resultRows : [])
     .filter((r) => Number(r.rank) >= 1 && Number(r.rank) <= 3 && Number(r.boat) >= 1 && Number(r.boat) <= 6)
     .sort((a, b) => Number(a.rank) - Number(b.rank));
@@ -416,7 +422,7 @@ async function buildVenueAiLedger({ venue, ymd, honmeiPoints = 6, taikouPoints =
       `ai_prediction_snapshots?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&select=race_no,bets,ranked,model_version,captured_at,updated_at&order=race_no.asc`
     ),
     supabaseCacheRequest(
-      `race_results?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&select=race_no,boat,rank,status&order=race_no.asc,rank.asc`
+      `race_results?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&select=race_no,boat,rank&order=race_no.asc,rank.asc`
     ),
   ]);
 
