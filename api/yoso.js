@@ -1822,14 +1822,14 @@ function parseOfficialTrifectaPayout(html, expectedResult = "") {
     if (expected) {
       const [a, b, c] = expected.split("-");
       if (a && b && c) {
-        const expectedRe = new RegExp(`${a}\D{0,8}${b}\D{0,8}${c}`);
+        const expectedRe = new RegExp(`${a}\\D{0,8}${b}\\D{0,8}${c}`);
         const hit = block.match(expectedRe);
         if (hit) combo = { 0: hit[0], 1: a, 2: b, 3: c, index: hit.index || 0 };
       }
     }
 
     if (!combo) {
-      const comboRe = new RegExp(`([1-6])\s*${dash}\s*([1-6])\s*${dash}\s*([1-6])`);
+      const comboRe = new RegExp(`([1-6])\\s*${dash}\\s*([1-6])\\s*${dash}\\s*([1-6])`);
       combo = block.match(comboRe);
     }
     if (!combo) continue;
