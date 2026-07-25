@@ -108,16 +108,26 @@
         }
 
         function patchCriterionChips(card) {
-          const labels = ["枠別成績", "展示タイム", "モーター"];
+          const criteria = [
+            { label: "枠別成績", aliases: ["枠別成績"] },
+            { label: "展示", aliases: ["展示", "展示タイム"] },
+            { label: "モーター", aliases: ["モーター"] },
+          ];
           let good = 0;
           const leaves = leafElements(card);
 
-          for (const label of labels) {
+          for (const criterion of criteria) {
             const chip = leaves.find((el) => {
               const t = textOf(el);
-              return t.endsWith(label) && /^[✓✗×−-]/.test(t);
+              return criterion.aliases.some((alias) => t.endsWith(alias)) && /^[✓✗×−-]/.test(t);
             });
-            if (chip && textOf(chip).startsWith("✓")) good += 1;
+            if (chip) {
+              const t = textOf(chip);
+              if (t.startsWith("✓")) good += 1;
+              const prefix = (t.match(/^[✓✗×−-]/) || [""])[0];
+              const next = `${prefix} ${criterion.label}`.trim();
+              if (t !== next) chip.textContent = next;
+            }
           }
 
           const windChip = leaves.find((el) => {
@@ -162,14 +172,14 @@
           const aliases = {
             "成績": "枠別成績",
             "枠別成績": "枠別成績",
-            "展示": "展示タイム",
-            "展示タイム": "展示タイム",
+            "展示": "展示",
+            "展示タイム": "展示",
             "モーター": "モーター",
             "風": "風",
             "ST": "ST",
             "枠基準": "枠基準",
           };
-          const desired = ["枠別成績", "展示タイム", "モーター", "風", "ST", "枠基準"];
+          const desired = ["枠別成績", "展示", "モーター", "風", "ST", "枠基準"];
           const rows = [];
 
           for (const el of leafElements(box)) {
@@ -204,11 +214,20 @@
           let node;
           while ((node = walker.nextNode())) {
             const before = String(node.nodeValue || "");
-            if (!before.includes("判定:") || !before.includes("4項目")) continue;
-            const after = before.replace(
-              /判定:\s*枠別成績・展示タイム・モーター・風\s*の4項目中、?\s*良が3つ以上＝◎\s*／?\s*2つ＝○\s*／?\s*1つ＝△\s*／?\s*0＝[×✕]。?/,
-              "判定: 枠別成績・展示タイム・モーターの3項目で、3項目＝◎／2項目＝○／1項目＝△／0項目＝✕。風は印判定から除外し、合計点・総合順位にのみ反映します。"
-            );
+            let after = before;
+            if (after.includes("判定:")) {
+              after = after.replace(
+                /判定:\s*枠別成績・(?:展示タイム|展示)・モーター・風\s*の4項目中、?\s*良が3つ以上＝◎\s*／?\s*2つ＝○\s*／?\s*1つ＝△\s*／?\s*0＝[×✕]。?/,
+                "判定: 枠別成績・展示・モーターの3項目で、3項目＝◎／2項目＝○／1項目＝△／0項目＝✕。風は印判定から除外し、合計点・総合順位にのみ反映します。"
+              );
+              after = after.replace(
+                /判定:\s*枠別成績・展示タイム・モーターの3項目で、3項目＝◎／2項目＝○／1項目＝△／0項目＝✕。/,
+                "判定: 枠別成績・展示・モーターの3項目で、3項目＝◎／2項目＝○／1項目＝△／0項目＝✕。"
+              );
+            }
+            if (after.includes("使用データ:")) {
+              after = after.replace(/展示タイム/g, "展示");
+            }
             if (after !== before) node.nodeValue = after;
           }
         }

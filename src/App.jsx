@@ -3669,7 +3669,7 @@ export default function App() {
 
     const usedData = [
       rows.some((r) => r.racerR1final != null || r.racerR3final != null) ? `枠別成績(${racerCat})` : null,
-      "展示タイム",
+      "展示",
       motorAvg != null ? "モーター" : null,
       wind !== "無風" ? "風" : null,
       stAvg != null ? "平均ST(注意判定)" : null,
@@ -6189,7 +6189,7 @@ export default function App() {
                       <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: 8 }}>
                         {[
                           ["枠別成績", r.crit.racer],
-                          ["展示タイム", r.crit.time],
+                          ["展示", r.crit.time],
                           ["モーター", r.crit.motor],
                         ].map(([label, v]) => (
                           <span key={label} style={{
@@ -6210,7 +6210,7 @@ export default function App() {
                         const fixedOrder = ["成績", "展示", "モーター", "風", "ST", "枠基準"];
                         const labelOf = {
                           成績: "枠別成績",
-                          展示: "展示タイム",
+                          展示: "展示",
                           モーター: "モーター",
                           風: "風",
                           ST: "ST",
@@ -6275,7 +6275,7 @@ export default function App() {
                 </div>
 
                 <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 10, lineHeight: 1.6 }}>
-                  判定: 枠別成績・展示タイム・モーターの3項目で、3項目＝◎／2項目＝○／1項目＝△／0項目＝✕。風は印判定から除外し、合計点・総合順位にのみ反映します。
+                  判定: 枠別成績・展示・モーターの3項目で、3項目＝◎／2項目＝○／1項目＝△／0項目＝✕。風は印判定から除外し、合計点・総合順位にのみ反映します。
                   場平均は参考表示のみ。−はデータ未入力。
                   使用データ: {aiEval.usedData.join("・")}
                 </div>
