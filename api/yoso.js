@@ -1802,13 +1802,21 @@ function normalizeOfficialPayoutText(value) {
     .trim();
 }
 
-function parseOfficialPayoutAmount(value) {
+function parseOfficialPayoutAmount(value, { allowBare = false } = {}) {
   const text = normalizeOfficialPayoutText(value);
-  // 公式結果ページは「8,220円」と「¥8,220」の両形式がある。
+  // 公式結果ページは「8,220円」「¥8,220」のほか、セル内が「8,220」だけの形式もある。
   const marked = [...text.matchAll(/(?:¥\s*([0-9][0-9,]*)|([0-9][0-9,]*)\s*円)/g)];
   for (const match of marked) {
     const amount = Number(String(match[1] || match[2] || "").replace(/,/g, ""));
     if (Number.isFinite(amount) && amount >= 100) return amount;
+  }
+  if (allowBare) {
+    // 人気順位や艇番を誤認しないよう、裸の数値は3桁以上またはカンマ付きだけ許可する。
+    const bare = [...text.matchAll(/(?:^|[^0-9])([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{3,})(?:[^0-9]|$)/g)];
+    for (const match of bare) {
+      const amount = Number(String(match[1] || "").replace(/,/g, ""));
+      if (Number.isFinite(amount) && amount >= 100) return amount;
+    }
   }
   return null;
 }
@@ -1851,6 +1859,7 @@ function parseOfficialTrifectaPayout(html, expectedResult = "") {
     }
 
     let payoutPer100 = null;
+    // まず通貨記号・円表記を優先する。
     for (const cell of cells) {
       const amount = parseOfficialPayoutAmount(cell);
       if (amount != null) {
@@ -1859,6 +1868,25 @@ function parseOfficialTrifectaPayout(html, expectedResult = "") {
       }
     }
     if (payoutPer100 == null) payoutPer100 = parseOfficialPayoutAmount(joined);
+
+    // BOATRACE公式は払戻セルが「8,220」のように金額だけの場合がある。
+    // 組合せセルより後ろだけを走査し、人気順位ではなく3桁以上の金額を採用する。
+    if (payoutPer100 == null) {
+      let comboIndex = cells.findIndex((cell) => /([1-6])\s*-\s*([1-6])\s*-\s*([1-6])/.test(cell));
+      if (comboIndex < 0 && expectedParts.length === 3) {
+        const [a, b, c] = expectedParts;
+        const expectedRe = new RegExp(`${a}\\D{0,20}${b}\\D{0,20}${c}`);
+        comboIndex = cells.findIndex((cell) => expectedRe.test(cell));
+      }
+      const payoutCells = comboIndex >= 0 ? cells.slice(comboIndex + 1) : cells;
+      for (const cell of payoutCells) {
+        const amount = parseOfficialPayoutAmount(cell, { allowBare: true });
+        if (amount != null) {
+          payoutPer100 = amount;
+          break;
+        }
+      }
+    }
     pushCandidate(result, payoutPer100);
   }
 
@@ -1879,7 +1907,7 @@ function parseOfficialTrifectaPayout(html, expectedResult = "") {
       const combo = block.match(/([1-6])\s*-\s*([1-6])\s*-\s*([1-6])/);
       if (combo) result = `${combo[1]}-${combo[2]}-${combo[3]}`;
     }
-    pushCandidate(result, parseOfficialPayoutAmount(block));
+    pushCandidate(result, parseOfficialPayoutAmount(block) || parseOfficialPayoutAmount(block, { allowBare: true }));
   }
 
   const exact = expected ? candidates.find((x) => x.result === expected) : null;
