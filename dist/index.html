@@ -5,42 +5,257 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>舟券アカデミア評価ツール</title>
     <script src="/api/runtime-config.js"></script>
-    <script type="module" src="/cloud-bootstrap-v3.js?v=20260712-2"></script>
+    <script type="module" src="/cloud-bootstrap-v3.js?v=20260725-ui3item2"></script>
   </head>
   <body>
     <div id="root"></div>
+
     <script>
-new MutationObserver(() => {
-  document.querySelectorAll("div").forEach((h) => {
-    if (
-      h.children.length ||
-      !String(h.textContent || "").trim().startsWith("AI予想の収支（")
-    ) return;
+      (() => {
+        function removeDuplicateAiLedgerRows() {
+          const headings = [...document.querySelectorAll("div")].filter((el) => {
+            const text = String(el.textContent || "").trim();
+            return el.children.length === 0 && text.startsWith("AI予想の収支（");
+          });
 
-    const grid = [...h.parentElement.children].find((e) =>
-      e.children.length > 1 &&
-      [...e.children].every((r) => r.children.length >= 3)
-    );
+          for (const heading of headings) {
+            const card = heading.parentElement;
+            if (!card) continue;
 
-    if (!grid) return;
+            const grid = [...card.children].find((el) => {
+              if (!(el instanceof HTMLElement)) return false;
+              const rows = [...el.children];
+              return rows.length >= 2 && rows.every((row) => row.children.length >= 3);
+            });
 
-    const seen = new Set();
+            if (!grid) continue;
 
-    [...grid.children].forEach((row) => {
-      const name = String(
-        row.firstElementChild?.textContent || ""
-      ).trim();
+            const seen = new Set();
+            for (const row of [...grid.children]) {
+              const label = String(row.firstElementChild?.textContent || "").trim();
+              if (!label) continue;
+              if (seen.has(label)) row.remove();
+              else seen.add(label);
+            }
+          }
+        }
 
-      if (!name) return;
+        const FIXED_ORDER_KEY = "hunaken_breakdown_fixed_order_v1";
+        let fixedOrder = false;
+        try { fixedOrder = localStorage.getItem(FIXED_ORDER_KEY) === "1"; } catch (_) {}
 
-      if (seen.has(name)) row.remove();
-      else seen.add(name);
-    });
-  });
-}).observe(document.getElementById("root"), {
-  childList: true,
-  subtree: true
-});
-</script>
+        const textOf = (el) => String(el?.textContent || "").replace(/\s+/g, " ").trim();
+        const isLeaf = (el) => el instanceof HTMLElement && el.children.length === 0;
+        const leafElements = (root) => [...root.querySelectorAll("span,div,label")].filter(isLeaf);
+
+        function findAiSection() {
+          const heading = [...document.querySelectorAll("span,div")].find((el) =>
+            isLeaf(el) && textOf(el).startsWith("総合AI評価（")
+          );
+          return heading?.parentElement?.parentElement || null;
+        }
+
+        function findRankCards(section) {
+          const cards = new Set();
+          const ranks = leafElements(section).filter((el) => /^[1-6]\.$/.test(textOf(el)));
+          for (const rank of ranks) {
+            let p = rank.parentElement;
+            while (p && p !== section) {
+              const t = textOf(p);
+              if (t.includes("合計点") && t.includes("評価の内訳")) {
+                cards.add(p);
+                break;
+              }
+              p = p.parentElement;
+            }
+          }
+          return [...cards];
+        }
+
+        function ensureFixedOrderCheckbox(section) {
+          const heading = leafElements(section).find((el) => textOf(el).startsWith("総合AI評価（"));
+          const headerRow = heading?.parentElement;
+          if (!headerRow) return;
+
+          let label = headerRow.querySelector('[data-hunaken-fixed-order="1"]');
+          if (!label) {
+            label = document.createElement("label");
+            label.dataset.hunakenFixedOrder = "1";
+            label.style.cssText = [
+              "display:inline-flex", "align-items:center", "gap:5px", "margin-left:auto",
+              "font-size:10px", "font-weight:800", "border-radius:999px", "padding:4px 9px",
+              "cursor:pointer", "user-select:none"
+            ].join(";");
+            const input = document.createElement("input");
+            input.type = "checkbox";
+            input.style.cssText = "width:13px;height:13px;margin:0;accent-color:#5dd39e";
+            const span = document.createElement("span");
+            span.textContent = "項目順を一律にする";
+            input.addEventListener("change", () => {
+              fixedOrder = input.checked;
+              try { localStorage.setItem(FIXED_ORDER_KEY, fixedOrder ? "1" : "0"); } catch (_) {}
+              applyThreeItemPatch();
+            });
+            label.append(input, span);
+            headerRow.appendChild(label);
+          }
+
+          const input = label.querySelector("input");
+          if (input) input.checked = fixedOrder;
+          label.style.color = fixedOrder ? "#5dd39e" : "#9db5cc";
+          label.style.background = fixedOrder ? "rgba(46,158,107,0.18)" : "#102238";
+          label.style.border = `1px solid ${fixedOrder ? "rgba(93,211,158,0.45)" : "#284766"}`;
+        }
+
+        function patchCriterionChips(card) {
+          const labels = ["枠別成績", "展示タイム", "モーター"];
+          let good = 0;
+          const leaves = leafElements(card);
+
+          for (const label of labels) {
+            const chip = leaves.find((el) => {
+              const t = textOf(el);
+              return t.endsWith(label) && /^[✓✗×−-]/.test(t);
+            });
+            if (chip && textOf(chip).startsWith("✓")) good += 1;
+          }
+
+          const windChip = leaves.find((el) => {
+            const t = textOf(el);
+            return t.endsWith("風") && /^[✓✗×−-]/.test(t);
+          });
+          if (windChip) windChip.style.display = "none";
+
+          const mark = good === 3 ? "◎" : good === 2 ? "○" : good === 1 ? "△" : "✕";
+          const rankEl = leaves.find((el) => /^[1-6]\.$/.test(textOf(el)));
+          const header = rankEl?.parentElement || card;
+          const markEl = [...header.querySelectorAll("span,div")].find((el) =>
+            isLeaf(el) && ["◎", "○", "△", "×", "✕"].includes(textOf(el))
+          );
+          if (markEl && textOf(markEl) !== mark) markEl.textContent = mark;
+          if (markEl) {
+            markEl.style.color = mark === "◎" ? "#f9c513"
+              : mark === "○" ? "#5dd39e"
+              : mark === "△" ? "#e8eef5" : "#7a8da0";
+          }
+
+          const goodsEl = leaves.find((el) => /^良\s*\d+\s*\/\s*[34]/.test(textOf(el)));
+          if (goodsEl) {
+            const old = textOf(goodsEl);
+            const suffixIndex = old.indexOf("｜");
+            const suffix = suffixIndex >= 0 ? ` ${old.slice(suffixIndex)}` : "";
+            const next = `良 ${good}/3${suffix}`;
+            if (old !== next) goodsEl.textContent = next;
+          }
+
+          const rankPos = Number(String(textOf(rankEl)).replace(".", ""));
+          const targetBorder = mark === "◎" ? "1px solid #f9c513"
+            : rankPos === 1 ? "1px solid #3d7ab8" : "1px solid transparent";
+          if (card.style.border !== targetBorder) card.style.border = targetBorder;
+        }
+
+        function patchBreakdownOrder(card) {
+          const heading = leafElements(card).find((el) => textOf(el).startsWith("評価の内訳（"));
+          const box = heading?.parentElement;
+          if (!box) return;
+
+          const aliases = {
+            "成績": "枠別成績",
+            "枠別成績": "枠別成績",
+            "展示": "展示タイム",
+            "展示タイム": "展示タイム",
+            "モーター": "モーター",
+            "風": "風",
+            "ST": "ST",
+            "枠基準": "枠基準",
+          };
+          const desired = ["枠別成績", "展示タイム", "モーター", "風", "ST", "枠基準"];
+          const rows = [];
+
+          for (const el of leafElements(box)) {
+            const normalized = aliases[textOf(el)];
+            if (!normalized) continue;
+            const row = el.parentElement;
+            if (!row || row.parentElement !== box) continue;
+            if (normalized !== textOf(el)) el.textContent = normalized;
+            rows.push({ row, normalized });
+          }
+
+          if (fixedOrder) {
+            box.style.display = "flex";
+            box.style.flexDirection = "column";
+            if (heading) heading.style.order = "0";
+            for (const { row, normalized } of rows) {
+              row.style.order = String(10 + desired.indexOf(normalized));
+            }
+            [...box.children].forEach((child) => {
+              if (child === heading || rows.some((x) => x.row === child)) return;
+              child.style.order = "99";
+            });
+          } else {
+            box.style.display = "";
+            box.style.flexDirection = "";
+            [...box.children].forEach((child) => { child.style.order = ""; });
+          }
+        }
+
+        function patchExplanation(section) {
+          const walker = document.createTreeWalker(section, NodeFilter.SHOW_TEXT);
+          let node;
+          while ((node = walker.nextNode())) {
+            const before = String(node.nodeValue || "");
+            if (!before.includes("判定:") || !before.includes("4項目")) continue;
+            const after = before.replace(
+              /判定:\s*枠別成績・展示タイム・モーター・風\s*の4項目中、?\s*良が3つ以上＝◎\s*／?\s*2つ＝○\s*／?\s*1つ＝△\s*／?\s*0＝[×✕]。?/,
+              "判定: 枠別成績・展示タイム・モーターの3項目で、3項目＝◎／2項目＝○／1項目＝△／0項目＝✕。風は印判定から除外し、合計点・総合順位にのみ反映します。"
+            );
+            if (after !== before) node.nodeValue = after;
+          }
+        }
+
+        let applying = false;
+        function applyThreeItemPatch() {
+          if (applying) return;
+          applying = true;
+          try {
+            removeDuplicateAiLedgerRows();
+            const section = findAiSection();
+            if (!section) return;
+            ensureFixedOrderCheckbox(section);
+            for (const card of findRankCards(section)) {
+              patchCriterionChips(card);
+              patchBreakdownOrder(card);
+            }
+            patchExplanation(section);
+          } finally {
+            applying = false;
+          }
+        }
+
+        let scheduled = false;
+        const runSoon = () => {
+          if (scheduled) return;
+          scheduled = true;
+          requestAnimationFrame(() => {
+            scheduled = false;
+            applyThreeItemPatch();
+          });
+        };
+
+        const start = () => {
+          runSoon();
+          const root = document.getElementById("root");
+          if (root) {
+            new MutationObserver(runSoon).observe(root, { childList: true, subtree: true, characterData: true });
+          }
+        };
+
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", start, { once: true });
+        } else {
+          start();
+        }
+      })();
+    </script>
   </body>
 </html>
