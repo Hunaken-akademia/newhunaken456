@@ -4484,10 +4484,16 @@ export default function App() {
   useEffect(() => {
     const pendingKeys = new Map();
     for (const b of betRecordsRef.current || []) {
-      if (!b?.result && b?.date && b?.venue && b?.venue !== "—" && b?.race) pendingKeys.set(`${b.date}_${b.venue}_${b.race}`, b);
+      const needsSettlement = !b?.result || (b?.autoSettled && b?.settlementSource !== "official_result_payout");
+      if (needsSettlement && b?.date && b?.venue && b?.venue !== "—" && b?.race) {
+        pendingKeys.set(`${b.date}_${b.venue}_${b.race}`, b);
+      }
     }
     for (const r of recordsRef.current || []) {
-      if (!r?.result && r?.date && r?.venue && r?.race) pendingKeys.set(`${r.date}_${r.venue}_${r.race}`, r);
+      const needsSettlement = !r?.result || (r?.autoSettled && r?.settlementSource !== "official_result_payout");
+      if (needsSettlement && r?.date && r?.venue && r?.race) {
+        pendingKeys.set(`${r.date}_${r.venue}_${r.race}`, r);
+      }
     }
     if (!pendingKeys.size) return;
     let cancelled = false;
@@ -4505,7 +4511,14 @@ export default function App() {
           const trio = data.result;
           await persistRecords((prev) => prev.map((r) =>
             r.date === rec.date && r.venue === rec.venue && String(r.race) === String(rec.race)
-              ? { ...r, result: trio, payoutOdds: payoutPer100 || null, autoSettled: true }
+              ? {
+                  ...r,
+                  result: trio,
+                  payoutOdds: payoutPer100 || null,
+                  autoSettled: true,
+                  settlementSource: data.oddsSource || "",
+                  settlementUpdatedAt: Date.now(),
+                }
               : r
           ));
           await persistBets((prev) => prev.map((b) => {
@@ -4513,7 +4526,16 @@ export default function App() {
             const hit = Array.isArray(b.tickets) && b.tickets.includes(trio);
             const hitAmt = hit ? (b.perTicket ? Number(b.perTicket[trio] || 0) : Number(b.amountPerPoint || 0)) : 0;
             const payout = hit && payoutPer100 > 0 ? Math.round((hitAmt / 100) * payoutPer100) : 0;
-            return { ...b, result: trio, hit, payoutOdds: payoutPer100 || null, payout, autoSettled: true };
+            return {
+              ...b,
+              result: trio,
+              hit,
+              payoutOdds: payoutPer100 || null,
+              payout,
+              autoSettled: true,
+              settlementSource: data.oddsSource || "",
+              settlementUpdatedAt: Date.now(),
+            };
           }));
         } catch (e) { /* 次回再試行 */ }
       }

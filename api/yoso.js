@@ -365,22 +365,38 @@ async function readRaceSettlement({ venue, raceNo, ymd }) {
   if (finish.length < 3) return { completed: false, result: null, payoutOdds: null, payoutPer100: null };
   const result = finish.slice(0, 3).map((r) => Number(r.boat)).join("-");
   const review = Array.isArray(reviewRows) ? reviewRows[0] : null;
+
+  // 精算は、表示オッズの掛け算ではなく公式結果ページの「3連単払戻金」を最優先する。
+  // これにより高配当の端数（例: 168,620円）や、締切前オッズとの差をそのまま反映できる。
+  const officialPayout = await fetchOfficialTrifectaPayout({ venue, raceNo: race, ymd, expectedResult: result });
+  if (officialPayout?.payoutPer100 > 0) {
+    return {
+      completed: true,
+      settlementReady: true,
+      result,
+      payoutOdds: officialPayout.payoutPer100 / 100,
+      payoutPer100: officialPayout.payoutPer100,
+      oddsSource: officialPayout.source,
+      payoutUrl: officialPayout.url,
+      finalized: true,
+      finalizedAt: review?.finalized_at || review?.updated_at || "",
+    };
+  }
+
+  // 公式払戻欄が一時的に取れない場合だけ、確定オッズをフォールバックとして使う。
   const storedOdds = review?.odds || review?.snapshot?.odds || {};
   let decimalOdds = Number(storedOdds?.[result]);
-  let oddsSource = decimalOdds > 0 ? "saved_snapshot" : "";
-
-  // 過去日の舟券記録は、復習スナップショットにオッズが無くても
-  // 公式の確定オッズを直接取り直して精算できるようにする。
+  let oddsSource = decimalOdds > 0 ? "saved_snapshot_fallback" : "";
   if (!(Number.isFinite(decimalOdds) && decimalOdds > 0)) {
     try {
       const fetched = await fetchOddsForVenue(venue, race, ymd);
       const fetchedOdds = Number(fetched?.odds?.[result]);
       if (fetched?.ok && Number.isFinite(fetchedOdds) && fetchedOdds > 0) {
         decimalOdds = fetchedOdds;
-        oddsSource = "official_fixed_odds";
+        oddsSource = "official_fixed_odds_fallback";
       }
     } catch (e) {
-      // 結果だけ取得済み・オッズ未取得なら、次回の自動精算で再試行する。
+      // 結果だけ取得済み・払戻未取得なら、次回の自動精算で再試行する。
     }
   }
 
@@ -433,6 +449,18 @@ async function buildVenueAiLedger({ venue, ymd, honmeiPoints = 6, taikouPoints =
     if (!resultByRace.has(race)) resultByRace.set(race, []);
     resultByRace.get(race).push(row);
   }
+  const payoutByRace = new Map();
+  await Promise.all((reviewItems || []).map(async (item) => {
+    const race = Number(item.race);
+    const finish = (resultByRace.get(race) || [])
+      .filter((r) => Number(r.rank) >= 1 && Number(r.rank) <= 3 && Number(r.boat) >= 1 && Number(r.boat) <= 6)
+      .sort((a, b) => Number(a.rank) - Number(b.rank));
+    if (finish.length < 3) return;
+    const expectedResult = finish.slice(0, 3).map((r) => Number(r.boat)).join("-");
+    const payout = await fetchOfficialTrifectaPayout({ venue, raceNo: race, ymd, expectedResult });
+    if (payout?.payoutPer100 > 0) payoutByRace.set(race, payout);
+  }));
+
   const stats = Object.fromEntries(VENUE_LEDGER_PATTERNS.map((p) => [p.key, { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 }]));
   const details = [];
   const missingPredictions = [];
@@ -447,9 +475,17 @@ async function buildVenueAiLedger({ venue, ymd, honmeiPoints = 6, taikouPoints =
     const result = finish.slice(0, 3).map((r) => Number(r.boat)).join("-");
     const oddsMap = item?.snapshot?.odds || {};
     const decimalOdds = Number(oddsMap?.[result]);
+    const officialPayout = payoutByRace.get(race);
+    const payoutPer100 = Number(officialPayout?.payoutPer100);
     if (!pred?.bets || !Array.isArray(pred.bets)) {
       missingPredictions.push(race);
-      details.push({ race, result, predictionSaved: false, odds: Number.isFinite(decimalOdds) ? decimalOdds : null });
+      details.push({
+        race,
+        result,
+        predictionSaved: false,
+        odds: Number.isFinite(decimalOdds) ? decimalOdds : null,
+        payoutPer100: Number.isFinite(payoutPer100) ? payoutPer100 : null,
+      });
       continue;
     }
     for (const pattern of VENUE_LEDGER_PATTERNS) {
@@ -466,10 +502,21 @@ async function buildVenueAiLedger({ venue, ymd, honmeiPoints = 6, taikouPoints =
       s.spent += tickets.size * 100;
       if (tickets.has(result)) {
         s.hit += 1;
-        if (Number.isFinite(decimalOdds) && decimalOdds > 0) s.ret += Math.round(decimalOdds * 100);
+        if (Number.isFinite(payoutPer100) && payoutPer100 > 0) {
+          s.ret += payoutPer100;
+        } else if (Number.isFinite(decimalOdds) && decimalOdds > 0) {
+          s.ret += Math.round(decimalOdds * 100);
+        }
       }
     }
-    details.push({ race, result, predictionSaved: true, odds: Number.isFinite(decimalOdds) ? decimalOdds : null });
+    details.push({
+      race,
+      result,
+      predictionSaved: true,
+      odds: Number.isFinite(decimalOdds) ? decimalOdds : null,
+      payoutPer100: Number.isFinite(payoutPer100) ? payoutPer100 : null,
+      payoutSource: officialPayout?.source || (Number.isFinite(decimalOdds) ? "odds_fallback" : ""),
+    });
   }
 
   return {
@@ -1759,6 +1806,57 @@ function parseKimariteFromResultHtml(html) {
   const text = pickText(html);
   const m = text.match(/決まり手\s*[:：]?\s*(まくり差し|逃げ|差し|まくり|抜き|恵まれ)/);
   return m ? m[1] : "";
+}
+
+function parseOfficialTrifectaPayout(html, expectedResult = "") {
+  const dash = "[-‐‑‒–—―ー−]";
+  const expected = String(expectedResult || "").replace(/[^1-6-]/g, "");
+  const lines = textLinesFromHtml(html).map(normalizeResultToken).filter(Boolean);
+  const candidates = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (!/(?:3連単|3連勝単式)/.test(lines[i])) continue;
+    const block = lines.slice(i, Math.min(lines.length, i + 14)).join(" ");
+    let combo = null;
+
+    if (expected) {
+      const [a, b, c] = expected.split("-");
+      if (a && b && c) {
+        const expectedRe = new RegExp(`${a}\D{0,8}${b}\D{0,8}${c}`);
+        const hit = block.match(expectedRe);
+        if (hit) combo = { 0: hit[0], 1: a, 2: b, 3: c, index: hit.index || 0 };
+      }
+    }
+
+    if (!combo) {
+      const comboRe = new RegExp(`([1-6])\s*${dash}\s*([1-6])\s*${dash}\s*([1-6])`);
+      combo = block.match(comboRe);
+    }
+    if (!combo) continue;
+
+    const result = `${combo[1]}-${combo[2]}-${combo[3]}`;
+    const afterCombo = block.slice((combo.index || 0) + combo[0].length);
+    const yen = afterCombo.match(/([0-9][0-9,]*)\s*円/);
+    if (!yen) continue;
+    const payoutPer100 = Number(String(yen[1]).replace(/,/g, ""));
+    if (!Number.isFinite(payoutPer100) || payoutPer100 <= 0) continue;
+    candidates.push({ result, payoutPer100 });
+  }
+
+  const exact = expected ? candidates.find((x) => x.result === expected) : null;
+  return exact || candidates[0] || null;
+}
+
+async function fetchOfficialTrifectaPayout({ venue, raceNo, ymd, expectedResult = "" }) {
+  const url = buildOfficialResultUrl(venue, raceNo, yyyymmdd(ymd));
+  if (!url) return null;
+  try {
+    const html = await fetchHtml(url, { referer: "https://www.boatrace.jp/", timeoutMs: 12000 });
+    const parsed = parseOfficialTrifectaPayout(html, expectedResult);
+    return parsed ? { ...parsed, url, source: "official_result_payout" } : null;
+  } catch (e) {
+    return null;
+  }
 }
 
 function buildRaceResultRows({ venue, raceNo, ymd, resultHtml, racers, sttRaw = "", resultRaw = "" }) {
