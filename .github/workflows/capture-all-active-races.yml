@@ -25,5 +25,5 @@ jobs:
         env:
           APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
           CAPTURE_TOKEN: ${{ secrets.CAPTURE_TOKEN }}
-          CAPTURE_CONCURRENCY: "3"
+          CAPTURE_CONCURRENCY: "5"
         run: node pipeline/capture_all_active_races.mjs
