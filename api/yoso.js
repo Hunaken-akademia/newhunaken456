@@ -1,18 +1,18 @@
-const STATIC_CACHE_MS = 45 * 1000;
+const STATIC_CACHE_MS = 3 * 60 * 1000;
 const SCHEDULE_CACHE_MS = 3 * 60 * 1000;
 const ODDS_CACHE_MS = 60 * 1000;
 const STALE_CACHE_MS = 30 * 60 * 1000;
-// 復習用：発売終了後もJST翌日08:00まで共有キャッシュを返す。
-// 08:00以降は当日開催へ切り替える。
-const REVIEW_CACHE_STALE_MS = 17 * 60 * 60 * 1000;
+// 復習用：発売終了後も翌朝の朝一レース前まで共有キャッシュを返す。
+// 正確な翌朝1R時刻が取れない場合に備え、JST翌日09:00まで保持する。
+const REVIEW_CACHE_STALE_MS = 18 * 60 * 60 * 1000;
 const CACHE_MS = STATIC_CACHE_MS;
 
 // Vercelの同一実行環境内で共有するキャッシュ。
 // 同じ場・日付・RはTTL内ならBOATCASTへ再アクセスせず、取得中は他ユーザーへ古いキャッシュを返す。
-const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V127__ || new Map();
-globalThis.__HUNAKEN_YOSO_CACHE_V127__ = cacheStore;
-const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V127__ || new Map();
-globalThis.__HUNAKEN_YOSO_INFLIGHT_V127__ = inFlightStore;
+const cacheStore = globalThis.__HUNAKEN_YOSO_CACHE_V115__ || new Map();
+globalThis.__HUNAKEN_YOSO_CACHE_V115__ = cacheStore;
+const inFlightStore = globalThis.__HUNAKEN_YOSO_INFLIGHT_V115__ || new Map();
+globalThis.__HUNAKEN_YOSO_INFLIGHT_V115__ = inFlightStore;
 
 const SUPABASE_REST_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -41,10 +41,11 @@ function ymdToDate(ymd) {
 function nextMorningReviewExpiryIso(ymd) {
   const raceDate = ymdToDate(ymd);
   if (!raceDate) return new Date(Date.now() + REVIEW_CACHE_STALE_MS).toISOString();
-  // JST翌日08:00 = レース日当日のUTC 23:00
+  // JST翌日09:00 = UTC同日24:00相当ではなく、Date.UTCでJSTを補正
   const [y, m, d] = raceDate.split('-').map(Number);
-  const utc = Date.UTC(y, m - 1, d, 23, 0, 0);
-  return new Date(utc).toISOString();
+  const utc = Date.UTC(y, m - 1, d + 1, 0, 0, 0); // JST翌日09:00
+  const t = Math.max(utc, Date.now() + STALE_CACHE_MS);
+  return new Date(t).toISOString();
 }
 
 function persistentStaleExpiryForKey(key, ttlMs, staleMs) {
@@ -181,6 +182,92 @@ async function saveExhibitionRows({ venue, raceNo, ymd, rows, source = "BOATCAST
   }
 }
 
+
+async function saveReviewSnapshot(payload, { finalized = false } = {}) {
+  if (!ENABLE_PERSISTENT_CACHE || !payload?.ok || !payload?.venue || !payload?.race || !payload?.date) {
+    return { ok: false, skipped: true, reason: "保存対象なし" };
+  }
+  try {
+    const raceDate = ymdToDate(yyyymmdd(payload.date));
+    const placeNo = JCD[payload.venue] ? Number(JCD[payload.venue]) : null;
+    if (!raceDate || !placeNo) return { ok: false, skipped: true, reason: "場・日付不正" };
+    const nowIso = new Date().toISOString();
+    const body = [{
+      race_date: raceDate,
+      place_no: placeNo,
+      race_no: Number(payload.race),
+      venue: payload.venue,
+      snapshot: payload,
+      odds: payload.odds && Object.keys(payload.odds).length >= 10 ? payload.odds : null,
+      odds_count: Number(payload.oddsCount || Object.keys(payload.odds || {}).length || 0),
+      is_final: !!finalized,
+      captured_at: nowIso,
+      finalized_at: finalized ? nowIso : null,
+      updated_at: nowIso,
+    }];
+    await supabaseCacheRequest("race_review_snapshots?on_conflict=race_date,place_no,race_no", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(body),
+    });
+    return { ok: true, finalized: !!finalized };
+  } catch (e) {
+    console.warn("review snapshot write skipped:", e?.message || e);
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+async function readReviewSnapshot({ venue, raceNo, ymd }) {
+  if (!ENABLE_PERSISTENT_CACHE || !venue || !JCD[venue]) return null;
+  try {
+    const raceDate = ymdToDate(yyyymmdd(ymd));
+    const placeNo = Number(JCD[venue]);
+    const rows = await supabaseCacheRequest(
+      `race_review_snapshots?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&race_no=eq.${Number(raceNo)}&select=snapshot,odds,odds_count,is_final,captured_at,finalized_at,updated_at&limit=1`
+    );
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row?.snapshot) return null;
+    return {
+      ...row.snapshot,
+      odds: row.odds || row.snapshot.odds || null,
+      oddsCount: Number(row.odds_count || Object.keys(row.odds || row.snapshot.odds || {}).length || 0),
+      reviewSnapshot: true,
+      reviewFinalized: !!row.is_final,
+      reviewCapturedAt: row.finalized_at || row.captured_at || row.updated_at || "",
+      cached: true,
+      stale: false,
+      cacheStatus: row.is_final ? "review-final" : "review-snapshot",
+      servedAt: new Date().toISOString(),
+    };
+  } catch (e) {
+    console.warn("review snapshot read skipped:", e?.message || e);
+    return null;
+  }
+}
+
+async function isRequestedRaceClosed(venue, raceNo, ymd) {
+  const now = jstNowParts();
+  const target = yyyymmdd(ymd);
+  if (target < now.ymd) return true;
+  if (target > now.ymd) return false;
+  try {
+    const schedulePayload = await fetchSchedulePayload(venue, target);
+    const hit = (schedulePayload.schedule || []).find((r) => Number(r.race) === Number(raceNo));
+    if (!hit) return false;
+    return Number(hit.deadlineMinutes) <= now.minutes;
+  } catch (e) {
+    return false;
+  }
+}
+
+function captureAuthorized(req) {
+  const expected = String(process.env.CAPTURE_TOKEN || "");
+  if (!expected) return true;
+  const raw = req.headers?.["x-capture-token"];
+  const received = Array.isArray(raw) ? String(raw[0] || "") : String(raw || "");
+  return received === expected;
+}
+
 async function savePreRaceStatus({ venue, raceNo, ymd, racers, source = "BOATCAST" }) {
   if (!ENABLE_PERSISTENT_CACHE) return { ok: false, skipped: true, reason: "SUPABASE_SERVICE_KEYなし" };
   const rows = preRaceRowsFromRacers({ venue, raceNo, ymd, racers, source });
@@ -207,7 +294,7 @@ async function fetchBoatcastPreRaceStatusPayload(venue, raceNo, ymd) {
   return {
     ok: true,
     action: "prerace",
-    appVersion: "v127",
+    appVersion: "v115",
     venue,
     race: Number(raceNo),
     date: ymd,
@@ -2004,7 +2091,7 @@ function parseBoatcastDisplay(raw) {
 
   const setRow = (boat, picked) => {
     boat = Number(boat);
-    if (!Number.isInteger(boat) || boat < 1 || boat > 6 || !picked || rowsByBoat.has(boat)) return;
+    if (!boat || boat < 1 || boat > 6 || !picked || rowsByBoat.has(boat)) return;
     if (!picked.tenji || !picked.isshu || !picked.mawari) return;
     rowsByBoat.set(boat, { boat, course: boat, ...picked });
   };
@@ -2236,19 +2323,9 @@ async function fetchBoatcastPayload(venue, raceNo, dateStr) {
         const officialRows = parseDisplayRowsByLines(officialHtml, venue);
         if (validRows(officialRows)) {
           const sttRows = parseBoatcastSttRows(stt);
-          const tkzRows = parseBoatcastTkzRows(tkz);
           rows = sanitizeDisplayRows(officialRows.map((r) => {
-            const boat = Number(r.boat);
-            const st = sttRows.find((x) => Number(x.boat) === boat);
-            const tk = tkzRows.find((x) => Number(x.boat) === boat);
-            return {
-              ...r,
-              course: st?.course || r.course || boat,
-              tenji: tk?.tenji || r.tenji,
-              weight: tk?.weight || r.weight || "",
-              adjust_weight: tk?.adjust_weight || r.adjust_weight || "",
-              tilt: tk?.tilt || r.tilt || "",
-            };
+            const st = sttRows.find((x) => Number(x.boat) === Number(r.boat));
+            return st ? { ...r, course: st.course || r.course || r.boat } : r;
           }));
         } else {
           rowErrors.push(`official-beforeinfo: ${officialRows?.length || 0}艇`);
@@ -2928,7 +3005,7 @@ async function fetchSchedulePayload(venue, ymd) {
     return {
       ok: true,
       action: "schedule",
-      appVersion: "v127",
+      appVersion: "v115",
       venue,
       date: ymd,
       url,
@@ -3027,25 +3104,7 @@ async function fetchHtml(url, options = {}) {
 }
 
 function validRows(rows) {
-  if (!Array.isArray(rows) || rows.length !== 6) return false;
-
-  const boats = rows.map((r) => Number(r?.boat));
-  if (
-    !boats.every((b) => Number.isInteger(b) && b >= 1 && b <= 6) ||
-    new Set(boats).size !== 6 ||
-    ![1, 2, 3, 4, 5, 6].every((b) => boats.includes(b))
-  ) {
-    return false;
-  }
-
-  return rows.every((r) => {
-    const lapOk = inRange(r.isshu, 30, 45) || inRange(r.isshu, 15, 25);
-    return (
-      inRange(r.tenji, 5.5, 7.8) &&
-      lapOk &&
-      inRange(r.mawari, 4, 15)
-    );
-  });
+  return Array.isArray(rows) && rows.length >= 6 && rows.every((r) => r.boat && r.tenji && r.isshu && r.mawari);
 }
 
 function pruneCache() {
@@ -3074,7 +3133,7 @@ async function buildFullYosoPayload(venue, raceNo, ymd) {
       });
       return {
         ok: true,
-        appVersion: "v127",
+        appVersion: "v115",
         venue,
         race: raceNo,
         date: ymd,
@@ -3178,7 +3237,7 @@ export default async function handler(req, res) {
     const ymd = yyyymmdd(date);
 
     if (action === "schedule") {
-      res.setHeader("Cache-Control", "public, s-maxage=30, stale-while-revalidate=30");
+      res.setHeader("Cache-Control", "public, s-maxage=180, stale-while-revalidate=600");
       if (!venue) {
         res.status(400).json({ ok: false, error: "venue を指定してください" });
         return;
@@ -3208,7 +3267,7 @@ export default async function handler(req, res) {
       res.status(200).json({
         ok: true,
         action: "schedules",
-        appVersion: "v127",
+        appVersion: "v115",
         date: ymd,
         statusesByVenue,
         fetchedAt: new Date().toISOString(),
@@ -3274,7 +3333,7 @@ export default async function handler(req, res) {
         res.status(400).json({ ok: false, error: "venue を指定してください" });
         return;
       }
-      const oddsKey = `odds:v127:${venue}:${raceNo}:${ymd}`;
+      const oddsKey = `odds:v115:${venue}:${raceNo}:${ymd}`;
       pruneCache();
       const payload = await withSharedCache(oddsKey, ODDS_CACHE_MS, async () => {
         const oddsInfo = await fetchOddsForVenue(venue, raceNo, ymd);
@@ -3282,7 +3341,7 @@ export default async function handler(req, res) {
         return {
           ok: true,
           action: "odds",
-          appVersion: "v127",
+          appVersion: "v115",
           venue,
           race: raceNo,
           date: ymd,
@@ -3296,10 +3355,41 @@ export default async function handler(req, res) {
       return;
     }
 
+    if (action === "capture") {
+      res.setHeader("Cache-Control", "no-store");
+      if (!captureAuthorized(req)) {
+        res.status(401).json({ ok: false, error: "Unauthorized capture request" });
+        return;
+      }
+      if (!venue || !JCD[venue]) {
+        res.status(400).json({ ok: false, error: "取得対象のvenueを指定してください" });
+        return;
+      }
+      const finalized = String(req.query?.final || "") === "1" || String(req.query?.final || "").toLowerCase() === "true";
+      const live = await buildFullYosoPayload(venue, raceNo, ymd);
+      const reviewSaved = await saveReviewSnapshot(live, { finalized });
+      res.status(200).json({ ...live, action: "capture", reviewSaved, finalized });
+      return;
+    }
+
+    const closed = await isRequestedRaceClosed(venue, raceNo, ymd);
+    if (closed) {
+      const saved = await readReviewSnapshot({ venue, raceNo, ymd });
+      if (saved) {
+        res.setHeader("Cache-Control", "private, no-store");
+        res.status(200).json(saved);
+        return;
+      }
+    }
+
     res.setHeader("Cache-Control", "public, s-maxage=180, stale-while-revalidate=600");
-    const key = `full:v127:${venue}:${raceNo}:${ymd}`;
+    const key = `full:v115:${venue}:${raceNo}:${ymd}`;
     pruneCache();
-    const payload = await withSharedCache(key, STATIC_CACHE_MS, async () => buildFullYosoPayload(venue, raceNo, ymd), { allowStale: false });
+    const payload = await withSharedCache(key, STATIC_CACHE_MS, async () => {
+      const live = await buildFullYosoPayload(venue, raceNo, ymd);
+      await saveReviewSnapshot(live, { finalized: false });
+      return live;
+    }, { allowStale: false });
     res.status(200).json(payload);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message || String(e) });

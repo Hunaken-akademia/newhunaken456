@@ -1,0 +1,63 @@
+const VENUES = [
+  "桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江",
+  "尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"
+];
+
+const BASE = String(process.env.APP_BASE_URL || "https://newhunaken456.vercel.app").replace(/\/$/, "");
+const TOKEN = String(process.env.CAPTURE_TOKEN || "");
+const CONCURRENCY = Math.max(1, Math.min(5, Number(process.env.CAPTURE_CONCURRENCY || 3)));
+
+function jstNow() {
+  const p = new Intl.DateTimeFormat("ja-JP", { timeZone:"Asia/Tokyo", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hour12:false })
+    .formatToParts(new Date()).reduce((a,x)=>{ if(x.type!=="literal") a[x.type]=x.value; return a; },{});
+  const h = Number(p.hour === "24" ? "0" : p.hour);
+  return { date:`${p.year}-${p.month}-${p.day}`, ymd:`${p.year}${p.month}${p.day}`, minutes:h*60+Number(p.minute||0) };
+}
+
+async function getJson(url, headers={}) {
+  const r = await fetch(url, { headers });
+  const text = await r.text();
+  let data={}; try { data=JSON.parse(text); } catch {}
+  if (!r.ok || !data.ok) throw new Error(`${r.status} ${data.error || text.slice(0,180)}`);
+  return data;
+}
+
+async function mapLimit(items, limit, fn) {
+  let i=0; const out=[];
+  async function worker(){ while(true){ const n=i++; if(n>=items.length) return; try{ out[n]=await fn(items[n]); }catch(e){ out[n]={ok:false,error:e.message||String(e)}; } } }
+  await Promise.all(Array.from({length:Math.min(limit,items.length)},worker));
+  return out;
+}
+
+const now=jstNow();
+console.log(`capture-all-active-races start ${now.date} ${now.minutes}min JST`);
+
+const schedules = await mapLimit(VENUES, CONCURRENCY, async venue => {
+  const u = `${BASE}/api/yoso?action=schedule&venue=${encodeURIComponent(venue)}&date=${now.date}`;
+  const data = await getJson(u);
+  return { venue, schedule:data.schedule||[], noRace:!!data.noRace };
+});
+
+const jobs=[];
+for (const s of schedules) {
+  if (!s?.venue || s.noRace || !Array.isArray(s.schedule)) continue;
+  for (const r of s.schedule) {
+    const left = Number(r.deadlineMinutes) - now.minutes;
+    // 展示公開前後は繰り返し取得。締切後は確定オッズを2回まで拾える幅を取る。
+    if (left <= 20 && left >= -12) jobs.push({ venue:s.venue, race:Number(r.race), left, final:left <= -1 });
+  }
+}
+
+console.log(`capture jobs=${jobs.length}`);
+const results = await mapLimit(jobs, CONCURRENCY, async j => {
+  const q = new URLSearchParams({ action:"capture", venue:j.venue, race:String(j.race), date:now.date, final:j.final?"1":"0", t:String(Date.now()) });
+  const data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
+  const rows = Array.isArray(data.rows) ? data.rows.length : 0;
+  console.log(`OK ${j.venue}${j.race}R left=${j.left} final=${j.final} rows=${rows} odds=${data.oddsCount||0}`);
+  return {ok:true,...j,rows,odds:data.oddsCount||0};
+});
+
+const ok=results.filter(x=>x?.ok).length;
+const ng=results.length-ok;
+console.log(JSON.stringify({date:now.date,jobs:jobs.length,ok,ng,errors:results.filter(x=>!x?.ok).slice(0,10)},null,2));
+if (ng) process.exitCode=1;
