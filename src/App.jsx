@@ -1559,6 +1559,8 @@ export default function App() {
   const [venueStatusLoading, setVenueStatusLoading] = useState(false);
   const [prefetchInfo, setPrefetchInfo] = useState("");
   const autoBusyRef = useRef(false);
+  const reviewDayCacheRef = useRef({});
+  const reviewDayFetchRef = useRef(new Map());
   const lastAutoFetchKeyRef = useRef("");
   const lastAutoFetchAtRef = useRef(0);
   const manualRaceSelectUntilRef = useRef(0);
@@ -2376,6 +2378,79 @@ export default function App() {
     return applyPrefetchedYosoPayload(data, v, r, d);
   };
 
+  const reviewDayStorageKey = (d) => `hunaken_review_day_v130_${d}`;
+
+  const hydrateReviewDayCache = (d) => {
+    if (!d) return {};
+    if (reviewDayCacheRef.current[d]) return reviewDayCacheRef.current[d];
+    try {
+      const raw = localStorage.getItem(reviewDayStorageKey(d));
+      const parsed = raw ? JSON.parse(raw) : null;
+      const maxAge = 36 * 60 * 60 * 1000;
+      if (parsed?.items && Date.now() - Number(parsed.savedAt || 0) <= maxAge) {
+        reviewDayCacheRef.current[d] = parsed.items;
+        return parsed.items;
+      }
+    } catch (e) {}
+    reviewDayCacheRef.current[d] = {};
+    return reviewDayCacheRef.current[d];
+  };
+
+  const saveReviewDayCache = (d, items) => {
+    reviewDayCacheRef.current[d] = items || {};
+    try {
+      localStorage.setItem(reviewDayStorageKey(d), JSON.stringify({ savedAt: Date.now(), items: items || {} }));
+    } catch (e) {}
+  };
+
+  const reviewSnapshotKey = (v, r) => `${v}_${Number(r)}`;
+
+  const getCachedReviewSnapshot = (v, r, d) => {
+    const day = hydrateReviewDayCache(d);
+    return day?.[reviewSnapshotKey(v, r)] || null;
+  };
+
+  const applyCachedReviewSnapshot = (v, r, d) => {
+    const data = getCachedReviewSnapshot(v, r, d);
+    if (!data) return false;
+    const applied = applyPrefetchedYosoPayload(data, v, r, d);
+    if (applied) {
+      setReviewMode(true);
+      setAutoLoading(false);
+      setAutoMsg(`${v}${r}Rの保存済み確定データを表示しました。`);
+      setAutoRefreshInfo("");
+    }
+    return applied;
+  };
+
+  const preloadReviewSnapshots = async (d, { force = false } = {}) => {
+    if (!d) return {};
+    const existing = hydrateReviewDayCache(d);
+    if (!force && Object.keys(existing || {}).length) return existing;
+    if (reviewDayFetchRef.current.has(d)) return reviewDayFetchRef.current.get(d);
+    const task = (async () => {
+      try {
+        const qs = new URLSearchParams({ action: "review_day", date: d, t: String(Math.floor(Date.now() / 60000)) });
+        const res = await fetch(`/api/yoso?${qs.toString()}`, { cache: "no-store" });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) throw new Error(data.error || "復習データの先読み失敗");
+        const next = { ...existing };
+        (data.items || []).forEach((item) => {
+          if (!item?.venue || !item?.race || !item?.snapshot) return;
+          next[reviewSnapshotKey(item.venue, item.race)] = item.snapshot;
+        });
+        saveReviewDayCache(d, next);
+        return next;
+      } catch (e) {
+        return existing || {};
+      } finally {
+        reviewDayFetchRef.current.delete(d);
+      }
+    })();
+    reviewDayFetchRef.current.set(d, task);
+    return task;
+  };
+
   const minutesUntilDeadline = (hhmm) => {
     const m = String(hhmm || "").match(/^(\d{1,2}):(\d{2})$/);
     if (!m) return null;
@@ -2384,7 +2459,7 @@ export default function App() {
     return deadlineMin - (now.getHours() * 60 + now.getMinutes());
   };
 
-  // 締切20分前から、対応場の次Rをサーバー側キャッシュへ先読みする。
+  // 締切30分前から、ナイター場を含む次Rをサーバー側キャッシュへ早めに先読みする。
   // 画面を開いている間だけ動く。ユーザーが場をタップした時は、通常取得でも3分キャッシュから即返りやすくなる。
   const prefetchApproachingAutoRaces = async (statuses, targetDate = todayDateValue()) => {
     if (!autoRefreshEnabledRef.current || document.hidden) return;
@@ -2393,9 +2468,9 @@ export default function App() {
     const candidates = raw
       .filter((st) => st && AUTO_FETCH_VENUES.includes(st.venue) && !st.noRace && !st.allClosed && st.nextRace && st.nextDeadline)
       .map((st) => ({ ...st, leftMin: minutesUntilDeadline(st.nextDeadline) }))
-      .filter((st) => st.leftMin != null && st.leftMin <= 20 && st.leftMin >= -1)
+      .filter((st) => st.leftMin != null && st.leftMin <= 30 && st.leftMin >= -2)
       .sort((a, b) => a.leftMin - b.leftMin)
-      .slice(0, 8);
+      .slice(0, 14);
 
     if (!candidates.length) {
       setPrefetchInfo("");
@@ -2515,6 +2590,13 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    const d = activeRaceDateValue();
+    hydrateReviewDayCache(d);
+    preloadReviewSnapshots(d).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [raceDate]);
+
   const selectVenueQuick = async (v) => {
     const today = activeRaceDateValue();
     manualRaceSelectUntilRef.current = 0;
@@ -2537,11 +2619,17 @@ export default function App() {
       const reviewRace = raceNo && String(raceNo) !== "" ? String(raceNo) : "12";
       setRaceNo(reviewRace);
       setReviewMode(true);
-      resetRaceAutoData();
-      setAutoMsg(`${v}は全レース発売終了です。翌日朝8時まで復習できるように${reviewRace}Rを表示します。`);
-      if (AUTO_FETCH_VENUES.includes(v)) {
-        window.setTimeout(() => fetchOfficialYoso({ venue: v, raceNo: reviewRace, raceDate: today, force: true, ignoreSalesEnded: true }), 80);
-      }
+      const shown = applyCachedReviewSnapshot(v, reviewRace, today);
+      if (!shown) resetRaceAutoData();
+      setAutoMsg(shown
+        ? `${v}${reviewRace}Rの保存済み確定データを即時表示しました。`
+        : `${v}は全レース発売終了です。保存済みデータを読み込んでいます…`);
+      preloadReviewSnapshots(today, { force: true }).then(() => {
+        if (!shown && applyCachedReviewSnapshot(v, reviewRace, today)) return;
+        if (!shown && AUTO_FETCH_VENUES.includes(v)) {
+          fetchOfficialYoso({ venue: v, raceNo: reviewRace, raceDate: today, force: true, ignoreSalesEnded: true });
+        }
+      });
       return;
     }
 
@@ -2620,7 +2708,7 @@ export default function App() {
   useEffect(() => {
     const today = activeRaceDateValue();
     refreshVenueStatuses(today);
-    const id = window.setInterval(() => refreshVenueStatuses(activeRaceDateValue(), { silent: true }), 180000);
+    const id = window.setInterval(() => refreshVenueStatuses(activeRaceDateValue(), { silent: true }), 60000);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -4976,10 +5064,18 @@ export default function App() {
               manualRaceSelectUntilRef.current = Date.now() + 10 * 60 * 1000;
               setRaceNo(nr);
               setVenueNotHeld(false);
-              resetRaceAutoData();
+              const targetDate = raceDate || activeRaceDateValue();
+              const shown = venue ? applyCachedReviewSnapshot(venue, nr, targetDate) : false;
+              if (!shown) resetRaceAutoData();
               if (salesEnded && venue) {
                 setReviewMode(true);
-                window.setTimeout(() => fetchOfficialYoso({ venue, raceNo: nr, raceDate: raceDate || activeRaceDateValue(), force: true, ignoreSalesEnded: true }), 80);
+                if (!shown) {
+                  preloadReviewSnapshots(targetDate, { force: true }).then(() => {
+                    if (!applyCachedReviewSnapshot(venue, nr, targetDate)) {
+                      fetchOfficialYoso({ venue, raceNo: nr, raceDate: targetDate, force: true, ignoreSalesEnded: true });
+                    }
+                  });
+                }
               } else {
                 setSalesEnded(false);
                 setReviewMode(false);

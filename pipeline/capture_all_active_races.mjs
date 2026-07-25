@@ -5,7 +5,7 @@ const VENUES = [
 
 const BASE = String(process.env.APP_BASE_URL || "https://newhunaken456.vercel.app").replace(/\/$/, "");
 const TOKEN = String(process.env.CAPTURE_TOKEN || "");
-const CONCURRENCY = Math.max(1, Math.min(5, Number(process.env.CAPTURE_CONCURRENCY || 3)));
+const CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.CAPTURE_CONCURRENCY || 5)));
 
 function jstNow() {
   const p = new Intl.DateTimeFormat("ja-JP", { timeZone:"Asia/Tokyo", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hour12:false })
@@ -44,15 +44,22 @@ for (const s of schedules) {
   for (const r of s.schedule) {
     const left = Number(r.deadlineMinutes) - now.minutes;
     // 展示公開前後は繰り返し取得。締切後は確定オッズを2回まで拾える幅を取る。
-    if (left <= 20 && left >= -12) jobs.push({ venue:s.venue, race:Number(r.race), left, final:left <= -1 });
+    if (left <= 30 && left >= -15) jobs.push({ venue:s.venue, race:Number(r.race), left, final:left <= -1 });
   }
 }
 
 console.log(`capture jobs=${jobs.length}`);
 const results = await mapLimit(jobs, CONCURRENCY, async j => {
   const q = new URLSearchParams({ action:"capture", venue:j.venue, race:String(j.race), date:now.date, final:j.final?"1":"0", t:String(Date.now()) });
-  const data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
-  const rows = Array.isArray(data.rows) ? data.rows.length : 0;
+  let data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
+  let rows = Array.isArray(data.rows) ? data.rows.length : 0;
+  // ナイター場などで展示公開が遅れる場合、締切15分前以降だけ同一run内で再確認する。
+  if (rows < 6 && j.left <= 15 && j.left >= -2) {
+    await new Promise((resolve) => setTimeout(resolve, 35000));
+    q.set("t", String(Date.now()));
+    data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
+    rows = Array.isArray(data.rows) ? data.rows.length : 0;
+  }
   console.log(`OK ${j.venue}${j.race}R left=${j.left} final=${j.final} rows=${rows} odds=${data.oddsCount||0}`);
   return {ok:true,...j,rows,odds:data.oddsCount||0};
 });

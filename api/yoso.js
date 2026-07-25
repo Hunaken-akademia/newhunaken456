@@ -245,6 +245,36 @@ async function readReviewSnapshot({ venue, raceNo, ymd }) {
   }
 }
 
+async function readReviewSnapshotsForDay(ymd, venue = "") {
+  if (!ENABLE_PERSISTENT_CACHE) return [];
+  const raceDate = ymdToDate(yyyymmdd(ymd));
+  if (!raceDate) return [];
+  const filters = [
+    `race_date=eq.${encodeURIComponent(raceDate)}`,
+    "is_final=eq.true",
+    "select=venue,race_no,snapshot,odds,odds_count,is_final,finalized_at,updated_at",
+    "order=venue.asc,race_no.asc",
+  ];
+  if (venue && JCD[venue]) filters.splice(1, 0, `place_no=eq.${Number(JCD[venue])}`);
+  const rows = await supabaseCacheRequest(`race_review_snapshots?${filters.join("&")}`);
+  return (Array.isArray(rows) ? rows : []).map((row) => ({
+    venue: row.venue,
+    race: Number(row.race_no),
+    snapshot: {
+      ...(row.snapshot || {}),
+      odds: row.odds || row.snapshot?.odds || null,
+      oddsCount: Number(row.odds_count || Object.keys(row.odds || row.snapshot?.odds || {}).length || 0),
+      reviewSnapshot: true,
+      reviewFinalized: !!row.is_final,
+      reviewCapturedAt: row.finalized_at || row.updated_at || "",
+      cached: true,
+      stale: false,
+      cacheStatus: "review-final",
+      servedAt: new Date().toISOString(),
+    },
+  }));
+}
+
 async function isRequestedRaceClosed(venue, raceNo, ymd) {
   const now = jstNowParts();
   const target = yyyymmdd(ymd);
@@ -3324,6 +3354,13 @@ export default async function handler(req, res) {
       }
       const payload = await fetchBoatcastRaceResultPayload(venue, raceNo, ymd);
       res.status(200).json(payload);
+      return;
+    }
+
+    if (action === "review_day") {
+      res.setHeader("Cache-Control", "private, max-age=30");
+      const items = await readReviewSnapshotsForDay(ymd, venue);
+      res.status(200).json({ ok: true, action: "review_day", appVersion: "v130", date: ymd, venue: venue || "", count: items.length, items, fetchedAt: new Date().toISOString() });
       return;
     }
 
