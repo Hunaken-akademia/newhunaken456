@@ -3770,34 +3770,65 @@ export default function App() {
       .sort((a, b) => a.st - b.st)
       .map((x) => x.b);
 
-    // 本線（改善B・C）: 1着率1位を1着固定（頭を1艇に集約）。
-    //   2着=2連対率上位＋ST速い艇、3着=3連対率上位＋ST速い艇
+    // 本線（確率モデル駆動）: 1着率1位を1着固定（このルールは変更しない）。
+    //   2・3着は Harville 推定確率の高い順。同確率帯では現行の2連対率・3連対率・ST順位をtiebreakに使う。
     const honHead = r1[0];
-    let honSecond = [...new Set([...r2.slice(0, 2), ...stRank.slice(0, 2), r3[0]])]
-      .filter((b) => b && b !== honHead);
-    let honThird = [...new Set([...r3.slice(0, 3), ...r2.slice(0, 2), ...stRank.slice(0, 2)])]
-      .filter((b) => b && b !== honHead);
-    // 相手候補が少ないと本線が極端に減るため、評価上位順で補完して最低限の点数を確保
-    const honFill = order.filter((b) => b && b !== honHead);
-    for (const b of honFill) { if (!honSecond.includes(b)) honSecond.push(b); }
-    for (const b of honFill) { if (!honThird.includes(b)) honThird.push(b); }
-    // まず本来の優先候補で組み、6点に満たなければ補完候補込みで最大6点まで広げる
-    const honPref2 = [...new Set([...r2.slice(0, 2), ...stRank.slice(0, 2), r3[0]])].filter((b) => b && b !== honHead);
-    const honPref3 = [...new Set([...r3.slice(0, 3), ...r2.slice(0, 2), ...stRank.slice(0, 2)])].filter((b) => b && b !== honHead);
-    let honTickets = buildTickets([honHead], honPref2, honPref3, 12);
     const HON_MIN = 4, HON_TARGET = 6;
-    if (honTickets.length < HON_TARGET) {
-      const more = buildTickets([honHead], honSecond, honThird, Math.max(HON_TARGET, honTickets.length));
-      for (const t of more) { if (!honTickets.includes(t)) honTickets.push(t); if (honTickets.length >= HON_TARGET) break; }
-    }
-    // それでも最低点に満たない場合（相手が極端に少ない）は全評価艇で最低4点を埋める
+    const honFill = order.filter((b) => b && b !== honHead);
+    const honLegacyRank = (ticket) => {
+      const parts = String(ticket || "").split("-").map(Number);
+      const second = parts[1], third = parts[2];
+      const pos = (arr, boat) => {
+        const i = arr.indexOf(boat);
+        return i >= 0 ? i : 99;
+      };
+      return pos(r2, second) * 1000
+        + pos(r3, third) * 100
+        + pos(stRank, second) * 10
+        + pos(stRank, third);
+    };
+    const honProbCandidates = honHead
+      ? buildTickets([honHead], honFill, honFill, 20)
+        .filter((t) => probOf(t) > 0)
+        .sort((a, b) => {
+          const diff = probOf(b) - probOf(a);
+          return Math.abs(diff) > 1e-12 ? diff : honLegacyRank(a) - honLegacyRank(b);
+        })
+      : [];
+
+    // probMapが正常なら確率上位6点。空・全0なら従来ロジックへ明示的にフォールバックする。
+    let honTickets = honProbCandidates.slice(0, HON_TARGET);
     if (honTickets.length < HON_MIN) {
-      const all = buildTickets([honHead], honFill, honFill, HON_MIN);
-      for (const t of all) { if (!honTickets.includes(t)) honTickets.push(t); if (honTickets.length >= HON_MIN) break; }
+      let honSecond = [...new Set([...r2.slice(0, 2), ...stRank.slice(0, 2), r3[0]])]
+        .filter((b) => b && b !== honHead);
+      let honThird = [...new Set([...r3.slice(0, 3), ...r2.slice(0, 2), ...stRank.slice(0, 2)])]
+        .filter((b) => b && b !== honHead);
+      for (const b of honFill) { if (!honSecond.includes(b)) honSecond.push(b); }
+      for (const b of honFill) { if (!honThird.includes(b)) honThird.push(b); }
+      const honPref2 = [...new Set([...r2.slice(0, 2), ...stRank.slice(0, 2), r3[0]])]
+        .filter((b) => b && b !== honHead);
+      const honPref3 = [...new Set([...r3.slice(0, 3), ...r2.slice(0, 2), ...stRank.slice(0, 2)])]
+        .filter((b) => b && b !== honHead);
+      honTickets = buildTickets([honHead], honPref2, honPref3, HON_TARGET);
+      if (honTickets.length < HON_TARGET) {
+        const more = buildTickets([honHead], honSecond, honThird, HON_TARGET);
+        for (const t of more) {
+          if (!honTickets.includes(t)) honTickets.push(t);
+          if (honTickets.length >= HON_TARGET) break;
+        }
+      }
+      if (honTickets.length < HON_MIN) {
+        const all = buildTickets([honHead], honFill, honFill, HON_MIN);
+        for (const t of all) {
+          if (!honTickets.includes(t)) honTickets.push(t);
+          if (honTickets.length >= HON_MIN) break;
+        }
+      }
     }
+    const honCoveragePct = Math.max(0, Math.min(100, coverage(honTickets) * 100));
     const honmei = {
       label: "本線",
-      desc: "1着率1位を1着固定／2・3着＝2連・3連対率上位＋ST速い艇",
+      desc: `1着率1位を1着固定／2・3着は推定確率上位（カバー率 ${honCoveragePct.toFixed(1)}%）`,
       tickets: honTickets,
     };
 
