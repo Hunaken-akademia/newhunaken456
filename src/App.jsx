@@ -3742,6 +3742,27 @@ export default function App() {
       return out;
     };
 
+    // ── 確率モデル駆動の買い目選択で共通利用する安全なヘルパー ──
+    // probMap / odds が未取得・不完全でも例外を出さず、空値は0として扱う。
+    const probOf = (t) => {
+      const p = Number(probMap?.[t]);
+      return Number.isFinite(p) && p > 0 ? p : 0;
+    };
+    const sortByProb = (list) => [...(Array.isArray(list) ? list : [])]
+      .sort((a, b) => probOf(b) - probOf(a));
+    const sortByEv = (list) => [...(Array.isArray(list) ? list : [])]
+      .sort((a, b) => {
+        const oa = Number(odds?.[a]);
+        const ob = Number(odds?.[b]);
+        const hasOa = Number.isFinite(oa) && oa > 0;
+        const hasOb = Number.isFinite(ob) && ob > 0;
+        if (hasOa && hasOb) return (probOf(b) * ob) - (probOf(a) * oa);
+        if (hasOa !== hasOb) return hasOb ? 1 : -1;
+        return probOf(b) - probOf(a);
+      });
+    const coverage = (tickets) => [...new Set(Array.isArray(tickets) ? tickets : [])]
+      .reduce((sum, t) => sum + probOf(t), 0);
+
     // ST順（速い順）。F持ちは除外。2・3着の精度を上げるのに使う（改善C）
     const stRank = order
       .map((b) => ({ b, st: fHold[b] ? null : Number(fSts[b] ?? sts[b]) }))
