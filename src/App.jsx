@@ -3935,29 +3935,26 @@ export default function App() {
       tickets: taikouTickets,
     };
 
-    // 穴: 「本命とは差別化された妙味艇」を必ず絡める。根拠を明確化し、薄い目は埋めない。
-    //   頭 = 評価1・2位（本命軸）＋ タイム抜群の妙味艇（一発頭）
-    //   妙味艇の根拠: A=展示タイム抜群 / B=モーター良 / C=人気落とし（今期↓だが他区分↑）
+    // 穴: オッズ取得時は120通り全体からEV基準で選定。
+    //   オッズ未取得時、またはEV条件該当なしの場合は従来の妙味艇ロジックへ明示的にフォールバックする。
     let ana;
     {
-      // ── 妙味艇を根拠付きで抽出 ──
-      // 全体の展示タイム差の基準（上位かどうか）
+      // ── 妙味艇を根拠付きで抽出（従来ロジックを維持） ──
       const diffVals = ranked.map((r) => r.diff).filter((d) => d != null);
       const diffSorted = [...diffVals].sort((a, b) => b - a);
-      const diffTopThresh = diffSorted.length ? diffSorted[Math.min(1, diffSorted.length - 1)] : 0.1; // 上位2番手相当
-      // 人気薄判定: その艇が絡む3連単の平均オッズ（高いほど人気薄）
+      const diffTopThresh = diffSorted.length ? diffSorted[Math.min(1, diffSorted.length - 1)] : 0.1;
       const meanOdds = (b) => {
         if (!odds) return null;
         const vals = Object.entries(odds)
           .filter(([k]) => k.split("-").includes(String(b)))
-          .map(([, v]) => v);
+          .map(([, v]) => Number(v))
+          .filter((v) => Number.isFinite(v) && v > 0);
         return vals.length ? vals.reduce((a, v) => a + v, 0) / vals.length : null;
       };
       const oddsMeans = ranked.map((r) => meanOdds(r.boat)).filter((v) => v != null);
       const oddsMedian = oddsMeans.length
         ? [...oddsMeans].sort((a, b) => a - b)[Math.floor(oddsMeans.length / 2)]
         : null;
-      // 「人気落とし」: 選択期間(racerCat)の1着率が平均以下だが、他区分の最高1着率が選択期間＋3%以上
       const w1cur = (i) => racerStats?.win1?.[racerCat]?.[i] ?? null;
       const w1best = (i) => {
         if (!racerStats?.win1) return null;
@@ -3970,96 +3967,94 @@ export default function App() {
         return best;
       };
 
-      // 評価順位（rankPos: 1が最上位）。本命=上位2艇は「妙味」から除外（差別化のため）
       const topBoats = ranked.slice(0, 2).map((r) => r.boat);
-      const merits = []; // { boat, reasons[] }
+      const merits = [];
       for (const r of ranked) {
-        if (topBoats.includes(r.boat)) continue; // 本命そのものは妙味にしない
+        if (topBoats.includes(r.boat)) continue;
         const reasons = [];
-        // 根拠A: 展示タイム抜群（展示✓ かつ タイム差が上位相当）
-        if (r.crit.time === true && r.diff != null && r.diff >= diffTopThresh) {
-          reasons.push("展示タイム抜群");
-        }
-        // 根拠B: モーター良
-        if (r.crit.motor === true) {
-          reasons.push("モーター良");
-        }
-        // 根拠C: 人気落とし（選択期間↓・他区分↑）
+        if (r.crit.time === true && r.diff != null && r.diff >= diffTopThresh) reasons.push("展示タイム抜群");
+        if (r.crit.motor === true) reasons.push("モーター良");
         const i = r.boat - 1;
         const cur = w1cur(i), best = w1best(i);
         if (cur != null && best != null && r1Avg != null && cur <= r1Avg && best >= cur + 3) {
           reasons.push(`直近6ヶ月等は好成績（${best.toFixed(0)}%）も直近1年で人気落とし`);
         }
         if (reasons.length === 0) continue;
-        // 人気薄フィルタ: オッズがあれば中央値以上（人気薄）を優先採用。なければ評価中位以下のみ。
         const mo = meanOdds(r.boat);
-        const isUnpopular = oddsMedian != null
-          ? (mo == null || mo >= oddsMedian)
-          : r.rankPos >= 3; // オッズ無いときは評価3位以下を人気薄扱い
+        const isUnpopular = oddsMedian != null ? (mo == null || mo >= oddsMedian) : r.rankPos >= 3;
         if (!isUnpopular) continue;
         merits.push({ boat: r.boat, reasons, mo: mo ?? 0 });
       }
-      // 妙味艇は人気薄（オッズ高い）順に並べる
       merits.sort((a, b) => b.mo - a.mo);
       const meritBoats = merits.map((m) => m.boat);
+      const meritReasonByBoat = Object.fromEntries(merits.map((m) => [m.boat, m.reasons[0]]));
 
-      // ── 頭の決定 ──
-      // 本命軸（評価1・2位）＋ タイム抜群の妙味艇（一発頭）＋ 展開濃厚な攻め手艇
       const heads = [];
       for (const b of ranked.slice(0, 2).map((r) => r.boat)) if (!heads.includes(b)) heads.push(b);
-      for (const m of merits) {
-        if (m.reasons.includes("展示タイム抜群") && !heads.includes(m.boat)) heads.push(m.boat);
-      }
-      // 展開連動: まくり/差しが濃厚な攻め手艇を穴の頭に追加（荒れの主役を頭で押さえる）
+      for (const m of merits) if (m.reasons.includes("展示タイム抜群") && !heads.includes(m.boat)) heads.push(m.boat);
       for (const h of scenarioHeads) if (!heads.includes(h)) heads.push(h);
-      if (heads.length === 0) heads.push(order[0]);
+      if (heads.length === 0 && order[0]) heads.push(order[0]);
 
-      // ── 買い目組成: 各頭に妙味艇を必ず2着or3着で絡める。根拠ある目だけ。 ──
-      const tickets = [];
-      const cap = 12;
-      const pushU = (t) => { if (t && !tickets.includes(t)) tickets.push(t); };
+      const all120 = buildTickets([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], 120);
+      const excluded = new Set([...honmei.tickets, ...taikou.tickets]);
+      const hasOdds = odds && Object.values(odds).some((o) => Number.isFinite(Number(o)) && Number(o) > 0);
+      const evCandidates = hasOdds
+        ? sortByEv(all120.filter((t) => {
+            const o = Number(odds?.[t]);
+            return !excluded.has(t) && Number.isFinite(o) && o >= 20 && probOf(t) * o >= 1.0;
+          }))
+        : [];
 
-      if (meritBoats.length > 0) {
-        // 相手（2・3着の埋め）は評価上位＋妙味艇
-        const fillers = [...new Set([...order.slice(0, 3), ...meritBoats])];
-        // (1) まず「頭→妙味艇→上位相手」「頭→上位相手→妙味艇」を根拠の濃い順に
-        for (const m of meritBoats) {
-          for (const head of heads) {
-            if (m === head) {
-              // 妙味艇が頭の場合は、相手に上位艇＋他妙味艇
-              const others = fillers.filter((b) => b !== head);
-              for (const a of others) for (const c of others) {
-                if (a !== c) { pushU(`${head}-${a}-${c}`); if (tickets.length >= cap) break; }
-              }
-            } else {
-              const others = fillers.filter((b) => b !== head && b !== m);
-              for (const c of others) { pushU(`${head}-${m}-${c}`); if (tickets.length >= cap) break; } // 妙味艇2着
-              for (const b of others) { pushU(`${head}-${b}-${m}`); if (tickets.length >= cap) break; } // 妙味艇3着
-            }
-            if (tickets.length >= cap) break;
-          }
-          if (tickets.length >= cap) break;
-        }
+      let tickets = evCandidates.slice(0, 12);
+      let desc;
+      if (tickets.length > 0) {
+        const involvedMerits = merits.filter((m) => tickets.some((t) => t.split("-").map(Number).includes(m.boat)));
+        const meritText = involvedMerits.slice(0, 2)
+          .map((m) => `${m.boat}号艇(${meritReasonByBoat[m.boat]})`)
+          .join("、");
+        desc = `120通りからEV1.0以上・20倍以上を抽出しEV順${meritText ? `／妙味艇: ${meritText}` : ""}`;
       } else {
-        // 妙味艇なし → 中穴（評価2・3位頭で軽め4点まで）
-        for (const head of ranked.slice(1, 3).map((r) => r.boat)) {
-          if (!head) continue;
-          const partners = order.filter((b) => b !== head).slice(0, 3);
-          for (const t of buildTickets([head], partners, partners, 4)) { pushU(t); if (tickets.length >= 4) break; }
-          if (tickets.length >= 4) break;
+        // 従来の妙味艇ロジックへフォールバックし、カードが空になるのを防ぐ。
+        const legacy = [];
+        const pushU = (t) => { if (t && !legacy.includes(t) && !excluded.has(t)) legacy.push(t); };
+        if (meritBoats.length > 0) {
+          const fillers = [...new Set([...order.slice(0, 3), ...meritBoats])];
+          for (const m of meritBoats) {
+            for (const head of heads) {
+              if (m === head) {
+                const others = fillers.filter((b) => b !== head);
+                for (const a of others) for (const c of others) {
+                  if (a !== c) { pushU(`${head}-${a}-${c}`); if (legacy.length >= 12) break; }
+                }
+              } else {
+                const others = fillers.filter((b) => b !== head && b !== m);
+                for (const c of others) { pushU(`${head}-${m}-${c}`); if (legacy.length >= 12) break; }
+                for (const b of others) { pushU(`${head}-${b}-${m}`); if (legacy.length >= 12) break; }
+              }
+              if (legacy.length >= 12) break;
+            }
+            if (legacy.length >= 12) break;
+          }
+        } else {
+          for (const head of ranked.slice(1, 3).map((r) => r.boat)) {
+            if (!head) continue;
+            const partners = order.filter((b) => b !== head).slice(0, 3);
+            for (const t of buildTickets([head], partners, partners, 4)) { pushU(t); if (legacy.length >= 4) break; }
+            if (legacy.length >= 4) break;
+          }
         }
+        if (legacy.length === 0) {
+          for (const t of all120) { pushU(t); if (legacy.length >= 4) break; }
+        }
+        tickets = legacy;
+        const meritStr = merits.slice(0, 2).map((m) => `${m.boat}号艇(${m.reasons[0]})`).join("、");
+        desc = meritBoats.length
+          ? `EV条件該当なしのため従来の妙味艇ロジック／妙味の根拠: ${meritStr}`
+          : `EV条件該当なしのため評価2・3位頭の中穴へフォールバック`;
       }
 
-      const headStr = heads.slice(0, 3).join("・");
-      const meritStr = merits.slice(0, 2).map((m) => `${m.boat}号艇(${m.reasons[0]})`).join("、");
-      const anaFlowNote = scenarioHeads.length ? `／展開濃厚艇${scenarioHeads.join("・")}号を頭に追加` : "";
-      ana = {
-        label: "穴",
-        desc: (meritBoats.length
-          ? `頭${headStr}に妙味艇を絡めた穴／妙味の根拠: ${meritStr}`
-          : `妙味艇が見当たらず、評価2・3位頭の中穴（軽め）`) + anaFlowNote,
-        tickets,
-      };
+      const anaCoveragePct = Math.max(0, Math.min(100, coverage(tickets) * 100));
+      ana = { label: "穴", desc: `${desc}（カバー率 ${anaCoveragePct.toFixed(1)}%）`, tickets };
     }
 
     // 合成オッズ（オッズ貼り付け時）= 1 ÷ Σ(1/各点オッズ)
@@ -4071,68 +4066,72 @@ export default function App() {
       return { odds: 1 / inv, covered: vals.length, total: tickets.length };
     };
 
-    // 超穴: 本線〜穴の買い目の中から、合成オッズ10倍超 かつ 当たりそうな組み合わせを12点以内
-    //   当たりそう = AI評価順位の合計が小さい順（上位艇で構成される目を優先）
-    const rankPos = Object.fromEntries(order.map((b, i) => [b, i])); // 0が最上位
-    const allTickets = [...new Set([...honmei.tickets, ...taikou.tickets, ...ana.tickets])];
+    // 超穴: 120通り全体からEV1.0以上・50倍以上を抽出し、合成10倍を維持して最大12点。
+    const rankPos = Object.fromEntries(order.map((b, i) => [b, i]));
     const likeliness = (t) => t.split("-").reduce((a, b) => a + (rankPos[Number(b)] ?? 9), 0);
-    // オッズがある時だけ「当たりそう順」に並べ、合成10倍超を維持できる範囲で詰める
+    const all120Tickets = buildTickets([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], 120);
     let choBet;
-    if (odds) {
-      const withOdds = allTickets.filter((t) => odds[t] > 0).sort((a, b) => likeliness(a) - likeliness(b));
-      // 当たりそうな順に足していき、合成が10倍を切らない範囲で最大12点
+    if (odds && Object.values(odds).some((o) => Number.isFinite(Number(o)) && Number(o) > 0)) {
+      const evLongshots = sortByEv(all120Tickets.filter((t) => {
+        const o = Number(odds?.[t]);
+        return Number.isFinite(o) && o >= 50 && probOf(t) * o >= 1.0;
+      }));
       const picked = [];
-      for (const t of withOdds) {
+      for (const t of evLongshots) {
         const trial = [...picked, t];
         const c = compOdds(trial);
-        if (trial.length <= 12 && c && c.odds > 10) picked.push(t);
+        if (trial.length <= 12 && c && c.odds >= 10) picked.push(t);
         if (picked.length >= 12) break;
       }
-      if (picked.length >= 1) {
+      if (picked.length > 0) {
+        const pct = Math.max(0, Math.min(100, coverage(picked) * 100));
         choBet = {
           label: "超穴",
-          desc: "合成10倍超を狙える買い目（当たりそうな順に最大12点）",
+          desc: `120通りからEV1.0以上・50倍以上をEV順／合成10倍以上を維持（カバー率 ${pct.toFixed(1)}%）`,
           tickets: picked,
         };
       } else {
-        // 合成10倍超の組がない → 1点勝負（最大3点）。当たりそう＋高配当の単発
-        const single = withOdds
-          .filter((t) => odds[t] > 10)
-          .sort((a, b) => likeliness(a) - likeliness(b))
+        // 条件該当0点は現行の1点勝負（最大3点）へフォールバック。
+        const single = sortByEv(all120Tickets.filter((t) => Number(odds?.[t]) > 10))
           .slice(0, 3);
+        const safeSingle = single.length ? single : sortByProb(all120Tickets).slice(0, 3);
+        const pct = Math.max(0, Math.min(100, coverage(safeSingle) * 100));
         choBet = {
           label: "超穴",
-          desc: single.length ? "合成10倍超の組がないため1点勝負（最大3点）" : "該当なし",
-          tickets: single,
+          desc: `条件該当なしのため1点勝負（最大3点）（カバー率 ${pct.toFixed(1)}%）`,
+          tickets: safeSingle,
         };
       }
     } else {
-      // オッズ未入力時は配当不明 → 評価上位3艇で当たりそうな高配当狙いの目を最大3点
-      const cand = allTickets.sort((a, b) => likeliness(a) - likeliness(b)).slice(0, 3);
+      const cand = sortByProb(all120Tickets).slice(0, 3);
+      const safeCand = cand.length ? cand : all120Tickets.slice(0, 3);
+      const pct = Math.max(0, Math.min(100, coverage(safeCand) * 100));
       choBet = {
         label: "超穴",
-        desc: "オッズ未取得のため目安（オッズが自動取得されると合成10倍超で精選）",
-        tickets: cand,
+        desc: `オッズ未取得のため推定確率上位を目安表示（カバー率 ${pct.toFixed(1)}%）`,
+        tickets: safeCand,
       };
     }
 
-    [honmei, taikou, ana].forEach((b) => { b.comp = compOdds(b.tickets); });
+    [honmei, taikou, ana, choBet].forEach((b) => { b.comp = compOdds(b.tickets); });
 
-    const bets = [honmei, taikou, ana];
+    const bets = [honmei, taikou, ana, choBet];
 
+    // EVランキングは選択済みの買い目だけでなく、3連単120通り全体を対象にする。
     let evList = [];
     if (odds) {
-      const seenEv = new Set();
-      for (const bset of bets) {
-        for (const t of bset.tickets) {
-          if (seenEv.has(t)) continue;
-          seenEv.add(t);
-          const o = odds[t];
-          const p = probMap[t];
-          if (o > 0 && p != null) evList.push({ t, from: bset.label, p, o, ev: p * o });
-        }
-      }
-      evList.sort((x, y) => y.ev - x.ev);
+      const ticketLabel = (t) => bets.find((b) => b.tickets.includes(t))?.label || "全120通り";
+      evList = all120Tickets
+        .map((t) => {
+          const o = Number(odds?.[t]);
+          const p = probOf(t);
+          return Number.isFinite(o) && o > 0 && p > 0
+            ? { t, from: ticketLabel(t), p, o, ev: p * o }
+            : null;
+        })
+        .filter(Boolean)
+        .sort((x, y) => y.ev - x.ev)
+        .slice(0, 20);
     }
 
     // ── 段階的フィルター＋決まり手シナリオ ──
@@ -4639,10 +4638,14 @@ export default function App() {
         return [...tk].sort((a, b) => likeli(a) - likeli(b));
       } else if (pickerMode === "ev") {
         const pseudoProb = (t) => 1 / (1 + likeli(t));
+        const modelProb = (t) => {
+          const p = Number(aiEval?.probMap?.[t]);
+          return Number.isFinite(p) && p > 0 ? p : pseudoProb(t);
+        };
         const ev = (t) => {
           const o = odds && odds[t] > 0 ? odds[t] : null;
           if (o == null) return -1;
-          return pseudoProb(t) * o;
+          return modelProb(t) * o;
         };
         return [...tk].sort((a, b) => ev(b) - ev(a));
       } else {
@@ -6625,6 +6628,10 @@ export default function App() {
                         const lim = betLimits[bet.label] != null ? Math.min(betLimits[bet.label], maxPts) : maxPts;
                         const shown = baseTickets.slice(0, lim);
                         // 表示点数に応じた合成オッズ
+                        const shownCoverage = Math.max(0, Math.min(100, shown.reduce((sum, t) => {
+                          const p = Number(aiEval?.probMap?.[t]);
+                          return sum + (Number.isFinite(p) && p > 0 ? p : 0);
+                        }, 0) * 100));
                         let compShown = null;
                         if (odds) {
                           const vals = shown.map((t) => odds[t]).filter((o) => o != null && o > 0);
@@ -6669,6 +6676,7 @@ export default function App() {
                             {compShown ? (
                               <div style={{ fontSize: 12, color: "#5dd39e", fontWeight: 800, marginBottom: 6 }}>
                                 合成オッズ 約{compShown.odds.toFixed(1)}倍
+                                <span style={{ marginLeft: 8, color: "#9db5cc", fontWeight: 700 }}>カバー率 {shownCoverage.toFixed(1)}%</span>
                                 {compShown.covered < compShown.total && (
                                   <span style={{ fontSize: 10, color: "#7da3c8", fontWeight: 400 }}>
                                     （{compShown.covered}/{compShown.total}点のオッズで計算）
@@ -6678,6 +6686,7 @@ export default function App() {
                             ) : !odds ? (
                               <div style={{ fontSize: 10, color: "#8a98a8", marginBottom: 6 }}>
                                 オッズ未取得のため合成オッズは表示できません（自動取得できると計算されます）
+                                <span style={{ marginLeft: 8 }}>カバー率 {shownCoverage.toFixed(1)}%</span>
                               </div>
                             ) : null}
                             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -6708,7 +6717,7 @@ export default function App() {
                           対象（最大4つまで選択）{cmpMode === "overlap" ? "・被り買い目から" : ""}
                         </div>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
-                          {["本線", "対抗", "穴"].map((p) => {
+                          {["本線", "対抗", "穴", "超穴"].map((p) => {
                             const sel = pickerParts.includes(p);
                             const c = p === "本線" ? "#3d7ab8" : p === "対抗" ? "#5a9e2e" : p === "超穴" ? "#9c5ec7" : "#b8893d";
                             return (
