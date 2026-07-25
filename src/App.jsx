@@ -3402,7 +3402,7 @@ export default function App() {
     };
   });
 
-  // 総合AI評価（枠別成績・展示タイム・モーター・風の4項目）。rows を渡すと同じロジックで評価
+  // 総合AI評価。印判定は枠別成績・展示タイム・モーターの3項目。風は合計点・総合順位には加味する。
   const evaluateRows = (rows) => {
     if (!rows) return null;
 
@@ -3436,7 +3436,7 @@ export default function App() {
 
     const evals = rows.map((r) => {
       const m = motors[r.boat];
-      // 4項目判定: true=良 / false=良くない / null=データなし
+      // 印判定用の3項目＋参考用の風: true=良 / false=良くない / null=データなし
       const crit = {
         racer: (r.racerR1final == null && r.racerR2final == null && r.racerR3final == null)
           ? null
@@ -3449,8 +3449,9 @@ export default function App() {
           : null,
         wind: wind === "無風" ? null : r.windAdj >= 0.5,
       };
-      const goods = Object.values(crit).filter((v) => v === true).length;
-      const mark = goods >= 3 ? "◎" : goods === 2 ? "○" : goods === 1 ? "△" : "✕";
+      // 印は「枠別成績・展示タイム・モーター」の3項目だけで判定。風は対象外。
+      const goods = [crit.racer, crit.time, crit.motor].filter((v) => v === true).length;
+      const mark = goods === 3 ? "◎" : goods === 2 ? "○" : goods === 1 ? "△" : "✕";
 
       // 注意マーク
       const warns = [];
@@ -3545,7 +3546,7 @@ export default function App() {
         風: cWind,
         ST: stScore,
         枠基準: cBase,  // 基本場平均＋展示補正ベース（風は含めない）
-        総合印: cGoods, // 4項目チェック（枠/展/機/風）の合計
+        総合印: cGoods, // 3項目チェック（枠/展/機）の合計。風は別項目で加味
       };
       const score = cGoods + cRacer + cDiff + cMotor + cWind + cBase + stScore;
 
@@ -6130,7 +6131,7 @@ export default function App() {
                       onChange={(e) => setBreakdownFixedOrder(e.target.checked)}
                       style={{ width: 13, height: 13, margin: 0, accentColor: "#5dd39e" }}
                     />
-                    項目順
+                    項目順を一律にする
                   </label>
                 </div>
                 <div style={{ fontSize: 11, color: "#7da3c8", background: "#16273c", border: "1px solid #243a55", borderRadius: 8, padding: "8px 10px", marginBottom: 10, lineHeight: 1.6 }}>
@@ -6160,7 +6161,7 @@ export default function App() {
                         }}>{r.boat}</span>
                         <span style={{ fontSize: 11, color: "#7da3c8" }}>{r.course}C進入</span>
                         <span style={{ fontSize: 11, color: "#7da3c8", marginLeft: "auto" }}>
-                          良 {r.goods}/4 ｜ 枠基準参考 {fmt(r.final1, 1)}%
+                          良 {r.goods}/3 ｜ 枠基準参考 {fmt(r.final1, 1)}%
                         </span>
                       </div>
 
@@ -6184,13 +6185,12 @@ export default function App() {
                         );
                       })()}
 
-                      {/* 4項目の判定チップ */}
+                      {/* 3項目の印判定チップ（風は対象外） */}
                       <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: 8 }}>
                         {[
                           ["枠別成績", r.crit.racer],
                           ["展示タイム", r.crit.time],
                           ["モーター", r.crit.motor],
-                          ["風", r.crit.wind],
                         ].map(([label, v]) => (
                           <span key={label} style={{
                             fontSize: 10, fontWeight: 800, padding: "4px 8px", borderRadius: 6,
@@ -6206,8 +6206,17 @@ export default function App() {
                       {/* 評価の内訳（項目別配点） */}
                       {r.points && (() => {
                         const maxOf = { 成績: 20, 展示: 20, モーター: 20, ST: 20, 枠基準: 10, 風: 10 };
-                        const fixedOrder = ["成績", "展示", "モーター", "ST", "枠基準", "風"];
-                        const items = fixedOrder.map((k) => ({ k, pt: r.points[k] ?? 0, max: maxOf[k] }));
+                        // チェック時は全艇を同じ並びにする。主要4項目は指定順、その後に補助2項目を表示。
+                        const fixedOrder = ["成績", "展示", "モーター", "風", "ST", "枠基準"];
+                        const labelOf = {
+                          成績: "枠別成績",
+                          展示: "展示タイム",
+                          モーター: "モーター",
+                          風: "風",
+                          ST: "ST",
+                          枠基準: "枠基準",
+                        };
+                        const items = fixedOrder.map((k) => ({ k, label: labelOf[k] || k, pt: r.points[k] ?? 0, max: maxOf[k] }));
                         if (!breakdownFixedOrder) {
                           items.sort((a, b) => (b.pt / b.max) - (a.pt / a.max)); // 達成率の高い順
                         }
@@ -6221,7 +6230,7 @@ export default function App() {
                               const ratio = it.pt / it.max;
                               return (
                                 <div key={it.k} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                                  <span style={{ fontSize: 10, color: "#9db5cc", width: 44, flexShrink: 0 }}>{it.k}</span>
+                                  <span style={{ fontSize: 10, color: "#9db5cc", width: 62, flexShrink: 0 }}>{it.label}</span>
                                   <div style={{ flex: 1, height: 10, background: "#0a1420", borderRadius: 3, overflow: "hidden" }}>
                                     <div style={{ width: `${ratio * 100}%`, height: "100%", background: color(ratio), borderRadius: 3 }} />
                                   </div>
@@ -6266,7 +6275,7 @@ export default function App() {
                 </div>
 
                 <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 10, lineHeight: 1.6 }}>
-                  判定: 枠別成績・展示タイム・モーター・風 の4項目中、良が3つ以上＝◎／2つ＝○／1つ＝△／0＝✕。
+                  判定: 枠別成績・展示タイム・モーターの3項目で、3項目＝◎／2項目＝○／1項目＝△／0項目＝✕。風は印判定から除外し、合計点・総合順位にのみ反映します。
                   場平均は参考表示のみ。−はデータ未入力。
                   使用データ: {aiEval.usedData.join("・")}
                 </div>
@@ -6358,7 +6367,7 @@ export default function App() {
                                       const m = ev.mark[b];
                                       const mc = m === "◎" ? "#f9c513" : m === "○" ? "#5dd39e" : m === "△" ? "#9db5cc" : "#5e7a92";
                                       const cr = ev.crit?.[b] || {};
-                                      const items = [["枠", cr.racer], ["展", cr.time], ["機", cr.motor], ["風", cr.wind]];
+                                      const items = [["枠", cr.racer], ["展", cr.time], ["機", cr.motor]];
                                       return (
                                         <div key={b} style={{ display: "flex", alignItems: "center", gap: 5 }}>
                                           <span style={{ fontSize: 11, color: "#5e7a92", width: 14 }}>{i + 1}</span>
@@ -6388,7 +6397,7 @@ export default function App() {
                               ))}
                             </div>
                             <div style={{ fontSize: 10, color: "#5e7a92", marginTop: 4 }}>
-                              ※ メインと同じ4項目（枠別成績・展示・モーター・風）で評価。期間で変わるのは枠別成績ぶんです。
+                              ※ メインと同じ3項目（枠別成績・展示・モーター）で印を判定。風は印の対象外ですが、総合順位には反映します。期間で変わるのは枠別成績ぶんです。
                             </div>
                           </div>
                         )}
