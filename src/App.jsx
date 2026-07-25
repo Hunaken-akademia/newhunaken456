@@ -3657,6 +3657,34 @@ export default function App() {
       });
     }
 
+    // ── スコア→確率モデル（買い目生成より先に確定） ──
+    //   ここでは ranked と各艇の score / final1 / baseRate が確定済み。
+    //   1着確率: コース別の場平均1着率(final1)を土台(prior)に、当日評価スコアで補正して正規化。
+    //   3連単確率: Harville式 P(a-b-c)=pa×pb/(1-pa)×pc/(1-pa-pb)（一次近似）。
+    //   評価ロジックの数式・重みは変更せず、計算順序だけを前倒しする。
+    const meanScore = ranked.reduce((a, r) => a + (r.score || 0), 0) / Math.max(1, ranked.length);
+    const winProb = {};
+    {
+      let zSum = 0;
+      for (const r of ranked) {
+        const baseP = Math.max(1, r.final1 ?? r.baseRate ?? 10);
+        const w = baseP * Math.exp(0.08 * ((r.score || 0) - meanScore));
+        winProb[r.boat] = w;
+        zSum += w;
+      }
+      for (const b of Object.keys(winProb)) winProb[b] = zSum > 0 ? winProb[b] / zSum : 0;
+    }
+    const probMap = {};
+    const boatsAll = ranked.map((r) => r.boat);
+    for (const pa1 of boatsAll) for (const pb2 of boatsAll) for (const pc3 of boatsAll) {
+      if (pa1 === pb2 || pa1 === pc3 || pb2 === pc3) continue;
+      const pa = winProb[pa1], pb = winProb[pb2], pc = winProb[pc3];
+      const d1 = 1 - pa, d2 = 1 - pa - pb;
+      if (d1 <= 0 || d2 <= 0) continue;
+      const p = pa * (pb / d1) * (pc / d2);
+      if (Number.isFinite(p) && p > 0) probMap[`${pa1}-${pb2}-${pc3}`] = p;
+    }
+
     // レース全体の判定
     const maxG = Math.max(...evals.map((r) => r.goods));
     const topN = evals.filter((r) => r.goods === maxG).length;
@@ -4025,31 +4053,6 @@ export default function App() {
 
     const bets = [honmei, taikou, ana];
 
-    // ── スコア→確率→期待値 ──
-    //   1着確率: コース別の場平均1着率(final1)を土台(prior)に、当日評価スコアで補正して正規化。
-    //   3連単確率: Harville式 P(a-b-c)=pa×pb/(1-pa)×pc/(1-pa-pb)（一次近似）。
-    //   期待値 EV = 推定確率×オッズ。EV>1 は「市場より割安（妙味）」の目安。
-    const meanScore = ranked.reduce((a, r) => a + (r.score || 0), 0) / Math.max(1, ranked.length);
-    const winProb = {};
-    {
-      let zSum = 0;
-      for (const r of ranked) {
-        const baseP = Math.max(1, r.final1 ?? r.baseRate ?? 10);
-        const w = baseP * Math.exp(0.08 * ((r.score || 0) - meanScore));
-        winProb[r.boat] = w; zSum += w;
-      }
-      for (const b of Object.keys(winProb)) winProb[b] = zSum > 0 ? winProb[b] / zSum : 0;
-    }
-    const probMap = {};
-    const boatsAll = ranked.map((r) => r.boat);
-    for (const pa1 of boatsAll) for (const pb2 of boatsAll) for (const pc3 of boatsAll) {
-      if (pa1 === pb2 || pa1 === pc3 || pb2 === pc3) continue;
-      const pa = winProb[pa1], pb = winProb[pb2], pc = winProb[pc3];
-      const d1 = 1 - pa, d2 = 1 - pa - pb;
-      if (d1 <= 0 || d2 <= 0) continue;
-      const p = pa * (pb / d1) * (pc / d2);
-      if (Number.isFinite(p) && p > 0) probMap[`${pa1}-${pb2}-${pc3}`] = p;
-    }
     let evList = [];
     if (odds) {
       const seenEv = new Set();
