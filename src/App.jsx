@@ -1515,17 +1515,64 @@ export default function App() {
   useEffect(() => {
     checkPaidLogin();
   }, []);
-  const [wind, setWind] = useState(() => {
+  const [wind, setWind] = useState("無風");
+  const [raceWinds, setRaceWinds] = useState(() => Object.fromEntries(Array.from({ length: 12 }, (_, i) => [i + 1, ""])));
+  const [raceWindsLoading, setRaceWindsLoading] = useState(false);
+  const [raceWindsMsg, setRaceWindsMsg] = useState("");
+  const loadRaceWinds = async () => {
+    if (!venue || !raceDate) return;
+    setRaceWindsLoading(true);
+    setRaceWindsMsg("");
     try {
-      const saved = localStorage.getItem("hunaken_manual_wind_v1");
-      return saved && WIND[saved] ? saved : "無風";
-    } catch {
-      return "無風";
+      const qs = new URLSearchParams({ action: "manual_winds", venue, date: raceDate, t: String(Date.now()) });
+      const res = await fetch(`/api/yoso?${qs.toString()}`, { cache: "no-store" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || "風設定の取得に失敗しました");
+      const next = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [i + 1, ""]));
+      for (const [k, v] of Object.entries(data.winds || {})) {
+        const rn = Number(k);
+        if (rn >= 1 && rn <= 12 && WIND[v]) next[rn] = v;
+      }
+      setRaceWinds(next);
+    } catch (e) {
+      setRaceWindsMsg(e?.message || String(e));
+    } finally {
+      setRaceWindsLoading(false);
     }
-  });
+  };
+
+  const saveRaceWind = async (race, value) => {
+    const rn = Number(race);
+    setRaceWinds((p) => ({ ...p, [rn]: value }));
+    if (rn === Number(raceNo)) setWind(value || "無風");
+    setRaceWindsMsg("保存中…");
+    try {
+      const res = await fetch("/api/yoso?action=save_manual_wind", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(authSession?.access_token ? { Authorization: `Bearer ${authSession.access_token}` } : {}),
+        },
+        body: JSON.stringify({ venue, date: raceDate, race: rn, wind: value }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || "風設定の保存に失敗しました");
+      setRaceWindsMsg(`${rn}Rの風を保存しました`);
+    } catch (e) {
+      setRaceWindsMsg(e?.message || String(e));
+    }
+  };
+
   useEffect(() => {
-    try { localStorage.setItem("hunaken_manual_wind_v1", wind); } catch { /* noop */ }
-  }, [wind]);
+    if (venue && raceDate) loadRaceWinds();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [venue, raceDate]);
+
+  useEffect(() => {
+    const selected = raceWinds?.[Number(raceNo)] || "";
+    setWind(selected || "無風");
+  }, [raceNo, raceWinds]);
+
   const [correctionTable, setCorrectionTable] = useState(null);
   const [correctionStatus, setCorrectionStatus] = useState("固定補正");
   const [courses, setCourses] = useState({ 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6 });
@@ -4386,6 +4433,8 @@ export default function App() {
   // AI買い目は結果確定前の時点でレース単位に保存。場別収支はこのスナップショットと確定結果を結合する。
   useEffect(() => {
     if (!aiEval?.bets?.length || !venue || !raceDate || !raceNo) return;
+    const selectedManualWind = raceWinds?.[Number(raceNo)] || "";
+    if (!selectedManualWind) return;
     const payload = {
       venue,
       date: raceDate,
@@ -4393,6 +4442,7 @@ export default function App() {
       bets: aiEval.bets.map((b) => ({ label: b.label, tickets: Array.isArray(b.tickets) ? b.tickets : [] })),
       ranked: aiEval.ranked?.map((r) => ({ boat: r.boat, mark: r.mark })) || [],
       modelVersion: "wake-prob-v1",
+      wind: selectedManualWind,
     };
     const signature = `${raceDate}_${venue}_${raceNo}_${JSON.stringify(payload.bets)}`;
     if (predictionSaveRef.current === signature) return;
@@ -4413,7 +4463,7 @@ export default function App() {
       if (captureAiMode) console.warn("AI予想自動保存:", e?.message || e);
     });
     return () => { cancelled = true; };
-  }, [aiEval, venue, raceDate, raceNo, captureAiMode]);
+  }, [aiEval, venue, raceDate, raceNo, captureAiMode, raceWinds]);
 
   const loadVenueAiLedger = async ({ quiet = false } = {}) => {
     if (!venue || !raceDate) {
@@ -5395,7 +5445,8 @@ export default function App() {
               <>
                 <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 8 }}>
                   {venue}：結果確定 {venueLedger.finalizedRaces || 0}R／AI予想保存 {venueLedger.predictedRaces || 0}R
-                  {(venueLedger.missingPredictions || []).length > 0 && <span>（AI予想未保存 {venueLedger.missingPredictions.length}R）</span>}
+                  {(venueLedger.predictedRaceNos || []).length > 0 && <span>（保存済み：{venueLedger.predictedRaceNos.map((n) => `${n}R`).join("・")}）</span>}
+                  {(venueLedger.missingPredictions || []).length > 0 && <span>（結果確定済みのうちAI予想未保存 {venueLedger.missingPredictions.length}R）</span>}
                 </div>
                 <div style={{ display: "grid", gap: 6 }}>
                   {(venueLedger.patterns || []).map((p) => {
@@ -5550,25 +5601,37 @@ export default function App() {
             );
           })()}
 
-          {/* 風の選択 */}
+          {/* 全レースの風を個別設定 */}
           <div style={{ fontSize: 11, color: "#7da3c8", marginTop: 16, marginBottom: 6 }}>
-            風を選択（完全手動）
+            風を選択（1R〜12R・完全手動）
           </div>
-          <select
-            value={wind}
-            onChange={(e) => setWind(e.target.value)}
-            style={{
-              width: "100%", padding: "11px 12px", fontSize: 16,
-              background: "#16273c", color: "#fff",
-              border: "1px solid #2c4762", borderRadius: 10,
-            }}
-          >
-            {Object.keys(WIND).map((w) => (
-              <option key={w} value={w}>{w}</option>
-            ))}
-          </select>
-          <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 6, lineHeight: 1.5 }}>
-            自動取得・事前取得・レース変更では上書きされません。公式表示を確認して手動で選択してください。
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 7 }}>
+            {Array.from({ length: 12 }, (_, i) => i + 1).map((rn) => {
+              const selected = Number(raceNo) === rn;
+              const value = raceWinds?.[rn] || "";
+              return (
+                <label key={rn} style={{
+                  display: "grid", gridTemplateColumns: "34px minmax(0, 1fr)", gap: 5, alignItems: "center",
+                  padding: "6px", borderRadius: 8,
+                  background: selected ? "rgba(61,122,184,0.22)" : "#0e1b2c",
+                  border: selected ? "1px solid #3d7ab8" : "1px solid #20364d",
+                }}>
+                  <span style={{ fontSize: 11, fontWeight: 900, color: selected ? "#fff" : "#9db5cc", textAlign: "center" }}>{rn}R</span>
+                  <select
+                    value={value}
+                    disabled={raceWindsLoading}
+                    onChange={(e) => saveRaceWind(rn, e.target.value)}
+                    style={{ width: "100%", minWidth: 0, padding: "7px 5px", fontSize: 11, background: "#16273c", color: value ? "#fff" : "#ffb3ad", border: "1px solid #2c4762", borderRadius: 6 }}
+                  >
+                    <option value="">未設定</option>
+                    {Object.keys(WIND).map((w) => <option key={w} value={w}>{w}</option>)}
+                  </select>
+                </label>
+              );
+            })}
+          </div>
+          <div style={{ fontSize: 10, color: raceWindsMsg.includes("失敗") ? "#ff8a80" : "#7da3c8", marginTop: 6, lineHeight: 1.5 }}>
+            {raceWindsLoading ? "保存済みの風設定を読込中…" : raceWindsMsg || "各レースの風を選ぶとSupabaseへ保存され、サーバー側AI保存にも反映されます。未設定レースはAI買い目を保存しません。"}
           </div>
 
         </div>
