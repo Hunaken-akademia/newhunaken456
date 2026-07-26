@@ -4487,7 +4487,13 @@ export default function App() {
     if (captureAiMode) {
       window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "saving", date: targetDate, venue: targetVenue, race: targetRace };
     }
-    fetch("/api/yoso?action=save_ai_prediction", {
+    const saveAiQuery = new URLSearchParams({
+      action: "save_ai_prediction",
+      venue: targetVenue,
+      race: String(targetRace),
+      date: targetDate,
+    });
+    fetch(`/api/yoso?${saveAiQuery.toString()}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
