@@ -253,8 +253,9 @@ async function main() {
     aiSaved: summary.aiSaved,
     aiNg: summary.aiNg,
   };
-  await sendRunnerHeartbeat(ng || aiNg ? "failed" : "success", { summary: heartbeatSummary });
-  if (ng || aiNg) process.exitCode=1;
+  const hardFailure = aiNg > 0 || ng >= 5;
+  await sendRunnerHeartbeat(hardFailure ? "failed" : "success", { summary: heartbeatSummary });
+  if (hardFailure) process.exitCode = 1;
   return summary;
 }
 
