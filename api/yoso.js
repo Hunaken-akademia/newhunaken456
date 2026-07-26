@@ -668,6 +668,66 @@ async function saveManualWind({ venue, ymd, raceNo, wind }) {
   return { ok: true };
 }
 
+function normalizeCaptureRunnerName(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .slice(0, 64);
+}
+
+function captureRunnerHeartbeatKey(runner) {
+  return `capture_runner:${normalizeCaptureRunnerName(runner)}`;
+}
+
+async function saveCaptureRunnerHeartbeat({ runner, state, runId = "", startedAt = "", finishedAt = "", summary = null, error = "" }) {
+  if (!ENABLE_PERSISTENT_CACHE) throw new Error("Supabase永続キャッシュが未設定です");
+  const safeRunner = normalizeCaptureRunnerName(runner);
+  const allowedStates = new Set(["running", "success", "failed", "skipped"]);
+  const safeState = allowedStates.has(String(state || "")) ? String(state) : "running";
+  if (!safeRunner) throw new Error("runner を指定してください");
+  const now = new Date();
+  const payload = {
+    runner: safeRunner,
+    state: safeState,
+    runId: String(runId || "").slice(0, 160),
+    startedAt: String(startedAt || "").slice(0, 40),
+    finishedAt: String(finishedAt || "").slice(0, 40),
+    summary: summary && typeof summary === "object" ? summary : null,
+    error: String(error || "").slice(0, 1000),
+    updatedAt: now.toISOString(),
+  };
+  const body = [{
+    cache_key: captureRunnerHeartbeatKey(safeRunner),
+    cache_type: "capture_runner",
+    race_date: null,
+    venue: null,
+    race_no: null,
+    payload,
+    expires_at: new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000).toISOString(),
+    stale_expires_at: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    updated_at: now.toISOString(),
+  }];
+  await supabaseCacheRequest("yoso_cache?on_conflict=cache_key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify(body),
+  });
+  return payload;
+}
+
+async function readCaptureRunnerHeartbeat(runner) {
+  if (!ENABLE_PERSISTENT_CACHE) throw new Error("Supabase永続キャッシュが未設定です");
+  const safeRunner = normalizeCaptureRunnerName(runner);
+  if (!safeRunner) throw new Error("runner を指定してください");
+  const rows = await supabaseCacheRequest(
+    `yoso_cache?cache_key=eq.${encodeURIComponent(captureRunnerHeartbeatKey(safeRunner))}&select=payload,updated_at&limit=1`
+  );
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row?.payload) return null;
+  return { ...row.payload, updatedAt: row.payload.updatedAt || row.updated_at || "" };
+}
+
 async function readPersistentCache(key) {
   if (!ENABLE_PERSISTENT_CACHE) return null;
   try {
@@ -3766,6 +3826,56 @@ export default async function handler(req, res) {
       }
       const winds = await readManualWinds({ venue, ymd });
       res.status(200).json({ ok: true, action: "manual_winds", date: ymd, venue, winds, fetchedAt: new Date().toISOString() });
+      return;
+    }
+
+    if (action === "capture_runner_status") {
+      res.setHeader("Cache-Control", "no-store");
+      if (!captureAuthorized(req)) {
+        res.status(401).json({ ok: false, error: "Unauthorized capture request" });
+        return;
+      }
+      const runner = normalizeCaptureRunnerName(req.query?.runner);
+      if (!runner) {
+        res.status(400).json({ ok: false, error: "runner を指定してください" });
+        return;
+      }
+      const heartbeat = await readCaptureRunnerHeartbeat(runner);
+      res.status(200).json({
+        ok: true,
+        action: "capture_runner_status",
+        runner,
+        found: !!heartbeat,
+        heartbeat,
+        fetchedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (action === "capture_runner_heartbeat") {
+      res.setHeader("Cache-Control", "no-store");
+      if (String(req.method || "GET").toUpperCase() !== "POST") {
+        res.status(405).json({ ok: false, error: "POST only" });
+        return;
+      }
+      if (!captureAuthorized(req)) {
+        res.status(401).json({ ok: false, error: "Unauthorized capture request" });
+        return;
+      }
+      let body = req.body;
+      if (typeof body === "string") {
+        try { body = JSON.parse(body || "{}"); } catch { body = {}; }
+      }
+      const heartbeat = await saveCaptureRunnerHeartbeat({
+        runner: body?.runner,
+        state: body?.state,
+        runId: body?.runId,
+        startedAt: body?.startedAt,
+        finishedAt: body?.finishedAt,
+        summary: body?.summary,
+        error: body?.error,
+      });
+      res.status(200).json({ ok: true, action: "capture_runner_heartbeat", heartbeat });
       return;
     }
 

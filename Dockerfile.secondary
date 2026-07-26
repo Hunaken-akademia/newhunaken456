@@ -1,0 +1,22 @@
+FROM node:22-bookworm-slim
+
+WORKDIR /app
+
+# 副系に必要なのはPlaywrightだけ。アプリ本体の依存関係とは分離する。
+COPY cloudrun/package-secondary.json ./package.json
+RUN npm install --omit=dev --no-audit --no-fund
+RUN npx playwright install --with-deps chromium
+
+COPY pipeline ./pipeline
+
+ENV NODE_ENV=production
+ENV RUNNER_NAME=cloud-run-secondary
+ENV PRIMARY_RUNNER_NAME=github-actions-primary
+ENV SECONDARY_RUNNER_NAME=cloud-run-secondary
+ENV PRIMARY_MAX_AGE_MINUTES=7
+ENV RUNNING_MAX_AGE_MINUTES=20
+ENV CAPTURE_CONCURRENCY=5
+ENV AI_CAPTURE_CONCURRENCY=2
+ENV AI_SAVE_BEFORE_MINUTES=20
+
+CMD ["node", "pipeline/secondary_watchdog.mjs"]

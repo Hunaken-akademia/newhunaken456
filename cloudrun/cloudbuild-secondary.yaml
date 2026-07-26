@@ -1,0 +1,17 @@
+substitutions:
+  _REGION: asia-northeast1
+  _REPOSITORY: hunaken-jobs
+  _IMAGE: capture-all-active-races-secondary
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.secondary
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest
+      - .
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest

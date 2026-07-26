@@ -1,0 +1,193 @@
+# 舟券アカデミア：GitHub Actions＋Google Cloud Run 完全二重化
+
+## 目的
+
+自動取得・AI保存の実行基盤を次の2系統にします。
+
+- **主系**：GitHub Actions（JST 07:02〜翌00:57、5分間隔）
+- **副系**：Google Cloud Scheduler＋Cloud Run Job（JST 07:00〜翌00:55、5分間隔）
+
+副系は毎回いきなり全処理を行いません。Supabaseの既存 `yoso_cache` に保存された主系ハートビートを確認し、次の条件で動きます。
+
+- 主系が7分以内に成功：副系はスキップ
+- 主系が20分以内で実行中：副系はスキップ
+- 主系が失敗・未実行・7分超過：副系が同じ全場処理を実行
+- 主系状態の確認自体が失敗：安全側で副系を実行
+
+両方が重なっても、展示・結果・AI予想は既存の主キー／upsertで保存されるため、同一レースの行が無制限に増える構成ではありません。
+
+> これは「スケジューラと実行環境」の二重化です。Vercel、Supabase、公式サイトまで別系統になるわけではないため、外部サービス全体の同時障害までは回避できません。
+
+## 変更ファイル
+
+- `.github/workflows/capture-all-active-races.yml`
+- `api/yoso.js`
+- `pipeline/capture_all_active_races.mjs`
+- `pipeline/secondary_watchdog.mjs`（新規）
+- `Dockerfile.secondary`（新規）
+- `cloudrun/cloudbuild-secondary.yaml`（新規）
+- `cloudrun/package-secondary.json`（新規）
+- `cloudrun/setup_secondary.sh`（新規）
+- `cloudrun/update_auth_session.sh`（新規）
+
+## SQL
+
+**追加SQLはありません。**
+
+すでに手動風設定で使用している `yoso_cache` に、`cache_type=capture_runner` のハートビート行を追加します。既存テーブル・列の削除や変更はありません。
+
+## 反映順序
+
+### 1. 差分ファイルをGitHubへ上書き
+
+ZIP内のフォルダ構成を保ったまま、同じ場所へ上書きしてcommitします。
+
+### 2. Vercelのデプロイ完了を待つ
+
+`api/yoso.js` にハートビートAPIが追加されるため、先にVercelのデプロイを完了させます。
+
+### 3. GitHub Actionsを1回手動実行
+
+GitHubで以下を実行します。
+
+```text
+Actions
+→ capture-all-active-races
+→ Run workflow
+```
+
+ログ先頭に次が出れば主系名が反映されています。
+
+```text
+capture-all-active-races start runner=github-actions-primary
+```
+
+### 4. Google Cloud側を作成
+
+Google Cloudプロジェクトは課金を有効にしておく必要があります。
+
+Cloud Shellでリポジトリを開き、リポジトリ直下で実行します。
+
+```bash
+bash cloudrun/setup_secondary.sh
+```
+
+順番に次の3点を入力します。
+
+1. 舟券アカデミア本番URL
+2. GitHubと同じ `CAPTURE_TOKEN`
+3. `AUTOMATION_AUTH_SESSION_JSON` のJSON全体
+
+秘密情報はファイルへ書き込まず、Google Secret Managerへ保存されます。
+
+スクリプトは次を自動作成します。
+
+- Artifact Registry
+- Cloud Buildコンテナ
+- Cloud Run Job
+- 実行用サービスアカウント
+- Scheduler用サービスアカウント
+- Secret Managerの2秘密
+- 07:00〜23:55用Scheduler
+- 00:00〜00:55用Scheduler
+
+## 動作確認
+
+### 通常監視の確認
+
+```bash
+gcloud run jobs execute hunaken-capture-secondary \
+  --region=asia-northeast1 \
+  --wait
+```
+
+直近7分以内にGitHubが成功していれば、次のログで正常です。
+
+```text
+SECONDARY SKIP: primary success is fresh
+```
+
+### 副系の本体処理を強制テスト
+
+一時的に強制実行を有効にします。
+
+```bash
+gcloud run jobs update hunaken-capture-secondary \
+  --region=asia-northeast1 \
+  --update-env-vars=FORCE_SECONDARY_RUN=1
+
+gcloud run jobs execute hunaken-capture-secondary \
+  --region=asia-northeast1 \
+  --wait
+
+gcloud run jobs update hunaken-capture-secondary \
+  --region=asia-northeast1 \
+  --remove-env-vars=FORCE_SECONDARY_RUN
+```
+
+成功時はCloud Runログに次が出ます。
+
+```text
+SECONDARY RUN start
+capture-all-active-races start runner=cloud-run-secondary
+AI SAVED ○○○R
+```
+
+最終集計は次の形です。
+
+```json
+{
+  "runner": "cloud-run-secondary",
+  "ng": 0,
+  "aiNg": 0
+}
+```
+
+### 主系停止を使った実地テスト
+
+GitHub Actionsのworkflowを一時的にDisableし、8〜10分待ちます。Cloud Runログに `SECONDARY RUN start` が出れば切替成功です。確認後はGitHub workflowを必ずEnableへ戻します。
+
+## Schedulerの状態確認
+
+```bash
+gcloud scheduler jobs list --location=asia-northeast1
+```
+
+次の2件が `ENABLED` なら設定済みです。
+
+- `hunaken-capture-secondary-day`
+- `hunaken-capture-secondary-midnight`
+
+## AUTOMATION_AUTH_SESSION_JSONを更新する時
+
+ログインセッションを取り直した場合は、Cloud Shellで次を実行します。
+
+```bash
+bash cloudrun/update_auth_session.sh
+```
+
+GitHub側の `AUTOMATION_AUTH_SESSION_JSON` も同じ新しいJSONへ更新してください。
+
+## 再デプロイ
+
+コードを変更した後は、Cloud Shellで次を実行します。
+
+```bash
+gcloud builds submit \
+  --config=cloudrun/cloudbuild-secondary.yaml \
+  --substitutions=_REGION=asia-northeast1,_REPOSITORY=hunaken-jobs,_IMAGE=capture-all-active-races-secondary \
+  .
+
+gcloud run jobs update hunaken-capture-secondary \
+  --region=asia-northeast1 \
+  --image=asia-northeast1-docker.pkg.dev/$(gcloud config get-value project)/hunaken-jobs/capture-all-active-races-secondary:latest
+```
+
+## 保存・再試行仕様
+
+- GitHub Actions：失敗時は次の5分間隔実行で再試行
+- Cloud Run Job：1回の実行失敗につき1回再試行
+- 主系の成功が7分以上確認できない：次の副系Schedulerで処理
+- 公式結果未確定：当日中の以後の実行で再取得
+- 手動風未設定：AI買い目だけスキップし、展示・オッズ・結果取得は継続
+- 公式払戻金未取得：未精算のまま再取得し、保存オッズによる代替精算はしない
