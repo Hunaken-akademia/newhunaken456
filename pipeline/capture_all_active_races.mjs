@@ -47,7 +47,10 @@ for (const s of schedules) {
   for (const r of s.schedule) {
     const left = Number(r.deadlineMinutes) - now.minutes;
     // 展示公開前後は繰り返し取得。締切後も90分間は結果・確定オッズを再確認する。
-    if (left <= 30 && left >= -90) jobs.push({ venue:s.venue, race:Number(r.race), left, final:left <= -1 });
+    const race = Number(r.race);
+    if (left <= 30 && left >= -90 && Number.isInteger(race) && race >= 1 && race <= 12) {
+      jobs.push({ venue:s.venue, race, left, final:left <= -1 });
+    }
   }
 }
 
@@ -91,7 +94,35 @@ const results = await mapLimit(jobs, CONCURRENCY, async j => {
 
 // AI買い目は、利用者のブラウザではなくGitHub Actions上のヘッドレスChromiumで保存する。
 // capture_ai=1 は src/App.jsx の本番評価ロジックをそのまま実行するため、サーバー用の複製ロジックとの乖離が起きない。
-const aiTargets = results.filter((x) => x?.ok && !x.final && x.left <= AI_SAVE_BEFORE_MINUTES && x.left >= 2 && x.rows >= 6 && x.odds >= 10);
+const aiCandidates = results.filter((x) =>
+  x?.ok &&
+  !x.final &&
+  Number.isInteger(Number(x.race)) &&
+  Number(x.race) >= 1 &&
+  Number(x.race) <= 12 &&
+  x.left <= AI_SAVE_BEFORE_MINUTES &&
+  x.left >= 2 &&
+  x.rows >= 6 &&
+  x.odds >= 10
+);
+
+// 風は完全手動。レース別の風が保存済みの対象だけAI保存する。
+const windsByVenue = new Map();
+for (const venue of [...new Set(aiCandidates.map((x) => x.venue))]) {
+  try {
+    const q = new URLSearchParams({ action: "manual_winds", venue, date: now.date, t: String(Date.now()) });
+    const data = await getJson(`${BASE}/api/yoso?${q}`);
+    windsByVenue.set(venue, data.winds || {});
+  } catch (e) {
+    console.warn(`manual wind load failed: ${venue}: ${e.message || e}`);
+    windsByVenue.set(venue, {});
+  }
+}
+const aiTargets = aiCandidates.filter((x) => {
+  const wind = String(windsByVenue.get(x.venue)?.[String(x.race)] || windsByVenue.get(x.venue)?.[x.race] || "").trim();
+  if (!wind) console.log(`AI SKIP ${x.venue}${x.race}R: manual wind is not set`);
+  return !!wind;
+});
 let aiResults = [];
 if (aiTargets.length && AUTH_SESSION_JSON) {
   let session;
@@ -116,11 +147,17 @@ if (aiTargets.length && AUTH_SESSION_JSON) {
       try {
         await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
         await page.waitForFunction(() => document.body && !document.body.innerText.includes("ログイン状態と購入者情報を確認中"), null, { timeout: 45000 });
-        const deadline = Date.now() + 90000;
-        while (!saveResponse && Date.now() < deadline) await page.waitForTimeout(1000);
+        const deadline = Date.now() + 120000;
+        let pageStatus = null;
+        while (!saveResponse && Date.now() < deadline) {
+          pageStatus = await page.evaluate(() => window.__HUNAKEN_AI_CAPTURE_STATUS__ || null).catch(() => null);
+          if (pageStatus?.state === "error") throw new Error(pageStatus.error || "AI capture page error");
+          await page.waitForTimeout(1000);
+        }
         if (!saveResponse || saveResponse.status >= 300 || !saveResponse.body?.ok) {
           const bodyText = (await page.locator("body").innerText().catch(() => "")).slice(0, 300);
-          throw new Error(saveResponse?.body?.error || saveResponse?.body?.reason || `AI save timeout/status ${saveResponse?.status || "none"}: ${bodyText}`);
+          const statusText = pageStatus?.state ? ` page=${pageStatus.state}` : "";
+          throw new Error(saveResponse?.body?.error || saveResponse?.body?.reason || `AI save timeout/status ${saveResponse?.status || "none"}${statusText}: ${bodyText}`);
         }
         console.log(`AI SAVED ${j.venue}${j.race}R left=${j.left}`);
         return { ok:true, venue:j.venue, race:j.race };

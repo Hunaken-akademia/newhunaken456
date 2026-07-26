@@ -1603,6 +1603,19 @@ export default function App() {
   const [captureAiMode] = useState(() => {
     try { return new URLSearchParams(window.location.search).get("capture_ai") === "1"; } catch { return false; }
   });
+  const [captureAiTarget] = useState(() => {
+    try {
+      const qs = new URLSearchParams(window.location.search);
+      const race = Number(qs.get("race"));
+      return {
+        date: qs.get("date") || "",
+        venue: qs.get("venue") || "",
+        race: Number.isInteger(race) && race >= 1 && race <= 12 ? race : null,
+      };
+    } catch {
+      return { date: "", venue: "", race: null };
+    }
+  });
   const [venueNotHeld, setVenueNotHeld] = useState(false);
   const [officialSchedule, setOfficialSchedule] = useState(null);
   const [venueStatuses, setVenueStatuses] = useState({});
@@ -2547,11 +2560,14 @@ export default function App() {
   useEffect(() => {
     if (!captureAiMode) return;
     let cancelled = false;
-    const qs = new URLSearchParams(window.location.search);
-    const d = qs.get("date") || activeRaceDateValue();
-    const v = qs.get("venue") || "";
-    const r = qs.get("race") || "";
-    if (!v || !r) return;
+    const d = captureAiTarget.date || activeRaceDateValue();
+    const v = captureAiTarget.venue;
+    const r = captureAiTarget.race;
+    if (!v || !r) {
+      window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "error", error: "capture URLのvenue/raceが不正です" };
+      return;
+    }
+    window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "loading", date: d, venue: v, race: r };
     setAutoRefreshEnabled(false);
     setRaceDate(d);
     setVenue(v);
@@ -2559,8 +2575,8 @@ export default function App() {
     setReviewMode(true);
     preloadReviewSnapshots(d, { force: true }).then(() => {
       if (cancelled) return;
-      if (!applyCachedReviewSnapshot(v, r, d)) {
-        fetchOfficialYoso({ venue: v, raceNo: r, raceDate: d, force: true, ignoreSalesEnded: true });
+      if (!applyCachedReviewSnapshot(v, String(r), d)) {
+        fetchOfficialYoso({ venue: v, raceNo: String(r), raceDate: d, force: true, ignoreSalesEnded: true });
       }
     });
     return () => { cancelled = true; };
@@ -4432,22 +4448,45 @@ export default function App() {
 
   // AI買い目は結果確定前の時点でレース単位に保存。場別収支はこのスナップショットと確定結果を結合する。
   useEffect(() => {
-    if (!aiEval?.bets?.length || !venue || !raceDate || !raceNo) return;
-    const selectedManualWind = raceWinds?.[Number(raceNo)] || "";
-    if (!selectedManualWind) return;
+    const targetVenue = captureAiMode ? captureAiTarget.venue : venue;
+    const targetDate = captureAiMode ? (captureAiTarget.date || raceDate) : raceDate;
+    const targetRace = captureAiMode ? captureAiTarget.race : Number(raceNo);
+
+    if (!targetVenue || !targetDate || !Number.isInteger(targetRace) || targetRace < 1 || targetRace > 12) return;
+    // captureモードでは、別レースの状態で誤保存しない。
+    if (captureAiMode && (venue !== targetVenue || raceDate !== targetDate || Number(raceNo) !== targetRace)) return;
+    if (!aiEval?.bets?.length) return;
+
+    const selectedManualWind = raceWinds?.[targetRace] || "";
+    if (!selectedManualWind) {
+      if (captureAiMode && !raceWindsLoading) {
+        window.__HUNAKEN_AI_CAPTURE_STATUS__ = {
+          state: "waiting_wind",
+          date: targetDate,
+          venue: targetVenue,
+          race: targetRace,
+          error: "このレースの風が未設定です",
+        };
+      }
+      return;
+    }
+
     const payload = {
-      venue,
-      date: raceDate,
-      race: Number(raceNo),
+      venue: targetVenue,
+      date: targetDate,
+      race: targetRace,
       bets: aiEval.bets.map((b) => ({ label: b.label, tickets: Array.isArray(b.tickets) ? b.tickets : [] })),
       ranked: aiEval.ranked?.map((r) => ({ boat: r.boat, mark: r.mark })) || [],
       modelVersion: "wake-prob-v1",
       wind: selectedManualWind,
     };
-    const signature = `${raceDate}_${venue}_${raceNo}_${JSON.stringify(payload.bets)}`;
+    const signature = `${targetDate}_${targetVenue}_${targetRace}_${JSON.stringify(payload.bets)}`;
     if (predictionSaveRef.current === signature) return;
     predictionSaveRef.current = signature;
     let cancelled = false;
+    if (captureAiMode) {
+      window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "saving", date: targetDate, venue: targetVenue, race: targetRace };
+    }
     fetch("/api/yoso?action=save_ai_prediction", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4455,15 +4494,28 @@ export default function App() {
     }).then(async (res) => {
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) throw new Error(data.error || data.reason || "AI予想保存失敗");
-      if (!cancelled && captureAiMode && window.parent !== window) {
-        window.parent.postMessage({ type: "hunaken-ai-prediction-saved", date: raceDate, venue, race: Number(raceNo) }, window.location.origin);
+      if (!cancelled && captureAiMode) {
+        window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "saved", date: targetDate, venue: targetVenue, race: targetRace };
+        if (window.parent !== window) {
+          window.parent.postMessage({ type: "hunaken-ai-prediction-saved", date: targetDate, venue: targetVenue, race: targetRace }, window.location.origin);
+        }
       }
     }).catch((e) => {
       predictionSaveRef.current = "";
-      if (captureAiMode) console.warn("AI予想自動保存:", e?.message || e);
+      if (captureAiMode) {
+        window.__HUNAKEN_AI_CAPTURE_STATUS__ = {
+          state: "error",
+          date: targetDate,
+          venue: targetVenue,
+          race: targetRace,
+          error: e?.message || String(e),
+        };
+        console.warn("AI予想自動保存:", e?.message || e);
+      }
     });
     return () => { cancelled = true; };
-  }, [aiEval, venue, raceDate, raceNo, captureAiMode, raceWinds]);
+  }, [aiEval, venue, raceDate, raceNo, captureAiMode, captureAiTarget, raceWinds, raceWindsLoading]);
+
 
   const loadVenueAiLedger = async ({ quiet = false } = {}) => {
     if (!venue || !raceDate) {
