@@ -40,4 +40,6 @@ jobs:
           CAPTURE_CONCURRENCY: "5"
           AI_CAPTURE_CONCURRENCY: "2"
           AI_SAVE_BEFORE_MINUTES: "20"
+          RUNNER_NAME: "github-actions-primary"
+          RUN_ID: "github-${{ github.run_id }}-${{ github.run_attempt }}"
         run: node pipeline/capture_all_active_races.mjs
