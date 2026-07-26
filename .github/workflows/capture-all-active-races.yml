@@ -43,3 +43,4 @@ jobs:
           RUNNER_NAME: "github-actions-primary"
           RUN_ID: "github-${{ github.run_id }}-${{ github.run_attempt }}"
         run: node pipeline/capture_all_active_races.mjs
+# GitHub schedule automatic capture
