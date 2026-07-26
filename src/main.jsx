@@ -1,5 +1,18 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App.jsx";
+import ErrorBoundary from "./ErrorBoundary.jsx";
 
-createRoot(document.getElementById("root")).render(<App />);
+const rootElement = document.getElementById("root");
+
+if (!rootElement) {
+  throw new Error("root要素が見つかりません");
+}
+
+createRoot(rootElement).render(
+  <React.StrictMode>
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  </React.StrictMode>
+);
