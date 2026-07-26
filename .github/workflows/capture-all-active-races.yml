@@ -3,8 +3,10 @@ name: capture-all-active-races
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 22-23 * * *"
-    - cron: "*/5 0-15 * * *"
+    # JST 07:00〜08:45
+    - cron: "*/15 22-23 * * *"
+    # JST 09:00〜翌00:45
+    - cron: "*/15 0-15 * * *"
 
 concurrency:
   group: capture-all-active-races
@@ -34,9 +36,14 @@ jobs:
           APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
           CAPTURE_TOKEN: ${{ secrets.CAPTURE_TOKEN }}
           AUTOMATION_AUTH_SESSION_JSON: ${{ secrets.AUTOMATION_AUTH_SESSION_JSON }}
+
           CAPTURE_CONCURRENCY: "5"
           AI_CAPTURE_CONCURRENCY: "2"
-          AI_SAVE_BEFORE_MINUTES: "20"
+
+          # 15分間隔でも取りこぼしにくいよう、締切30分前からAI保存対象
+          AI_SAVE_BEFORE_MINUTES: "30"
+
           RUNNER_NAME: "github-actions-primary"
           RUN_ID: "github-${{ github.run_id }}-${{ github.run_attempt }}"
+
         run: node pipeline/capture_all_active_races.mjs
