@@ -488,9 +488,8 @@ async function buildVenueAiLedger({ venue, ymd, honmeiPoints = 6, taikouPoints =
         s.hit += 1;
         if (Number.isFinite(payoutPer100) && payoutPer100 > 0) {
           s.ret += payoutPer100;
-        } else if (Number.isFinite(decimalOdds) && decimalOdds > 0) {
-          s.ret += Math.round(decimalOdds * 100);
         }
+        // 公式払戻金が未取得のレースは未精算のままにし、保存オッズでは代替しない。
       }
     }
     details.push({
@@ -499,7 +498,7 @@ async function buildVenueAiLedger({ venue, ymd, honmeiPoints = 6, taikouPoints =
       predictionSaved: true,
       odds: Number.isFinite(decimalOdds) ? decimalOdds : null,
       payoutPer100: Number.isFinite(payoutPer100) ? payoutPer100 : null,
-      payoutSource: officialPayout?.source || (Number.isFinite(decimalOdds) ? "odds_fallback" : ""),
+      payoutSource: officialPayout?.source || "official_payout_pending",
     });
   }
 

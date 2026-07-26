@@ -6,6 +6,9 @@ const VENUES = [
 const BASE = String(process.env.APP_BASE_URL || "https://newhunaken456.vercel.app").replace(/\/$/, "");
 const TOKEN = String(process.env.CAPTURE_TOKEN || "");
 const CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.CAPTURE_CONCURRENCY || 5)));
+const AI_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.AI_CAPTURE_CONCURRENCY || 2)));
+const AUTH_SESSION_JSON = String(process.env.AUTOMATION_AUTH_SESSION_JSON || "").trim();
+const AI_SAVE_BEFORE_MINUTES = Math.max(5, Math.min(30, Number(process.env.AI_SAVE_BEFORE_MINUTES || 20)));
 
 function jstNow() {
   const p = new Intl.DateTimeFormat("ja-JP", { timeZone:"Asia/Tokyo", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hour12:false })
@@ -83,10 +86,57 @@ const results = await mapLimit(jobs, CONCURRENCY, async j => {
     }
   }
   console.log(`OK ${j.venue}${j.race}R left=${j.left} final=${j.final} rows=${rows} odds=${data.oddsCount||0} result=${resultCompleted ? "confirmed" : (j.final ? "pending" : "-")}`);
-  return {ok:true,...j,rows,odds:data.oddsCount||0,resultCompleted,resultReason};
+  return {ok:true,...j,rows,odds:data.oddsCount||0,resultCompleted,resultReason, displayDisabled:!!data.displayDisabled, displayReasonCode:data.displayReasonCode||""};
 });
+
+// AI買い目は、利用者のブラウザではなくGitHub Actions上のヘッドレスChromiumで保存する。
+// capture_ai=1 は src/App.jsx の本番評価ロジックをそのまま実行するため、サーバー用の複製ロジックとの乖離が起きない。
+const aiTargets = results.filter((x) => x?.ok && !x.final && x.left <= AI_SAVE_BEFORE_MINUTES && x.left >= 2 && x.rows >= 6 && x.odds >= 10);
+let aiResults = [];
+if (aiTargets.length && AUTH_SESSION_JSON) {
+  let session;
+  try { session = JSON.parse(AUTH_SESSION_JSON); } catch { throw new Error("AUTOMATION_AUTH_SESSION_JSON is not valid JSON"); }
+  if (!session?.access_token) throw new Error("AUTOMATION_AUTH_SESSION_JSON.access_token is required");
+  const { chromium } = await import("playwright");
+  const browser = await chromium.launch({ headless: true });
+  try {
+    aiResults = await mapLimit(aiTargets, AI_CONCURRENCY, async (j) => {
+      const context = await browser.newContext();
+      await context.addInitScript(({ session }) => {
+        localStorage.setItem("hunaken_paid_auth_session_v1", JSON.stringify(session));
+      }, { session });
+      const page = await context.newPage();
+      const targetUrl = `${BASE}/?capture_ai=1&date=${encodeURIComponent(now.date)}&venue=${encodeURIComponent(j.venue)}&race=${j.race}`;
+      let saveResponse = null;
+      page.on("response", async (response) => {
+        if (!response.url().includes("/api/yoso?action=save_ai_prediction")) return;
+        try { saveResponse = { status: response.status(), body: await response.json() }; }
+        catch { saveResponse = { status: response.status(), body: {} }; }
+      });
+      try {
+        await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.waitForFunction(() => document.body && !document.body.innerText.includes("ログイン状態と購入者情報を確認中"), null, { timeout: 45000 });
+        const deadline = Date.now() + 90000;
+        while (!saveResponse && Date.now() < deadline) await page.waitForTimeout(1000);
+        if (!saveResponse || saveResponse.status >= 300 || !saveResponse.body?.ok) {
+          const bodyText = (await page.locator("body").innerText().catch(() => "")).slice(0, 300);
+          throw new Error(saveResponse?.body?.error || saveResponse?.body?.reason || `AI save timeout/status ${saveResponse?.status || "none"}: ${bodyText}`);
+        }
+        console.log(`AI SAVED ${j.venue}${j.race}R left=${j.left}`);
+        return { ok:true, venue:j.venue, race:j.race };
+      } finally {
+        await context.close();
+      }
+    });
+  } finally {
+    await browser.close();
+  }
+} else if (aiTargets.length) {
+  console.warn(`AI capture skipped: AUTOMATION_AUTH_SESSION_JSON is not set (${aiTargets.length} targets)`);
+}
 
 const ok=results.filter(x=>x?.ok).length;
 const ng=results.length-ok;
-console.log(JSON.stringify({date:now.date,jobs:jobs.length,ok,ng,errors:results.filter(x=>!x?.ok).slice(0,10)},null,2));
-if (ng) process.exitCode=1;
+const aiNg=aiResults.filter(x=>!x?.ok).length;
+console.log(JSON.stringify({date:now.date,jobs:jobs.length,ok,ng,aiTargets:aiTargets.length,aiSaved:aiResults.filter(x=>x?.ok).length,aiNg,errors:results.filter(x=>!x?.ok).slice(0,10),aiErrors:aiResults.filter(x=>!x?.ok).slice(0,10)},null,2));
+if (ng || aiNg) process.exitCode=1;
