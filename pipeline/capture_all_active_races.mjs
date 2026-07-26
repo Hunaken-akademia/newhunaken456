@@ -46,25 +46,32 @@ for (const s of schedules) {
   if (!s?.venue || s.noRace || !Array.isArray(s.schedule)) continue;
   for (const r of s.schedule) {
     const left = Number(r.deadlineMinutes) - now.minutes;
-    // 展示公開前後は繰り返し取得。締切後も90分間は結果・確定オッズを再確認する。
+    // 展示・オッズは締切30分前〜締切後90分まで取得する。
+    // 公式結果は一時的な取得失敗を取り残さないよう、当日の終了済み全レースを毎回確認する。
     const race = Number(r.race);
-    if (left <= 30 && left >= -90 && Number.isInteger(race) && race >= 1 && race <= 12) {
-      jobs.push({ venue:s.venue, race, left, final:left <= -1 });
+    const captureNeeded = left <= 30 && left >= -90;
+    const resultNeeded = left <= -1;
+    if ((captureNeeded || resultNeeded) && Number.isInteger(race) && race >= 1 && race <= 12) {
+      jobs.push({ venue:s.venue, race, left, final:resultNeeded, captureNeeded });
     }
   }
 }
 
-console.log(`capture jobs=${jobs.length}`);
+console.log(`capture/result jobs=${jobs.length}`);
 const results = await mapLimit(jobs, CONCURRENCY, async j => {
-  const q = new URLSearchParams({ action:"capture", venue:j.venue, race:String(j.race), date:now.date, final:j.final?"1":"0", t:String(Date.now()) });
-  let data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
-  let rows = Array.isArray(data.rows) ? data.rows.length : 0;
-  // ナイター場などで展示公開が遅れる場合、締切15分前以降だけ同一run内で再確認する。
-  if (rows < 6 && j.left <= 15 && j.left >= -2) {
-    await new Promise((resolve) => setTimeout(resolve, 35000));
-    q.set("t", String(Date.now()));
+  let data = { rows: [], oddsCount: 0 };
+  let rows = 0;
+  if (j.captureNeeded) {
+    const q = new URLSearchParams({ action:"capture", venue:j.venue, race:String(j.race), date:now.date, final:j.final?"1":"0", t:String(Date.now()) });
     data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
     rows = Array.isArray(data.rows) ? data.rows.length : 0;
+    // ナイター場などで展示公開が遅れる場合、締切15分前以降だけ同一run内で再確認する。
+    if (rows < 6 && j.left <= 15 && j.left >= -2) {
+      await new Promise((resolve) => setTimeout(resolve, 35000));
+      q.set("t", String(Date.now()));
+      data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
+      rows = Array.isArray(data.rows) ? data.rows.length : 0;
+    }
   }
   let resultCompleted = false;
   let resultReason = "";

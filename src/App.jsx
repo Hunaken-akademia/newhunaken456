@@ -4487,13 +4487,13 @@ export default function App() {
     if (captureAiMode) {
       window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "saving", date: targetDate, venue: targetVenue, race: targetRace };
     }
-    const saveAiQuery = new URLSearchParams({
+    const saveAiQs = new URLSearchParams({
       action: "save_ai_prediction",
       venue: targetVenue,
-      race: String(targetRace),
       date: targetDate,
+      race: String(targetRace),
     });
-    fetch(`/api/yoso?${saveAiQuery.toString()}`, {
+    fetch(`/api/yoso?${saveAiQs.toString()}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -5508,8 +5508,7 @@ export default function App() {
                 </div>
                 <div style={{ display: "grid", gap: 6 }}>
                   {(venueLedger.patterns || []).map((p) => {
-                    const st = venueLedger.stats?.[p.key];
-                    if (!st || !st.races) return null;
+                    const st = venueLedger.stats?.[p.key] || { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
                     const roi = st.spent ? st.ret / st.spent * 100 : 0;
                     const hitRate = st.races ? st.hit / st.races * 100 : 0;
                     return (
