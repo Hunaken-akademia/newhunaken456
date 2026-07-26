@@ -1,0 +1,44 @@
+# 自動実行を確実に近づける設定
+
+GitHub Actions の `schedule` だけでは、GitHub側の都合で遅延することがあります。
+このZIPでは、混雑しやすい毎時00・05・10分を避けて、02・07・12…57分に変更しています。
+
+ただし、確実性を上げるには外部cronから `workflow_dispatch` も5分ごとに呼び、GitHub scheduleと二重化してください。
+
+## 外部cronで呼ぶURL
+
+POST
+
+https://api.github.com/repos/＜GitHubユーザー名＞/＜リポジトリ名＞/actions/workflows/capture-all-active-races.yml/dispatches
+
+Headers
+
+Authorization: Bearer ＜GitHubのFine-grained PAT＞
+Accept: application/vnd.github+json
+Content-Type: application/json
+
+Body
+
+{"ref":"main"}
+
+## PATの権限
+
+対象リポジトリだけを選択し、Actionsを Read and write にします。
+トークンの値はチャットや公開画面に貼らないでください。
+
+## 外部cron
+
+cron-job.org や Upstash QStash などで、上記POSTを5分ごとに実行します。
+GitHub側のscheduleも残すため、どちらか一方が遅れてももう一方が起動できます。
+
+## 重複起動
+
+workflowには次があるため、同じ時刻に二重起動しても並列で同じ処理が走りにくい構成です。
+
+concurrency:
+  group: capture-all-active-races
+  cancel-in-progress: false
+
+## 確認
+
+Actions一覧で、実行理由が `workflow_dispatch` の履歴と `schedule` の履歴の両方に増えれば二重化成功です。
