@@ -1,15 +1,28 @@
-# undefined.length 完全対策
+# 確定済みレース一括取得API
 
-## 原因
-進入データが更新途中で6艇未満の配列になった際、`every()` が既存要素だけを検査して通過し、
-不足した艇のコースが `undefined` のまま `courses` に保存されていました。
+追加API:
 
-その後 `lookup(course, diff)` で `TABLES[undefined]` を参照し、
-`rows.length` で画面全体が落ちていました。
+`/api/yoso?action=confirmed_results&date=YYYYMMDD`
 
-## 修正
-1. 進入データは6艇すべて揃い、1〜6が重複なく含まれる場合だけ反映
-2. `lookup()` 側にも防御を追加し、不正コースでもゼロ補正で継続
+必要ヘッダー:
 
-上書き対象:
-- src/App.jsx
+`x-capture-token: CAPTURE_TOKEN`
+
+レスポンス例:
+
+```json
+{
+  "ok": true,
+  "action": "confirmed_results",
+  "count": 2,
+  "confirmedKeys": ["桐生:1", "桐生:2"],
+  "confirmedByVenue": {
+    "桐生": [1, 2]
+  }
+}
+```
+
+判定方法:
+- `race_results` を当日分だけ1回取得
+- 1〜3着が重複なしで3件揃ったレースだけ確定済み扱い
+- 確定済みレースを次回のパイプライン処理から除外するために使用

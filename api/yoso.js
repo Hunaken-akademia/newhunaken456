@@ -245,6 +245,104 @@ async function readReviewSnapshot({ venue, raceNo, ymd }) {
   }
 }
 
+
+async function readConfirmedResultsForDay(ymd, venue = "") {
+  if (!ENABLE_PERSISTENT_CACHE) {
+    return {
+      date: yyyymmdd(ymd),
+      confirmed: [],
+      confirmedKeys: [],
+      confirmedByVenue: {},
+      count: 0,
+    };
+  }
+
+  const targetYmd = yyyymmdd(ymd);
+  const raceDate = ymdToDate(targetYmd);
+  if (!raceDate) throw new Error("日付が不正です");
+
+  const filters = [
+    `race_date=eq.${encodeURIComponent(raceDate)}`,
+    "select=place_no,race_no,boat,rank",
+    "order=place_no.asc,race_no.asc,rank.asc",
+  ];
+
+  if (venue) {
+    if (!JCD[venue]) throw new Error(`${venue}は結果取得対象外です`);
+    filters.splice(1, 0, `place_no=eq.${Number(JCD[venue])}`);
+  }
+
+  const rows = await supabaseCacheRequest(`race_results?${filters.join("&")}`);
+  const grouped = new Map();
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const placeNo = Number(row?.place_no);
+    const raceNo = Number(row?.race_no);
+    const boat = Number(row?.boat);
+    const rank = Number(row?.rank);
+
+    if (!(placeNo >= 1 && placeNo <= 24)) continue;
+    if (!(raceNo >= 1 && raceNo <= 12)) continue;
+    if (!(boat >= 1 && boat <= 6)) continue;
+    if (!(rank >= 1 && rank <= 6)) continue;
+
+    const key = `${placeNo}:${raceNo}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push({ boat, rank });
+  }
+
+  const venueByPlaceNo = Object.fromEntries(
+    Object.entries(JCD).map(([name, code]) => [Number(code), name])
+  );
+
+  const confirmed = [];
+  const confirmedByVenue = {};
+
+  for (const [key, raceRows] of grouped.entries()) {
+    const [placeNoText, raceNoText] = key.split(":");
+    const placeNo = Number(placeNoText);
+    const raceNo = Number(raceNoText);
+
+    const top3 = raceRows
+      .filter((r) => r.rank >= 1 && r.rank <= 3)
+      .sort((a, b) => a.rank - b.rank);
+
+    const uniqueRanks = new Set(top3.map((r) => r.rank));
+    const uniqueBoats = new Set(top3.map((r) => r.boat));
+
+    // 1〜3着が3件揃ったレースだけ確定済みとする。
+    if (top3.length < 3 || uniqueRanks.size < 3 || uniqueBoats.size < 3) continue;
+
+    const venueName = venueByPlaceNo[placeNo] || "";
+    if (!venueName) continue;
+
+    const result = top3.slice(0, 3).map((r) => r.boat).join("-");
+    const item = {
+      venue: venueName,
+      placeNo,
+      race: raceNo,
+      result,
+      key: `${venueName}:${raceNo}`,
+    };
+
+    confirmed.push(item);
+    if (!confirmedByVenue[venueName]) confirmedByVenue[venueName] = [];
+    confirmedByVenue[venueName].push(raceNo);
+  }
+
+  confirmed.sort((a, b) => a.placeNo - b.placeNo || a.race - b.race);
+  for (const races of Object.values(confirmedByVenue)) races.sort((a, b) => a - b);
+
+  return {
+    date: targetYmd,
+    confirmed,
+    confirmedKeys: confirmed.map((r) => r.key),
+    confirmedByVenue,
+    count: confirmed.length,
+  };
+}
+
+
 async function readReviewSnapshotsForDay(ymd, venue = "") {
   if (!ENABLE_PERSISTENT_CACHE) return [];
   const raceDate = ymdToDate(yyyymmdd(ymd));
@@ -3909,6 +4007,25 @@ export default async function handler(req, res) {
       res.setHeader("Cache-Control", "private, max-age=30");
       const items = await readReviewSnapshotsForDay(ymd, venue);
       res.status(200).json({ ok: true, action: "review_day", appVersion: "v131", date: ymd, venue: venue || "", count: items.length, items, fetchedAt: new Date().toISOString() });
+      return;
+    }
+
+    if (action === "confirmed_results") {
+      res.setHeader("Cache-Control", "no-store");
+      if (!captureAuthorized(req)) {
+        res.status(401).json({ ok: false, error: "Unauthorized capture request" });
+        return;
+      }
+
+      const payload = await readConfirmedResultsForDay(ymd, venue);
+      res.status(200).json({
+        ok: true,
+        action: "confirmed_results",
+        appVersion: "v132-confirmed-results",
+        venue: venue || "",
+        ...payload,
+        fetchedAt: new Date().toISOString(),
+      });
       return;
     }
 
