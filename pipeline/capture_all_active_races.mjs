@@ -86,23 +86,61 @@ async function main() {
     console.warn(`schedule errors=${scheduleErrors.length}`);
   }
 
+  // 当日すでに確定済みのレースを最初に1回だけ取得する。
+  // 取得に失敗した場合は安全側で従来どおり処理を続ける。
+  let confirmedKeys = new Set();
+  let confirmedLookupFailed = false;
+  try {
+    const q = new URLSearchParams({
+      action: "confirmed_results",
+      date: now.date,
+      t: String(Date.now()),
+    });
+    const confirmedData = await getJson(
+      `${BASE}/api/yoso?${q}`,
+      TOKEN ? { "x-capture-token": TOKEN } : {},
+    );
+    confirmedKeys = new Set(
+      (Array.isArray(confirmedData.confirmedKeys) ? confirmedData.confirmedKeys : [])
+        .map((v) => String(v || ""))
+        .filter(Boolean),
+    );
+    console.log(`confirmed results loaded=${confirmedKeys.size}`);
+  } catch (e) {
+    confirmedLookupFailed = true;
+    console.warn(`confirmed results lookup failed; fallback to full scan: ${e.message || e}`);
+  }
+
   const jobs=[];
   for (const s of schedules) {
     if (!s?.venue || s.noRace || !Array.isArray(s.schedule)) continue;
     for (const r of s.schedule) {
       const left = Number(r.deadlineMinutes) - now.minutes;
       // 展示・オッズは締切30分前〜締切後90分まで取得する。
-      // 公式結果は一時的な取得失敗を取り残さないよう、当日の終了済み全レースを毎回確認する。
+      // 公式結果がすでにSupabaseで確定済みのレースは、以後の実行対象から除外する。
       const race = Number(r.race);
+      if (!Number.isInteger(race) || race < 1 || race > 12) continue;
+
+      const raceKey = `${s.venue}:${race}`;
+      const alreadyConfirmed = confirmedKeys.has(raceKey);
+      if (alreadyConfirmed) continue;
+
       const captureNeeded = left <= 30 && left >= -90;
       const resultNeeded = left <= -1;
-      if ((captureNeeded || resultNeeded) && Number.isInteger(race) && race >= 1 && race <= 12) {
-        jobs.push({ venue:s.venue, race, left, final:resultNeeded, captureNeeded });
+      if (captureNeeded || resultNeeded) {
+        jobs.push({
+          venue: s.venue,
+          race,
+          left,
+          final: resultNeeded,
+          captureNeeded,
+          alreadyConfirmed: false,
+        });
       }
     }
   }
 
-  console.log(`capture/result jobs=${jobs.length}`);
+  console.log(`capture/result jobs=${jobs.length} skipped_confirmed=${confirmedKeys.size}`);
   const results = await mapLimit(jobs, CONCURRENCY, async j => {
     let data = { rows: [], oddsCount: 0 };
     let rows = 0;
@@ -235,6 +273,8 @@ async function main() {
     runId:RUN_ID,
     date:now.date,
     jobs:jobs.length,
+    skippedConfirmed:confirmedKeys.size,
+    confirmedLookupFailed,
     ok,
     ng,
     aiTargets:aiTargets.length,
@@ -247,6 +287,8 @@ async function main() {
   const heartbeatSummary = {
     date: summary.date,
     jobs: summary.jobs,
+    skippedConfirmed: summary.skippedConfirmed,
+    confirmedLookupFailed: summary.confirmedLookupFailed,
     ok: summary.ok,
     ng: summary.ng,
     aiTargets: summary.aiTargets,
