@@ -1162,10 +1162,20 @@ const TABLES = {
 };
 
 function lookup(boat, diff) {
-  const rows = TABLES[boat];
+  const normalizedBoat = Number(boat);
+  const rows = TABLES[normalizedBoat];
+
+  // 進入データが更新途中で欠けても、画面全体を落とさない。
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { w1: 0, w2: 0, w3: 0, top3: 0, tier: 0, tierMax: 1 };
+  }
+
+  const normalizedDiff = Number(diff);
+  const safeDiff = Number.isFinite(normalizedDiff) ? normalizedDiff : 0;
+
   for (let i = 0; i < rows.length; i++) {
     const [lo, hi, w1, w2, w3, top3] = rows[i];
-    if (diff >= lo && diff < hi) {
+    if (safeDiff >= lo && safeDiff < hi) {
       // tier: 0=最も遅い段階, rows.length-1=最も速い段階。tierMax=段階数
       return { w1, w2, w3, top3, tier: i, tierMax: rows.length };
     }
@@ -2060,7 +2070,12 @@ export default function App() {
           return next;
         });
 
-        if (shinnyu && shinnyu.every((v) => v >= 1 && v <= 6 && Number.isInteger(v))) {
+        if (
+          Array.isArray(shinnyu) &&
+          shinnyu.length === 6 &&
+          new Set(shinnyu).size === 6 &&
+          shinnyu.every((v) => v >= 1 && v <= 6 && Number.isInteger(v))
+        ) {
           const c = {};
           for (let b = 1; b <= 6; b++) c[b] = shinnyu[b - 1];
           setCourses(c);
@@ -4917,13 +4932,7 @@ export default function App() {
   // ── AI予想の収支（もし機械的に買っていたら・1点100円固定） ──
   const aiLedger = useMemo(() => {
     const PER = 100; // 1点100円
-    const safeRecords = Array.isArray(statFilter?.recs) ? statFilter.recs : [];
-    const judged = safeRecords.filter((r) =>
-      r?.result &&
-      r?.payoutOdds &&
-      Array.isArray(r?.bets) &&
-      r.bets.some((b) => Array.isArray(b?.tickets) && b.tickets.length > 0)
-    );
+    const judged = statFilter.recs.filter((r) => r.result && r.payoutOdds && r.bets && r.bets.length);
     const patterns = [
       { key: "honmei", name: "本線", parts: ["本線"] },
       { key: "taikou", name: "対抗", parts: ["対抗"] },
@@ -4937,26 +4946,16 @@ export default function App() {
     for (const p of patterns) stats[p.key] = { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
 
     for (const r of judged) {
-      const odds = Number(r?.payoutOdds || 0);
-      const limits = r?.betLimits || {}; // {本線:6, 対抗:4, ...} レースごとの点数設定
-      const bets = Array.isArray(r?.bets) ? r.bets : [];
-
+      const odds = r.payoutOdds;
+      const limits = r.betLimits || {}; // {本線:6, 対抗:4, ...} レースごとの点数設定
       for (const p of patterns) {
         // このパターンの合成買い目（各買い目は上位 limit 点まで・重複除外）
         const set = new Set();
         for (const part of p.parts) {
-          const bet = bets.find((b) => b?.label === part);
-          const tickets = Array.isArray(bet?.tickets) ? bet.tickets : [];
-          if (!tickets.length) continue;
-
-          const configuredLimit = Number(limits?.[part]);
-          const lim = Number.isFinite(configuredLimit) && configuredLimit >= 0
-            ? configuredLimit
-            : tickets.length;
-
-          for (const t of tickets.slice(0, lim)) {
-            if (typeof t === "string" && t) set.add(t);
-          }
+          const bet = r.bets.find((b) => b.label === part);
+          if (!bet) continue;
+          const lim = limits[part] != null ? limits[part] : bet.tickets.length; // 未設定なら全点
+          for (const t of bet.tickets.slice(0, lim)) set.add(t);
         }
         if (set.size === 0) continue;
         const s = stats[p.key];
