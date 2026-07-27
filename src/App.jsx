@@ -4917,7 +4917,13 @@ export default function App() {
   // ── AI予想の収支（もし機械的に買っていたら・1点100円固定） ──
   const aiLedger = useMemo(() => {
     const PER = 100; // 1点100円
-    const judged = statFilter.recs.filter((r) => r.result && r.payoutOdds && r.bets && r.bets.length);
+    const safeRecords = Array.isArray(statFilter?.recs) ? statFilter.recs : [];
+    const judged = safeRecords.filter((r) =>
+      r?.result &&
+      r?.payoutOdds &&
+      Array.isArray(r?.bets) &&
+      r.bets.some((b) => Array.isArray(b?.tickets) && b.tickets.length > 0)
+    );
     const patterns = [
       { key: "honmei", name: "本線", parts: ["本線"] },
       { key: "taikou", name: "対抗", parts: ["対抗"] },
@@ -4931,16 +4937,26 @@ export default function App() {
     for (const p of patterns) stats[p.key] = { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
 
     for (const r of judged) {
-      const odds = r.payoutOdds;
-      const limits = r.betLimits || {}; // {本線:6, 対抗:4, ...} レースごとの点数設定
+      const odds = Number(r?.payoutOdds || 0);
+      const limits = r?.betLimits || {}; // {本線:6, 対抗:4, ...} レースごとの点数設定
+      const bets = Array.isArray(r?.bets) ? r.bets : [];
+
       for (const p of patterns) {
         // このパターンの合成買い目（各買い目は上位 limit 点まで・重複除外）
         const set = new Set();
         for (const part of p.parts) {
-          const bet = r.bets.find((b) => b.label === part);
-          if (!bet) continue;
-          const lim = limits[part] != null ? limits[part] : bet.tickets.length; // 未設定なら全点
-          for (const t of bet.tickets.slice(0, lim)) set.add(t);
+          const bet = bets.find((b) => b?.label === part);
+          const tickets = Array.isArray(bet?.tickets) ? bet.tickets : [];
+          if (!tickets.length) continue;
+
+          const configuredLimit = Number(limits?.[part]);
+          const lim = Number.isFinite(configuredLimit) && configuredLimit >= 0
+            ? configuredLimit
+            : tickets.length;
+
+          for (const t of tickets.slice(0, lim)) {
+            if (typeof t === "string" && t) set.add(t);
+          }
         }
         if (set.size === 0) continue;
         const s = stats[p.key];
