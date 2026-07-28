@@ -1,12 +1,14 @@
-# AI予想収支を廃止
+# AI買い目自動保存を廃止
 
 変更内容:
-- 「開催場AI予想収支」カードを非表示
-- venue_ai_ledger APIの1分ごとの読み込みを停止
-- AI予想保存後の収支再読込を停止
-- 各利用者が「買い目を追加」したレースだけ舟券収支・履歴へ表示
-- 既存の予想機能、買い目追加、結果・払戻の自動反映は維持
-- toFixed安全化修正も維持
+- PlaywrightによるAI買い目自動保存を削除
+- `AI SAVED` / `AI SKIP` 処理を削除
+- `AUTOMATION_AUTH_SESSION_JSON` を不要化
+- `AI_CAPTURE_CONCURRENCY` / `AI_SAVE_BEFORE_MINUTES` を不要化
+- AI保存失敗による GitHub Actions の exit code 1 を廃止
+- 30分ごとの展示・オッズ・結果取得は維持
+- 確定済みレースの再取得停止も維持
+- GitHub Actionsは通常エラー5件以上のときだけ失敗扱い
 
 上書き先:
-`src/App.jsx`
+`pipeline/capture_all_active_races.mjs`
