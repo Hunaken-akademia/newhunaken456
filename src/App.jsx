@@ -5406,23 +5406,44 @@ export default function App() {
       .filter((b) => labels.includes(String(b?.label || "")));
 
     const summarize = (rows, name) => {
-      const races = new Set();
+      // 的中判定は保存済みの b.hit を信用せず、結果出目と買い目を毎回突き合わせる。
+      // また、的中率は「区分レコード数」ではなく「レース数」で数える。
+      const byRace = new Map();
+      for (const b of rows) {
+        const key = `${b?.date || ""}_${b?.venue || ""}_${b?.race || ""}`;
+        if (!byRace.has(key)) {
+          byRace.set(key, {
+            date: b?.date || "",
+            venue: b?.venue || "",
+            race: b?.race || "",
+            result: String(b?.result || "").trim(),
+            spent: 0,
+            ret: 0,
+            tickets: [],
+          });
+        }
+        const race = byRace.get(key);
+        if (!race.result && b?.result) race.result = String(b.result).trim();
+        race.spent += Number(b?.amount || 0);
+        race.ret += Number(b?.payout || 0);
+        if (Array.isArray(b?.tickets)) race.tickets.push(...b.tickets.map((t) => String(t || "").trim()));
+      }
+
       let spent = 0;
       let ret = 0;
       let judged = 0;
       let hit = 0;
-      for (const b of rows) {
-        races.add(`${b?.date || ""}_${b?.venue || ""}_${b?.race || ""}`);
-        spent += Number(b?.amount || 0);
-        ret += Number(b?.payout || 0);
-        if (b?.result) {
-          judged += 1;
-          if (b?.hit) hit += 1;
-        }
+      for (const race of byRace.values()) {
+        spent += race.spent;
+        ret += race.ret;
+        if (!race.result) continue;
+        judged += 1;
+        if (race.tickets.includes(race.result)) hit += 1;
       }
+
       return {
         name,
-        races: races.size,
+        races: byRace.size,
         bets: rows.length,
         spent,
         ret,
@@ -5459,7 +5480,6 @@ export default function App() {
 
     return {
       rows,
-      total: summarize(source, "AI全体"),
       venueRows,
       hasData: source.length > 0,
     };
@@ -7512,22 +7532,14 @@ export default function App() {
                             </div>
                             {SHOW_RECORDS && (
                             <button
-                              onClick={() => {
-                                if (pickerMode === "none" || pickerAlloc === "none") {
-                                  addConfiguredAiBetsToCart();
-                                } else {
-                                  addPickedToCart();
-                                }
-                              }}
+                              onClick={addPickedToCart}
                               style={{
                                 padding: "9px 16px", borderRadius: 8, cursor: "pointer",
                                 background: "#5a9e2e", color: "#fff", fontSize: 13, fontWeight: 700, border: "none",
                               }}
-                            >
-                              {pickerMode === "none" || pickerAlloc === "none"
-                                ? "上段の点数設定をリストに追加"
-                                : "この買い目をリストに追加"}
-                            </button>
+                            >{pickerMode === "none" || pickerAlloc === "none" ? "上段の点数設定をリストに追加" : "{pickerMode === "none" || pickerAlloc === "none"
+                                  ? "上段の点数設定をリストに追加"
+                                  : "この買い目をリストに追加"}"}</button>
                             )}
                           </>
                         ) : (
@@ -7886,7 +7898,7 @@ export default function App() {
                 実際に舟券履歴へ記録した本線・対抗・穴・超穴の買い目だけを集計しています。単体成績と、よく使う組み合わせ成績を1つの見やすい表にまとめています。
               </div>
               <div style={{ display: "grid", gap: 8 }}>
-                {[...aiBetStats.rows, aiBetStats.total].map((row) => {
+                {aiBetStats.rows.map((row) => {
                   const profitPositive = Number(row.profit) >= 0;
                   const roiPositive = Number(row.roi) >= 100;
                   const highlight = row.name === "AI全体";
