@@ -1734,6 +1734,8 @@ export default function App() {
   useEffect(() => { betRecordsRef.current = betRecords; }, [betRecords]);
   const [betMsg, setBetMsg] = useState("");
   const [cart, setCart] = useState([]);  // 記録前の買い目リスト [{id,label,tickets,amountPerPoint}]
+  const [batchBetStatus, setBatchBetStatus] = useState("");
+  const [batchBetProgress, setBatchBetProgress] = useState({ done: 0, total: 0, saved: 0, skipped: 0 });
   const [payoutOddsInput, setPayoutOddsInput] = useState(""); // 配当(100円あたり)
   const [easyMode, setEasyMode] = useState(true); // 表示モード: true=かんたん / false=詳細
   const [betDraft, setBetDraft] = useState({
@@ -4469,80 +4471,66 @@ export default function App() {
   );
 
 
-  // AI買い目は結果確定前の時点でレース単位に保存。場別収支はこのスナップショットと確定結果を結合する。
+  // 一括記録用の非表示画面では、そのレースのAI買い目を親画面へ返す。
+  // サーバーへのAI予想自動保存は行わない。
   useEffect(() => {
-    const targetVenue = captureAiMode ? captureAiTarget.venue : venue;
-    const targetDate = captureAiMode ? (captureAiTarget.date || raceDate) : raceDate;
-    const targetRace = captureAiMode ? captureAiTarget.race : Number(raceNo);
+    if (!captureAiMode) return;
+
+    const targetVenue = captureAiTarget.venue;
+    const targetDate = captureAiTarget.date || raceDate;
+    const targetRace = Number(captureAiTarget.race);
 
     if (!targetVenue || !targetDate || !Number.isInteger(targetRace) || targetRace < 1 || targetRace > 12) return;
-    // captureモードでは、別レースの状態で誤保存しない。
-    if (captureAiMode && (venue !== targetVenue || raceDate !== targetDate || Number(raceNo) !== targetRace)) return;
+    if (venue !== targetVenue || raceDate !== targetDate || Number(raceNo) !== targetRace) return;
     if (!aiEval?.bets?.length) return;
 
     const selectedManualWind = raceWinds?.[targetRace] || "";
     if (!selectedManualWind) {
-      if (captureAiMode && !raceWindsLoading) {
-        window.__HUNAKEN_AI_CAPTURE_STATUS__ = {
-          state: "waiting_wind",
-          date: targetDate,
-          venue: targetVenue,
-          race: targetRace,
-          error: "このレースの風が未設定です",
-        };
-      }
-      return;
-    }
-
-    const payload = {
-      venue: targetVenue,
-      date: targetDate,
-      race: targetRace,
-      bets: aiEval.bets.map((b) => ({ label: b.label, tickets: Array.isArray(b.tickets) ? b.tickets : [] })),
-      ranked: aiEval.ranked?.map((r) => ({ boat: r.boat, mark: r.mark })) || [],
-      modelVersion: "wake-prob-v1",
-      wind: selectedManualWind,
-    };
-    const signature = `${targetDate}_${targetVenue}_${targetRace}_${JSON.stringify(payload.bets)}`;
-    if (predictionSaveRef.current === signature) return;
-    predictionSaveRef.current = signature;
-    let cancelled = false;
-    if (captureAiMode) {
-      window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "saving", date: targetDate, venue: targetVenue, race: targetRace };
-    }
-    const saveAiQs = new URLSearchParams({
-      action: "save_ai_prediction",
-      venue: targetVenue,
-      date: targetDate,
-      race: String(targetRace),
-    });
-    fetch(`/api/yoso?${saveAiQs.toString()}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).then(async (res) => {
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) throw new Error(data.error || data.reason || "AI予想保存失敗");
-      if (!cancelled && captureAiMode) {
-        window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "saved", date: targetDate, venue: targetVenue, race: targetRace };
-        if (window.parent !== window) {
-          window.parent.postMessage({ type: "hunaken-ai-prediction-saved", date: targetDate, venue: targetVenue, race: targetRace }, window.location.origin);
-        }
-      }
-    }).catch((e) => {
-      predictionSaveRef.current = "";
-      if (captureAiMode) {
+      if (!raceWindsLoading) {
         window.__HUNAKEN_AI_CAPTURE_STATUS__ = {
           state: "error",
           date: targetDate,
           venue: targetVenue,
           race: targetRace,
-          error: e?.message || String(e),
+          error: "このレースの風が未設定です",
         };
-        console.warn("AI予想自動保存:", e?.message || e);
+        if (window.parent !== window) {
+          window.parent.postMessage({
+            type: "hunaken-ai-batch-error",
+            date: targetDate,
+            venue: targetVenue,
+            race: targetRace,
+            error: "風未設定",
+          }, window.location.origin);
+        }
       }
-    });
-    return () => { cancelled = true; };
+      return;
+    }
+
+    const bets = aiEval.bets.map((b) => ({
+      label: String(b?.label || ""),
+      tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
+    }));
+    const signature = `${targetDate}_${targetVenue}_${targetRace}_${JSON.stringify(bets)}`;
+    if (predictionSaveRef.current === signature) return;
+    predictionSaveRef.current = signature;
+
+    window.__HUNAKEN_AI_CAPTURE_STATUS__ = {
+      state: "ready",
+      date: targetDate,
+      venue: targetVenue,
+      race: targetRace,
+    };
+
+    if (window.parent !== window) {
+      window.parent.postMessage({
+        type: "hunaken-ai-batch-ready",
+        date: targetDate,
+        venue: targetVenue,
+        race: targetRace,
+        bets,
+      }, window.location.origin);
+    }
   }, [aiEval, venue, raceDate, raceNo, captureAiMode, captureAiTarget, raceWinds, raceWindsLoading]);
 
 
@@ -4591,44 +4579,95 @@ export default function App() {
   }, [venue, raceDate, venueLedgerPoints.honmei, venueLedgerPoints.taikou, venueLedgerPoints.ana]);
 
   useEffect(() => {
-    const onMessage = (event) => {
-      if (event.origin !== window.location.origin || event.data?.type !== "hunaken-ai-prediction-saved") return;
-      const key = `${event.data.date}_${event.data.venue}_${event.data.race}`;
-      aiCaptureAttemptRef.current.set(key, Date.now());
-      setAiCaptureQueue((q) => q.filter((x) => `${x.date}_${x.venue}_${x.race}` !== key));
-      if (SHOW_VENUE_AI_LEDGER && event.data.date === raceDate && event.data.venue === venue) {
-        loadVenueAiLedger({ quiet: true });
+    const onMessage = async (event) => {
+      if (event.origin !== window.location.origin) return;
+      const type = event.data?.type;
+      if (type !== "hunaken-ai-batch-ready" && type !== "hunaken-ai-batch-error") return;
+
+      const targetDate = String(event.data?.date || "");
+      const targetVenue = String(event.data?.venue || "");
+      const targetRace = Number(event.data?.race);
+      const queueKey = `${targetDate}_${targetVenue}_${targetRace}`;
+
+      if (type === "hunaken-ai-batch-ready") {
+        const sourceBets = Array.isArray(event.data?.bets) ? event.data.bets : [];
+        const limits = {
+          "本線": Math.max(0, Number(betLimits?.["本線"] ?? 0)),
+          "対抗": Math.max(0, Number(betLimits?.["対抗"] ?? 0)),
+          "穴": Math.max(0, Number(betLimits?.["穴"] ?? 0)),
+        };
+        const now = Date.now();
+        const recs = ["本線", "対抗", "穴"].flatMap((label, index) => {
+          const source = sourceBets.find((b) => String(b?.label) === label);
+          const limit = limits[label];
+          const tickets = Array.isArray(source?.tickets)
+            ? source.tickets.slice(0, limit).filter(Boolean)
+            : [];
+          if (!limit || !tickets.length) return [];
+          return [{
+            id: `batch_${targetDate}_${targetVenue}_${targetRace}_${label}_${now}_${index}`,
+            date: targetDate,
+            venue: targetVenue,
+            race: targetRace,
+            label,
+            points: tickets.length,
+            tickets,
+            amountPerPoint: 100,
+            perTicket: null,
+            amount: tickets.length * 100,
+            result: null,
+            hit: null,
+            payoutOdds: null,
+            payout: 0,
+            settlementStatus: "pending",
+            recordedAt: now,
+            batchRecorded: true,
+          }];
+        });
+
+        if (recs.length) {
+          await persistBets((prev) => {
+            // 同じ日・場・R・区分を一括記録し直した場合は置き換える。
+            const replaceKeys = new Set(recs.map((r) => `${r.date}_${r.venue}_${r.race}_${r.label}`));
+            const kept = prev.filter((r) => !replaceKeys.has(`${r.date}_${r.venue}_${r.race}_${r.label}`));
+            return [...recs, ...kept];
+          });
+        }
+
+        setBatchBetProgress((p) => ({
+          ...p,
+          done: p.done + 1,
+          saved: p.saved + (recs.length ? 1 : 0),
+          skipped: p.skipped + (recs.length ? 0 : 1),
+        }));
+      } else {
+        setBatchBetProgress((p) => ({
+          ...p,
+          done: p.done + 1,
+          skipped: p.skipped + 1,
+        }));
       }
+
+      aiCaptureAttemptRef.current.set(queueKey, Date.now());
+      predictionSaveRef.current = "";
+      setAiCaptureQueue((q) => q.filter((x) => `${x.date}_${x.venue}_${x.race}` !== queueKey));
     };
+
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [venue, raceDate, venueLedgerPoints.honmei, venueLedgerPoints.taikou, venueLedgerPoints.ana]);
+  }, [betLimits]);
 
-  // ログイン済みのツールが開いている間、全開催場の「次R」を締切30分前から自動保存する。
-  // 場を手動選択する必要はなく、各場の次Rが進むたびに1R〜12Rを順次処理する。
+
+  // AI買い目の自動保存は廃止。一括記録ボタンを押した時だけキューを作る。
+
+
   useEffect(() => {
-    if (captureAiMode || document.hidden) return;
-    const today = todayDateValue();
-    const now = Date.now();
-    const candidates = Object.values(venueStatuses || {})
-      .filter((st) => st && st.venue && st.nextRace && !st.noRace && !st.allClosed)
-      .map((st) => {
-        const left = Number.isFinite(Number(st.nextDeadlineMinutes))
-          ? Number(st.nextDeadlineMinutes)
-          : minutesUntilDeadline(st.nextDeadline);
-        return { date: today, venue: st.venue, race: Number(st.nextRace), left };
-      })
-      .filter((x) => x.race >= 1 && x.race <= 12 && x.left != null && x.left <= 30 && x.left >= 1)
-      .filter((x) => now - Number(aiCaptureAttemptRef.current.get(`${x.date}_${x.venue}_${x.race}`) || 0) > 2 * 60 * 1000)
-      .sort((a, b) => a.left - b.left);
-    if (!candidates.length) return;
-    setAiCaptureQueue((prev) => {
-      const map = new Map(prev.map((x) => [`${x.date}_${x.venue}_${x.race}`, x]));
-      for (const x of candidates) map.set(`${x.date}_${x.venue}_${x.race}`, x);
-      return Array.from(map.values()).sort((a, b) => a.left - b.left).slice(0, 24);
-    });
-  }, [venueStatuses, captureAiMode]);
+    if (batchBetProgress.total > 0 && batchBetProgress.done >= batchBetProgress.total && aiCaptureQueue.length === 0) {
+      setBatchBetStatus(
+        `✓ 一括記録完了：${batchBetProgress.saved}レース記録、${batchBetProgress.skipped}レーススキップ`
+      );
+    }
+  }, [batchBetProgress, aiCaptureQueue.length]);
 
   useEffect(() => {
     if (!aiCaptureQueue.length || captureAiMode) return;
@@ -4636,6 +4675,8 @@ export default function App() {
     const key = `${current.date}_${current.venue}_${current.race}`;
     aiCaptureAttemptRef.current.set(key, Date.now());
     const timer = window.setTimeout(() => {
+      setBatchBetProgress((p) => ({ ...p, done: p.done + 1, skipped: p.skipped + 1 }));
+      predictionSaveRef.current = "";
       setAiCaptureQueue((q) => q.filter((x) => `${x.date}_${x.venue}_${x.race}` !== key));
     }, 45000);
     return () => window.clearTimeout(timer);
@@ -5220,6 +5261,43 @@ export default function App() {
     return { pts, amt };
   }, [cart]);
 
+  const startBatchBetRecording = () => {
+    if (!venue) {
+      setBatchBetStatus("開催場を選択してください");
+      return;
+    }
+    if (aiCaptureQueue.length) {
+      setBatchBetStatus("一括記録を処理中です");
+      return;
+    }
+
+    const limits = {
+      "本線": Math.max(0, Number(betLimits?.["本線"] ?? 0)),
+      "対抗": Math.max(0, Number(betLimits?.["対抗"] ?? 0)),
+      "穴": Math.max(0, Number(betLimits?.["穴"] ?? 0)),
+    };
+    if (!limits["本線"] && !limits["対抗"] && !limits["穴"]) {
+      setBatchBetStatus("本線・対抗・穴の点数を1つ以上設定してください");
+      return;
+    }
+
+    const targets = Array.from({ length: 12 }, (_, i) => i + 1)
+      .filter((r) => String(raceWinds?.[r] || "").trim())
+      .map((r) => ({ date: raceDate, venue, race: r }));
+
+    if (!targets.length) {
+      setBatchBetStatus("風が設定されているレースがありません");
+      return;
+    }
+
+    setBatchBetProgress({ done: 0, total: targets.length, saved: 0, skipped: 0 });
+    setBatchBetStatus(
+      `一括記録を開始しました（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}／1点100円）`
+    );
+    predictionSaveRef.current = "";
+    setAiCaptureQueue(targets);
+  };
+
   // カートをこのレースの購入として確定。結果・払戻は公式結果確定後に自動反映する。
   const commitCart = async () => {
     if (cart.length === 0) { setBetMsg("リストに買い目がありません"); return; }
@@ -5237,16 +5315,6 @@ export default function App() {
     if (!saved) {
       setBetMsg("✗ 買い目の保存に失敗しました。ページを閉じずに、もう一度お試しください");
       return;
-    }
-    // AI予想側も結果待ちレコードとして保存し、自動精算後の的中率・収支へ反映する。
-    if (aiEval?.bets?.length) {
-      const key = `${raceDate}_${venue}_${raceNo}R`;
-      await persistRecords((prev) => [{
-        key, date: raceDate, venue, race: raceNo,
-        ranked: aiEval.ranked.map((r) => ({ boat: r.boat, mark: r.mark })),
-        bets: aiEval.bets.map((b) => ({ label: b.label, tickets: b.tickets })),
-        result: null, payoutOdds: null, betLimits: { ...betLimits }, savedAt: Date.now(),
-      }, ...prev.filter((r) => r.key !== key)]);
     }
     const totalAmt = recs.reduce((a, r) => a + r.amount, 0);
     setBetMsg(`✓ ${recs.length}件・${totalAmt.toLocaleString()}円を記録しました。結果確定後に自動反映します`);
@@ -5721,7 +5789,7 @@ export default function App() {
             })}
           </div>
           <div style={{ fontSize: 10, color: raceWindsMsg.includes("失敗") ? "#ff8a80" : "#7da3c8", marginTop: 6, lineHeight: 1.5 }}>
-            {raceWindsLoading ? "保存済みの風設定を読込中…" : raceWindsMsg || "各レースの風を選ぶとSupabaseへ保存され、サーバー側AI保存にも反映されます。未設定レースはAI買い目を保存しません。"}
+            {raceWindsLoading ? "保存済みの風設定を読込中…" : raceWindsMsg || "各レースの風を設定すると、そのレースのAI予想に反映されます。買い目は必要なレースだけ追加してください。"}
           </div>
 
         </div>
@@ -7658,6 +7726,40 @@ export default function App() {
             })}
           </div>
 
+          <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 800, color: "#cfe0f0", marginBottom: 6 }}>
+              1R〜12RのAI買い目を一括記録
+            </div>
+            <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.7, marginBottom: 9 }}>
+              風を設定済みの各レースについて、それぞれのAI予想から現在の点数設定
+              （本線{Number(betLimits?.["本線"] ?? 0)}・対抗{Number(betLimits?.["対抗"] ?? 0)}・穴{Number(betLimits?.["穴"] ?? 0)}）
+              を1点100円で記録します。公開前などAI予想を取得できないレースはスキップされます。
+            </div>
+            <button
+              onClick={startBatchBetRecording}
+              disabled={aiCaptureQueue.length > 0}
+              style={{
+                width: "100%", padding: "11px 14px", borderRadius: 8,
+                cursor: aiCaptureQueue.length ? "not-allowed" : "pointer",
+                background: aiCaptureQueue.length ? "#405267" : "#5a9e2e",
+                color: "#fff", fontSize: 13, fontWeight: 800, border: "none",
+                opacity: aiCaptureQueue.length ? 0.75 : 1,
+              }}
+            >
+              {aiCaptureQueue.length
+                ? `処理中 ${batchBetProgress.done}/${batchBetProgress.total}`
+                : "設定中の点数で1R〜12Rを一括記録"}
+            </button>
+            {batchBetStatus && (
+              <div style={{ fontSize: 11, color: "#9db5cc", marginTop: 8, lineHeight: 1.6 }}>
+                {batchBetStatus}
+                {batchBetProgress.total > 0
+                  ? `　完了${batchBetProgress.done}/${batchBetProgress.total}・記録${batchBetProgress.saved}R・スキップ${batchBetProgress.skipped}R`
+                  : ""}
+              </div>
+            )}
+          </div>
+
           {/* 舟券を追加 */}
           <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
             <div style={{ fontSize: 12, color: "#9db5cc", marginBottom: 8, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -7903,7 +8005,7 @@ export default function App() {
         {!captureAiMode && aiCaptureQueue.length > 0 && (
           <iframe
             key={`${aiCaptureQueue[0].date}_${aiCaptureQueue[0].venue}_${aiCaptureQueue[0].race}`}
-            title="AI予想自動保存"
+            title="AI買い目一括記録"
             src={`${window.location.pathname}?capture_ai=1&date=${encodeURIComponent(aiCaptureQueue[0].date)}&venue=${encodeURIComponent(aiCaptureQueue[0].venue)}&race=${encodeURIComponent(aiCaptureQueue[0].race)}`}
             style={{ position: "fixed", width: 1, height: 1, opacity: 0, pointerEvents: "none", left: -9999, top: -9999, border: 0 }}
           />
