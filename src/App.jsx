@@ -931,6 +931,64 @@ function compressTickets(tickets) {
   return out;
 }
 
+
+// 3連単の結果・買い目を必ず「1-2-3」の完全一致単位で扱う。
+// 表示用フォーメーション（例: 1-23-4 / 4-1-2356）が保存されていても、
+// 内部判定時は全組み合わせへ展開して照合する。
+function normalizeTrifectaResult(value) {
+  const s = String(value || "")
+    .replace(/[ー－–—]/g, "-")
+    .replace(/\s+/g, "")
+    .replace(/[^1-6-]/g, "");
+  const m = s.match(/^([1-6])-([1-6])-([1-6])$/);
+  if (!m) return "";
+  const parts = [m[1], m[2], m[3]];
+  return new Set(parts).size === 3 ? parts.join("-") : "";
+}
+
+function expandTrifectaTicket(ticket) {
+  const s = String(ticket || "")
+    .replace(/[ー－–—]/g, "-")
+    .replace(/\s+/g, "")
+    .replace(/[^1-6-]/g, "");
+  const parts = s.split("-");
+  if (parts.length !== 3) return [];
+  const groups = parts.map((part) => [...new Set(String(part).split("").filter((n) => /^[1-6]$/.test(n)))]);
+  if (groups.some((g) => !g.length)) return [];
+  const out = [];
+  for (const a of groups[0]) {
+    for (const b of groups[1]) {
+      for (const c of groups[2]) {
+        if (new Set([a, b, c]).size !== 3) continue;
+        out.push(`${a}-${b}-${c}`);
+      }
+    }
+  }
+  return [...new Set(out)];
+}
+
+function ticketListIncludesResult(tickets, result) {
+  const normalized = normalizeTrifectaResult(result);
+  if (!normalized || !Array.isArray(tickets)) return false;
+  return tickets.some((ticket) => expandTrifectaTicket(ticket).includes(normalized));
+}
+
+function stakeForTrifectaResult(record, result) {
+  const normalized = normalizeTrifectaResult(result);
+  if (!normalized || !ticketListIncludesResult(record?.tickets, normalized)) return 0;
+  const direct = Number(record?.perTicket?.[normalized]);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+  const flat = Number(record?.amountPerPoint || 0);
+  return Number.isFinite(flat) && flat > 0 ? flat : 0;
+}
+
+function recomputeTrifectaPayout(record, result, payoutPer100) {
+  const stake = stakeForTrifectaResult(record, result);
+  const official = Number(payoutPer100 || 0);
+  if (!(stake > 0) || !(official > 0)) return 0;
+  return Math.round((stake / 100) * official);
+}
+
 // 日付(YYYY-MM-DD)から季節を返す
 function seasonOf(dateStr) {
   let m = 1;
@@ -1732,6 +1790,7 @@ export default function App() {
   const aiCaptureAttemptRef = useRef(new Map());
   const predictionSaveRef = useRef("");
   const betRecordsRef = useRef([]);              // 保存処理用の最新値ミラー
+  const settlementVerifiedRef = useRef(new Set()); // 公式結果と払戻をこの画面で再照合済みのレース
   useEffect(() => { betRecordsRef.current = betRecords; }, [betRecords]);
   const [betMsg, setBetMsg] = useState("");
   const [cart, setCart] = useState([]);  // 記録前の買い目リスト [{id,label,tickets,amountPerPoint}]
@@ -4683,66 +4742,83 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [aiCaptureQueue, captureAiMode]);
 
-  // 結果未確定で記録した舟券とAI予想を、結果確定後に自動精算する。
+  // 舟券記録を公式結果ページの出目・3連単払戻金で再照合する。
+  // settlementVersion=3 未満の既存記録も一度だけ再検証し、過去の誤判定を自動修復する。
   useEffect(() => {
     const pendingKeys = new Map();
-    for (const b of betRecordsRef.current || []) {
-      const needsSettlement = !b?.result || (b?.autoSettled && b?.settlementSource !== "official_result_payout");
-      if (needsSettlement && b?.date && b?.venue && b?.venue !== "—" && b?.race) {
-        pendingKeys.set(`${b.date}_${b.venue}_${b.race}`, b);
-      }
-    }
-    for (const r of recordsRef.current || []) {
-      const needsSettlement = !r?.result || (r?.autoSettled && r?.settlementSource !== "official_result_payout");
-      if (needsSettlement && r?.date && r?.venue && r?.race) {
-        pendingKeys.set(`${r.date}_${r.venue}_${r.race}`, r);
-      }
-    }
+    const addPending = (rec) => {
+      if (!rec?.date || !rec?.venue || rec.venue === "—" || !rec?.race) return;
+      const key = `${rec.date}_${rec.venue}_${rec.race}`;
+      const needsSettlement = !rec?.result
+        || Number(rec?.settlementVersion || 0) < 3
+        || rec?.settlementSource !== "official_result_payout";
+      if (needsSettlement) pendingKeys.set(key, { ...rec, _settlementKey: key });
+    };
+    for (const b of betRecordsRef.current || []) addPending(b);
+    for (const r of recordsRef.current || []) addPending(r);
     if (!pendingKeys.size) return;
+
     let cancelled = false;
     const settle = async () => {
       for (const rec of pendingKeys.values()) {
         if (cancelled) return;
+        const key = rec._settlementKey;
+        if (settlementVerifiedRef.current.has(key)) continue;
         try {
-          const qs = new URLSearchParams({ action: "settlement", date: rec.date, venue: rec.venue, race: String(rec.race), t: String(Date.now()) });
+          const qs = new URLSearchParams({
+            action: "settlement",
+            date: rec.date,
+            venue: rec.venue,
+            race: String(rec.race),
+            t: String(Date.now()),
+          });
           const res = await fetch(`/api/yoso?${qs.toString()}`, { cache: "no-store" });
           const data = await res.json().catch(() => ({}));
           const payoutPer100 = Number(data.payoutPer100 || 0);
-          // 結果だけで精算済みにすると、的中時に配当0円で確定して再試行されなくなる。
-          // 出目と確定オッズの両方が揃った時だけ舟券記録へ反映する。
-          if (!res.ok || !data.ok || !data.completed || !data.result || !(payoutPer100 > 0)) continue;
-          const trio = data.result;
+          const verifiedResult = normalizeTrifectaResult(data.verifiedResult || data.result);
+          if (!res.ok || !data.ok || !data.completed || !data.settlementReady || !verifiedResult || !(payoutPer100 > 0)) continue;
+
           await persistRecords((prev) => prev.map((r) =>
             r.date === rec.date && r.venue === rec.venue && String(r.race) === String(rec.race)
               ? {
                   ...r,
-                  result: trio,
-                  payoutOdds: payoutPer100 || null,
+                  result: verifiedResult,
+                  payoutOdds: payoutPer100,
                   autoSettled: true,
-                  settlementSource: data.oddsSource || "",
+                  settlementSource: "official_result_payout",
+                  settlementVersion: 3,
+                  settlementResultMismatch: !!data.resultMismatch,
                   settlementUpdatedAt: Date.now(),
                 }
               : r
           ));
+
           await persistBets((prev) => prev.map((b) => {
             if (!(b.date === rec.date && b.venue === rec.venue && String(b.race) === String(rec.race))) return b;
-            const hit = Array.isArray(b.tickets) && b.tickets.includes(trio);
-            const hitAmt = hit ? (b.perTicket ? Number(b.perTicket[trio] || 0) : Number(b.amountPerPoint || 0)) : 0;
-            const payout = hit && payoutPer100 > 0 ? Math.round((hitAmt / 100) * payoutPer100) : 0;
+            const hit = ticketListIncludesResult(b?.tickets, verifiedResult);
+            const payout = hit ? recomputeTrifectaPayout(b, verifiedResult, payoutPer100) : 0;
             return {
               ...b,
-              result: trio,
+              result: verifiedResult,
               hit,
-              payoutOdds: payoutPer100 || null,
+              payoutOdds: payoutPer100,
               payout,
+              settlementStatus: "settled",
               autoSettled: true,
-              settlementSource: data.oddsSource || "",
+              settlementSource: "official_result_payout",
+              settlementVersion: 3,
+              settlementResultMismatch: !!data.resultMismatch,
               settlementUpdatedAt: Date.now(),
             };
           }));
-        } catch (e) { /* 次回再試行 */ }
+
+          settlementVerifiedRef.current.add(key);
+        } catch (e) {
+          // 公式結果がまだ揃っていない場合は次回再試行する。
+        }
       }
     };
+
     settle();
     const timer = window.setInterval(settle, 60000);
     return () => { cancelled = true; window.clearInterval(timer); };
@@ -4808,10 +4884,17 @@ export default function App() {
     await persistBets((prev) => prev.some(sameRace)
       ? prev.map((b) => {
           if (!sameRace(b)) return b;
-          const hit = b.tickets.includes(trio);
-          const hitAmt = hit ? (b.perTicket ? (b.perTicket[trio] || 0) : (b.amountPerPoint || 0)) : 0;
-          const payout = hit && odds > 0 ? Math.round((hitAmt / 100) * odds) : 0;
-          return { ...b, result: trio, hit, payoutOdds: odds || null, payout };
+          const hit = ticketListIncludesResult(b?.tickets, trio);
+          const payout = hit && odds > 0 ? recomputeTrifectaPayout(b, trio, odds) : 0;
+          return {
+            ...b,
+            result: trio,
+            hit,
+            payoutOdds: odds || null,
+            payout,
+            settlementSource: "manual",
+            settlementVersion: 0,
+          };
         })
       : prev);
 
@@ -5379,82 +5462,90 @@ export default function App() {
     setBetMsg(saved ? "✓ 舟券履歴をすべて削除しました" : "✗ 舟券履歴の削除に失敗しました");
   };
 
-  // 収支の集計
-  const betStats = useMemo(() => {
-    const races = new Set();
-    let spent = 0, ret = 0, hit = 0, judged = 0;
-    for (const b of statFilter.bets) {
-      races.add(`${b.date}_${b.venue}_${b.race}`);
-      spent += Number(b.amount || 0);
-      ret += Number(b.payout || 0);
-      if (b.result) { judged += 1; if (b.hit) hit += 1; }
+  // 保存済みの hit / payout は使わず、公式出目と保存買い目を完全一致で毎回再計算する。
+  // 未確定レースは収支・的中率の分母に入れない。
+  const summarizeRecordedBets = (rows, name = "") => {
+    const byRace = new Map();
+    for (const b of Array.isArray(rows) ? rows : []) {
+      const key = `${b?.date || ""}_${b?.venue || ""}_${b?.race || ""}`;
+      if (!byRace.has(key)) byRace.set(key, { key, date: b?.date || "", venue: b?.venue || "", race: b?.race || "", records: [] });
+      byRace.get(key).records.push(b);
     }
+
+    let spent = 0;
+    let ret = 0;
+    let judged = 0;
+    let hit = 0;
+    let betCount = 0;
+    const hitDetails = [];
+
+    for (const race of byRace.values()) {
+      const verified = race.records.find((b) => Number(b?.settlementVersion || 0) >= 3 && normalizeTrifectaResult(b?.result));
+      const fallback = race.records.find((b) => normalizeTrifectaResult(b?.result));
+      const source = verified || fallback;
+      const result = normalizeTrifectaResult(source?.result);
+      if (!result) continue;
+
+      judged += 1;
+      let raceHit = false;
+      let raceSpent = 0;
+      let raceRet = 0;
+
+      for (const b of race.records) {
+        raceSpent += Number(b?.amount || 0);
+        betCount += 1;
+        const matched = ticketListIncludesResult(b?.tickets, result);
+        if (!matched) continue;
+        raceHit = true;
+        const payoutPer100 = Number(b?.payoutOdds || source?.payoutOdds || 0);
+        raceRet += recomputeTrifectaPayout(b, result, payoutPer100);
+      }
+
+      spent += raceSpent;
+      ret += raceRet;
+      if (raceHit) {
+        hit += 1;
+        hitDetails.push(`${race.venue || ""}${race.race}R ${result}`.trim());
+      }
+    }
+
     return {
-      raceCount: races.size,
-      betCount: statFilter.bets.length,
-      spent, ret,
+      name,
+      races: judged,
+      recordedRaces: byRace.size,
+      bets: betCount,
+      spent,
+      ret,
+      profit: ret - spent,
+      hit,
+      judged,
+      hitDetails,
       hitRate: judged ? (hit / judged * 100) : null,
       roi: spent ? (ret / spent * 100) : null,
-      judged, hit,
+    };
+  };
+
+  // 舟券収支全体もレース単位で判定する。
+  const betStats = useMemo(() => {
+    const summary = summarizeRecordedBets(statFilter.bets, "舟券全体");
+    return {
+      raceCount: summary.races,
+      betCount: summary.bets,
+      spent: summary.spent,
+      ret: summary.ret,
+      hitRate: summary.hitRate,
+      roi: summary.roi,
+      judged: summary.judged,
+      hit: summary.hit,
+      hitDetails: summary.hitDetails,
     };
   }, [statFilter]);
 
-  // 実際に記録したAI買い目（本線・対抗・穴・超穴）だけを区分別・組み合わせ別に集計。
+  // 実際に記録したAI買い目を、単体・組み合わせ・開催場別で同じ判定関数に通す。
   const aiBetStats = useMemo(() => {
     const labels = ["本線", "対抗", "穴", "超穴"];
     const source = (Array.isArray(statFilter?.bets) ? statFilter.bets : [])
       .filter((b) => labels.includes(String(b?.label || "")));
-
-    const summarize = (rows, name) => {
-      // 的中判定は保存済みの b.hit を信用せず、結果出目と買い目を毎回突き合わせる。
-      // また、的中率は「区分レコード数」ではなく「レース数」で数える。
-      const byRace = new Map();
-      for (const b of rows) {
-        const key = `${b?.date || ""}_${b?.venue || ""}_${b?.race || ""}`;
-        if (!byRace.has(key)) {
-          byRace.set(key, {
-            date: b?.date || "",
-            venue: b?.venue || "",
-            race: b?.race || "",
-            result: String(b?.result || "").trim(),
-            spent: 0,
-            ret: 0,
-            tickets: [],
-          });
-        }
-        const race = byRace.get(key);
-        if (!race.result && b?.result) race.result = String(b.result).trim();
-        race.spent += Number(b?.amount || 0);
-        race.ret += Number(b?.payout || 0);
-        if (Array.isArray(b?.tickets)) race.tickets.push(...b.tickets.map((t) => String(t || "").trim()));
-      }
-
-      let spent = 0;
-      let ret = 0;
-      let judged = 0;
-      let hit = 0;
-      for (const race of byRace.values()) {
-        spent += race.spent;
-        ret += race.ret;
-        if (!race.result) continue;
-        judged += 1;
-        if (race.tickets.includes(race.result)) hit += 1;
-      }
-
-      return {
-        name,
-        races: byRace.size,
-        bets: rows.length,
-        spent,
-        ret,
-        profit: ret - spent,
-        hit,
-        judged,
-        hitRate: judged ? (hit / judged * 100) : null,
-        roi: spent ? (ret / spent * 100) : null,
-      };
-    };
-
     const byLabel = Object.fromEntries(
       labels.map((label) => [label, source.filter((b) => String(b?.label || "") === label)])
     );
@@ -5471,11 +5562,11 @@ export default function App() {
     ];
 
     const rows = definitions
-      .map((def) => summarize(def.labels.flatMap((label) => byLabel[label] || []), def.name))
-      .filter((row) => row.bets > 0);
+      .map((def) => summarizeRecordedBets(def.labels.flatMap((label) => byLabel[label] || []), def.name))
+      .filter((row) => row.recordedRaces > 0);
 
     const venueRows = [...new Set(source.map((b) => String(b?.venue || "").trim()).filter(Boolean))]
-      .map((venueName) => summarize(source.filter((b) => String(b?.venue || "").trim() === venueName), venueName))
+      .map((venueName) => summarizeRecordedBets(source.filter((b) => String(b?.venue || "").trim() === venueName), venueName))
       .sort((a, b) => b.races - a.races || a.name.localeCompare(b.name, "ja"));
 
     return {
@@ -7903,13 +7994,13 @@ export default function App() {
                 AI予想収支表
               </div>
               <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.6, marginBottom: 10 }}>
-                実際に舟券履歴へ記録した本線・対抗・穴・超穴の買い目だけを集計しています。単体成績と、よく使う組み合わせ成績を1つの見やすい表にまとめています。
+                公式結果と3連単払戻金を再照合し、結果確定済みレースだけを集計しています。フォーメーション表示も全点へ展開して完全一致で判定します。
               </div>
               <div style={{ display: "grid", gap: 8 }}>
                 {aiBetStats.rows.map((row) => {
                   const profitPositive = Number(row.profit) >= 0;
                   const roiPositive = Number(row.roi) >= 100;
-                  const highlight = row.name === "AI全体";
+                  const highlight = row.name === "本線+対抗+穴";
                   return (
                     <div key={row.name} style={{
                       background: highlight ? "#1b3550" : "#0e1b2c",
@@ -7937,6 +8028,11 @@ export default function App() {
                             <div style={{ fontSize: 14, fontWeight: 800, color }}>{value}</div>
                           </div>
                         ))}
+                      </div>
+                      <div style={{ marginTop: 8, fontSize: 10, lineHeight: 1.6, color: row.hitDetails?.length ? "#5dd39e" : "#6f8ba6" }}>
+                        {row.hitDetails?.length
+                          ? `的中レース：${row.hitDetails.join("・")}`
+                          : "的中レース：なし"}
                       </div>
                     </div>
                   );

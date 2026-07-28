@@ -468,10 +468,20 @@ async function readRaceSettlement({ venue, raceNo, ymd }) {
   // これにより高配当の端数（例: 168,620円）や、締切前オッズとの差をそのまま反映できる。
   const officialPayout = await fetchOfficialTrifectaPayout({ venue, raceNo: race, ymd, expectedResult: result });
   if (officialPayout?.payoutPer100 > 0) {
+    const officialResult = String(officialPayout?.result || "").replace(/[^1-6-]/g, "");
+    const parts = officialResult.split("-");
+    const officialResultValid = /^([1-6])-([1-6])-([1-6])$/.test(officialResult)
+      && new Set(parts).size === 3;
+    // 公式結果ページから解析した出目を精算の最終正とする。
+    // DB側の着順と食い違う場合に、DB出目と公式払戻だけを誤って組み合わせない。
+    const verifiedResult = officialResultValid ? officialResult : result;
     return {
       completed: true,
       settlementReady: true,
-      result,
+      result: verifiedResult,
+      verifiedResult,
+      cachedResult: result,
+      resultMismatch: officialResultValid && officialResult !== result,
       payoutOdds: officialPayout.payoutPer100 / 100,
       payoutPer100: officialPayout.payoutPer100,
       oddsSource: officialPayout.source,
