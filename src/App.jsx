@@ -5353,7 +5353,7 @@ export default function App() {
     };
   }, [statFilter]);
 
-  // 実際に記録したAI買い目（本線・対抗・穴・超穴）だけを区分別に集計。
+  // 実際に記録したAI買い目（本線・対抗・穴・超穴）だけを区分別・組み合わせ別に集計。
   const aiBetStats = useMemo(() => {
     const labels = ["本線", "対抗", "穴", "超穴"];
     const source = (Array.isArray(statFilter?.bets) ? statFilter.bets : [])
@@ -5383,18 +5383,33 @@ export default function App() {
         profit: ret - spent,
         hit,
         judged,
-        hitRate: judged ? hit / judged * 100 : null,
-        roi: spent ? ret / spent * 100 : null,
+        hitRate: judged ? (hit / judged * 100) : null,
+        roi: spent ? (ret / spent * 100) : null,
       };
     };
 
-    const rows = labels
-      .map((label) => summarize(source.filter((b) => String(b?.label || "") === label), label))
+    const byLabel = Object.fromEntries(
+      labels.map((label) => [label, source.filter((b) => String(b?.label || "") === label)])
+    );
+
+    const definitions = [
+      { name: "本線", labels: ["本線"] },
+      { name: "対抗", labels: ["対抗"] },
+      { name: "穴", labels: ["穴"] },
+      { name: "超穴", labels: ["超穴"] },
+      { name: "本線+対抗", labels: ["本線", "対抗"] },
+      { name: "本線+穴", labels: ["本線", "穴"] },
+      { name: "対抗+穴", labels: ["対抗", "穴"] },
+      { name: "本線+対抗+穴", labels: ["本線", "対抗", "穴"] },
+    ];
+
+    const rows = definitions
+      .map((def) => summarize(def.labels.flatMap((label) => byLabel[label] || []), def.name))
       .filter((row) => row.bets > 0);
 
     return {
       rows,
-      total: summarize(source, "合計"),
+      total: summarize(source, "AI全体"),
       hasData: source.length > 0,
     };
   }, [statFilter]);
@@ -7785,47 +7800,45 @@ export default function App() {
               <div style={{ fontSize: 12, fontWeight: 900, color: "#fff", marginBottom: 3 }}>
                 AI予想収支表
               </div>
-              <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.6, marginBottom: 9 }}>
-                実際に舟券履歴へ記録した本線・対抗・穴・超穴の買い目だけを集計しています。
+              <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.6, marginBottom: 10 }}>
+                実際に舟券履歴へ記録した本線・対抗・穴・超穴の買い目だけを集計しています。単体成績と、よく使う組み合わせ成績を1つの見やすい表にまとめています。
               </div>
-              <div style={{ overflowX: "auto" }}>
-                <div style={{ minWidth: 620, display: "grid", gap: 5 }}>
-                  <div style={{
-                    display: "grid",
-                    gridTemplateColumns: "1.1fr .7fr .9fr .9fr .9fr .8fr .8fr",
-                    gap: 6, padding: "0 8px 4px", fontSize: 10, color: "#6f8ba6",
-                  }}>
-                    <span>区分</span><span>R数</span><span>購入</span><span>払戻</span><span>収支</span><span>的中率</span><span>回収率</span>
-                  </div>
-                  {[...aiBetStats.rows, aiBetStats.total].map((row) => {
-                    const profitPositive = Number(row.profit) >= 0;
-                    const roiPositive = Number(row.roi) >= 100;
-                    return (
-                      <div key={row.name} style={{
-                        display: "grid",
-                        gridTemplateColumns: "1.1fr .7fr .9fr .9fr .9fr .8fr .8fr",
-                        gap: 6, alignItems: "center",
-                        background: row.name === "合計" ? "#1b3550" : "#0e1b2c",
-                        borderRadius: 8, padding: "8px",
-                        fontSize: 11,
-                      }}>
-                        <span style={{ color: "#cfe0f0", fontWeight: 800 }}>{row.name}</span>
-                        <span style={{ color: "#9db5cc" }}>{row.races}R</span>
-                        <span style={{ color: "#9db5cc" }}>{row.spent.toLocaleString()}円</span>
-                        <span style={{ color: "#9db5cc" }}>{row.ret.toLocaleString()}円</span>
-                        <span style={{ color: profitPositive ? "#5dd39e" : "#ff8a80", fontWeight: 800 }}>
+              <div style={{ display: "grid", gap: 8 }}>
+                {[...aiBetStats.rows, aiBetStats.total].map((row) => {
+                  const profitPositive = Number(row.profit) >= 0;
+                  const roiPositive = Number(row.roi) >= 100;
+                  const highlight = row.name === "AI全体";
+                  return (
+                    <div key={row.name} style={{
+                      background: highlight ? "#1b3550" : "#0e1b2c",
+                      borderRadius: 10,
+                      padding: "10px 12px",
+                      border: highlight ? "1px solid #335c84" : "1px solid transparent",
+                    }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                        <div style={{ color: "#fff", fontWeight: 900, fontSize: 15 }}>{row.name}</div>
+                        <div style={{ color: profitPositive ? "#5dd39e" : "#ff8a80", fontWeight: 900, fontSize: 18 }}>
                           {profitPositive ? "+" : ""}{row.profit.toLocaleString()}円
-                        </span>
-                        <span style={{ color: "#9db5cc" }}>
-                          {row.hitRate == null ? "—" : `${safeFixed(row.hitRate, 1)}%`}
-                        </span>
-                        <span style={{ color: row.roi == null ? "#9db5cc" : (roiPositive ? "#5dd39e" : "#ff8a80"), fontWeight: 800 }}>
-                          {row.roi == null ? "—" : `${safeFixed(row.roi, 1)}%`}
-                        </span>
+                        </div>
                       </div>
-                    );
-                  })}
-                </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+                        {[
+                          ["R数", `${row.races}R`, "#e8eef5"],
+                          ["購入", `${row.spent.toLocaleString()}円`, "#e8eef5"],
+                          ["払戻", `${row.ret.toLocaleString()}円`, "#e8eef5"],
+                          ["的中率", row.hitRate == null ? "—" : `${safeFixed(row.hitRate, 1)}%`, "#e8eef5"],
+                          ["的中", `${row.hit}/${row.judged || 0}`, "#e8eef5"],
+                          ["回収率", row.roi == null ? "—" : `${safeFixed(row.roi, 1)}%`, row.roi == null ? "#e8eef5" : (roiPositive ? "#5dd39e" : "#ff8a80")],
+                        ].map(([label, value, color]) => (
+                          <div key={`${row.name}_${label}`} style={{ background: "rgba(255,255,255,0.03)", borderRadius: 8, padding: "8px 9px" }}>
+                            <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 4 }}>{label}</div>
+                            <div style={{ fontSize: 14, fontWeight: 800, color }}>{value}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}
