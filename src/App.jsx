@@ -1685,9 +1685,10 @@ export default function App() {
         date: qs.get("date") || "",
         venue: qs.get("venue") || "",
         race: Number.isInteger(race) && race >= 1 && race <= 12 ? race : null,
+        token: qs.get("capture_token") || "",
       };
     } catch {
-      return { date: "", venue: "", race: null };
+      return { date: "", venue: "", race: null, token: "" };
     }
   });
   const [venueNotHeld, setVenueNotHeld] = useState(false);
@@ -1786,9 +1787,13 @@ export default function App() {
   const [venueLedger, setVenueLedger] = useState(null);
   const [venueLedgerLoading, setVenueLedgerLoading] = useState(false);
   const [venueLedgerError, setVenueLedgerError] = useState("");
-  const [aiCaptureQueue, setAiCaptureQueue] = useState([]); // [{date,venue,race}] 全開催場の締切前AI予想を順次保存
+  const [aiCaptureQueue, setAiCaptureQueue] = useState([]); // [{date,venue,race,captureToken}] 一括記録キュー
+  const aiCaptureQueueRef = useRef([]);
+  const aiCaptureFrameRef = useRef(null);
+  const [captureLoadedKey, setCaptureLoadedKey] = useState("");
   const aiCaptureAttemptRef = useRef(new Map());
   const predictionSaveRef = useRef("");
+  useEffect(() => { aiCaptureQueueRef.current = aiCaptureQueue; }, [aiCaptureQueue]);
   const betRecordsRef = useRef([]);              // 保存処理用の最新値ミラー
   const settlementVerifiedRef = useRef(new Set()); // 公式結果と払戻をこの画面で再照合済みのレース
   useEffect(() => { betRecordsRef.current = betRecords; }, [betRecords]);
@@ -2479,6 +2484,14 @@ export default function App() {
       }
 
       applyBoatcastRows(safeRows, { displayDisabled });
+      if (
+        captureAiMode
+        && String(targetVenue) === String(captureAiTarget.venue)
+        && String(targetDate) === String(captureAiTarget.date || targetDate)
+        && Number(targetRaceNo) === Number(captureAiTarget.race)
+      ) {
+        setCaptureLoadedKey(`${targetDate}_${targetVenue}_${Number(targetRaceNo)}`);
+      }
 
       const simpleFetchMsg = `${targetVenue}${targetRaceNo}Rのデータを取得しました${cacheNote}。`;
       setPMsg("tenji", simpleFetchMsg);
@@ -2560,6 +2573,14 @@ export default function App() {
     setPMsg("tenji", simpleFetchMsg);
     setAutoMsg(simpleFetchMsg);
     setAutoRefreshInfo("");
+    if (
+      captureAiMode
+      && String(targetVenue) === String(captureAiTarget.venue)
+      && String(targetDate) === String(captureAiTarget.date || targetDate)
+      && Number(targetRaceNo) === Number(captureAiTarget.race)
+    ) {
+      setCaptureLoadedKey(`${targetDate}_${targetVenue}_${Number(targetRaceNo)}`);
+    }
     return true;
   };
 
@@ -2653,6 +2674,9 @@ export default function App() {
       return;
     }
     window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "loading", date: d, venue: v, race: r };
+    setCaptureLoadedKey("");
+    predictionSaveRef.current = "";
+    resetRaceAutoData();
     setAutoRefreshEnabled(false);
     setRaceDate(d);
     setVenue(v);
@@ -4541,6 +4565,10 @@ export default function App() {
     const targetRace = Number(captureAiTarget.race);
 
     if (!targetVenue || !targetDate || !Number.isInteger(targetRace) || targetRace < 1 || targetRace > 12) return;
+    const targetKey = `${targetDate}_${targetVenue}_${targetRace}`;
+    if (!captureAiTarget.token) return;
+    if (captureLoadedKey !== targetKey) return;
+    if (autoLoading) return;
     if (venue !== targetVenue || raceDate !== targetDate || Number(raceNo) !== targetRace) return;
     if (!aiEval?.bets?.length) return;
 
@@ -4560,6 +4588,8 @@ export default function App() {
             date: targetDate,
             venue: targetVenue,
             race: targetRace,
+            captureToken: captureAiTarget.token,
+            loadedKey: targetKey,
             error: "風未設定",
           }, window.location.origin);
         }
@@ -4588,10 +4618,12 @@ export default function App() {
         date: targetDate,
         venue: targetVenue,
         race: targetRace,
+        captureToken: captureAiTarget.token,
+        loadedKey: targetKey,
         bets,
       }, window.location.origin);
     }
-  }, [aiEval, venue, raceDate, raceNo, captureAiMode, captureAiTarget, raceWinds, raceWindsLoading]);
+  }, [aiEval, venue, raceDate, raceNo, captureAiMode, captureAiTarget, captureLoadedKey, autoLoading, raceWinds, raceWindsLoading]);
 
 
   const loadVenueAiLedger = async ({ quiet = false } = {}) => {
@@ -4648,6 +4680,12 @@ export default function App() {
       const targetVenue = String(event.data?.venue || "");
       const targetRace = Number(event.data?.race);
       const queueKey = `${targetDate}_${targetVenue}_${targetRace}`;
+      const current = aiCaptureQueueRef.current?.[0];
+      const expectedKey = current ? `${current.date}_${current.venue}_${Number(current.race)}` : "";
+      if (!current || queueKey !== expectedKey) return;
+      if (event.source !== aiCaptureFrameRef.current?.contentWindow) return;
+      if (!current.captureToken || String(event.data?.captureToken || "") !== String(current.captureToken)) return;
+      if (String(event.data?.loadedKey || "") !== expectedKey) return;
 
       if (type === "hunaken-ai-batch-ready") {
         const sourceBets = Array.isArray(event.data?.bets) ? event.data.bets : [];
@@ -4682,14 +4720,24 @@ export default function App() {
             settlementStatus: "pending",
             recordedAt: now,
             batchRecorded: true,
+            batchCaptureVersion: 2,
+            batchCaptureToken: current.captureToken,
+            batchSourceKey: expectedKey,
+            batchSourceRace: targetRace,
           }];
         });
 
         if (recs.length) {
           await persistBets((prev) => {
-            // 同じ日・場・R・区分を一括記録し直した場合は置き換える。
-            const replaceKeys = new Set(recs.map((r) => `${r.date}_${r.venue}_${r.race}_${r.label}`));
-            const kept = prev.filter((r) => !replaceKeys.has(`${r.date}_${r.venue}_${r.race}_${r.label}`));
+            // このレースの旧一括記録は、本線・対抗・穴をまとめて完全置換する。
+            const batchLabels = new Set(["本線", "対抗", "穴"]);
+            const kept = prev.filter((r) => !(
+              r?.batchRecorded
+              && r?.date === targetDate
+              && r?.venue === targetVenue
+              && Number(r?.race) === targetRace
+              && batchLabels.has(String(r?.label || ""))
+            ));
             return [...recs, ...kept];
           });
         }
@@ -5390,7 +5438,7 @@ export default function App() {
     return { pts, amt };
   }, [cart]);
 
-  const startBatchBetRecording = () => {
+  const startBatchBetRecording = async () => {
     if (!venue) {
       setBatchBetStatus("開催場を選択してください");
       return;
@@ -5410,18 +5458,32 @@ export default function App() {
       return;
     }
 
+    const batchStartedAt = Date.now();
     const targets = Array.from({ length: 12 }, (_, i) => i + 1)
       .filter((r) => String(raceWinds?.[r] || "").trim())
-      .map((r) => ({ date: raceDate, venue, race: r }));
+      .map((r) => ({
+        date: raceDate,
+        venue,
+        race: r,
+        captureToken: `${batchStartedAt}_${r}_${Math.random().toString(36).slice(2, 10)}`,
+      }));
 
     if (!targets.length) {
       setBatchBetStatus("風が設定されているレースがありません");
       return;
     }
 
+    // 以前の一括記録はレース紐付けがずれている可能性があるため、この日・場の分を先に除去して作り直す。
+    await persistBets((prev) => prev.filter((b) => !(
+      b?.batchRecorded
+      && b?.date === raceDate
+      && b?.venue === venue
+      && ["本線", "対抗", "穴"].includes(String(b?.label || ""))
+    )));
+
     setBatchBetProgress({ done: 0, total: targets.length, saved: 0, skipped: 0 });
     setBatchBetStatus(
-      `一括記録を開始しました（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}／1点100円）`
+      `旧一括記録を削除して再作成中（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}／1点100円）`
     );
     predictionSaveRef.current = "";
     setAiCaptureQueue(targets);
@@ -5525,9 +5587,21 @@ export default function App() {
     };
   };
 
+  const reliableStatBets = useMemo(() => (
+    (Array.isArray(statFilter?.bets) ? statFilter.bets : []).filter((b) => (
+      !b?.batchRecorded || Number(b?.batchCaptureVersion || 0) >= 2
+    ))
+  ), [statFilter]);
+
+  const legacyBatchCount = useMemo(() => (
+    (Array.isArray(betRecords) ? betRecords : []).filter((b) => (
+      b?.batchRecorded && Number(b?.batchCaptureVersion || 0) < 2
+    )).length
+  ), [betRecords]);
+
   // 舟券収支全体もレース単位で判定する。
   const betStats = useMemo(() => {
-    const summary = summarizeRecordedBets(statFilter.bets, "舟券全体");
+    const summary = summarizeRecordedBets(reliableStatBets, "舟券全体");
     return {
       raceCount: summary.races,
       betCount: summary.bets,
@@ -5539,12 +5613,12 @@ export default function App() {
       hit: summary.hit,
       hitDetails: summary.hitDetails,
     };
-  }, [statFilter]);
+  }, [reliableStatBets]);
 
   // 実際に記録したAI買い目を、単体・組み合わせ・開催場別で同じ判定関数に通す。
   const aiBetStats = useMemo(() => {
     const labels = ["本線", "対抗", "穴", "超穴"];
-    const source = (Array.isArray(statFilter?.bets) ? statFilter.bets : [])
+    const source = reliableStatBets
       .filter((b) => labels.includes(String(b?.label || "")));
     const byLabel = Object.fromEntries(
       labels.map((label) => [label, source.filter((b) => String(b?.label || "") === label)])
@@ -5574,7 +5648,7 @@ export default function App() {
       venueRows,
       hasData: source.length > 0,
     };
-  }, [statFilter]);
+  }, [reliableStatBets]);
 
   const fmt = (n, d = 2) => safeFixed(n, d);
   const sign = (n) => (n > 0 ? `+${n}` : `${n}`);
@@ -7988,6 +8062,21 @@ export default function App() {
             })}
           </div>
 
+          {legacyBatchCount > 0 && (
+            <div style={{
+              background: "#3a2b14",
+              border: "1px solid #9b6a20",
+              color: "#ffd48a",
+              borderRadius: 10,
+              padding: "11px 12px",
+              marginBottom: 12,
+              fontSize: 11,
+              lineHeight: 1.7,
+            }}>
+              旧方式の一括記録が{legacyBatchCount}件あります。レースずれの可能性があるため収支集計から除外しています。下の「1R〜12Rを一括記録」をもう一度押すと、旧記録を削除して正しく作り直します。
+            </div>
+          )}
+
           {aiBetStats.hasData && (
             <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
               <div style={{ fontSize: 12, fontWeight: 900, color: "#fff", marginBottom: 3 }}>
@@ -8098,7 +8187,7 @@ export default function App() {
             <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.7, marginBottom: 9 }}>
               風を設定済みの各レースについて、それぞれのAI予想から現在の点数設定
               （本線{Number(betLimits?.["本線"] ?? 0)}・対抗{Number(betLimits?.["対抗"] ?? 0)}・穴{Number(betLimits?.["穴"] ?? 0)}）
-              を上段の表示順のまま1点100円で記録します。下段の選び順・配分は使用しません。公開前などAI予想を取得できないレースはスキップされます。
+              を上段の表示順のまま1点100円で記録します。下段の選び順・配分は使用しません。各レースの読込完了を確認してから保存します。公開前などAI予想を取得できないレースはスキップされます。
             </div>
             <button
               onClick={startBatchBetRecording}
@@ -8422,9 +8511,10 @@ export default function App() {
 
         {!captureAiMode && aiCaptureQueue.length > 0 && (
           <iframe
-            key={`${aiCaptureQueue[0].date}_${aiCaptureQueue[0].venue}_${aiCaptureQueue[0].race}`}
+            ref={aiCaptureFrameRef}
+            key={`${aiCaptureQueue[0].date}_${aiCaptureQueue[0].venue}_${aiCaptureQueue[0].race}_${aiCaptureQueue[0].captureToken}`}
             title="AI買い目一括記録"
-            src={`${window.location.pathname}?capture_ai=1&date=${encodeURIComponent(aiCaptureQueue[0].date)}&venue=${encodeURIComponent(aiCaptureQueue[0].venue)}&race=${encodeURIComponent(aiCaptureQueue[0].race)}`}
+            src={`${window.location.pathname}?capture_ai=1&date=${encodeURIComponent(aiCaptureQueue[0].date)}&venue=${encodeURIComponent(aiCaptureQueue[0].venue)}&race=${encodeURIComponent(aiCaptureQueue[0].race)}&capture_token=${encodeURIComponent(aiCaptureQueue[0].captureToken || "")}`}
             style={{ position: "fixed", width: 1, height: 1, opacity: 0, pointerEvents: "none", left: -9999, top: -9999, border: 0 }}
           />
         )}
