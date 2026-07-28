@@ -5325,14 +5325,22 @@ export default function App() {
     await persistBets((prev) => prev.filter((b) => b.id !== id));
   };
 
+  const clearAllBetRecords = async () => {
+    if (!betRecords.length) return;
+    const ok = window.confirm(`舟券履歴${betRecords.length}件をすべて削除します。元に戻せません。よろしいですか？`);
+    if (!ok) return;
+    const saved = await persistBets([]);
+    setBetMsg(saved ? "✓ 舟券履歴をすべて削除しました" : "✗ 舟券履歴の削除に失敗しました");
+  };
+
   // 収支の集計
   const betStats = useMemo(() => {
     const races = new Set();
     let spent = 0, ret = 0, hit = 0, judged = 0;
     for (const b of statFilter.bets) {
       races.add(`${b.date}_${b.venue}_${b.race}`);
-      spent += b.amount;
-      ret += b.payout || 0;
+      spent += Number(b.amount || 0);
+      ret += Number(b.payout || 0);
       if (b.result) { judged += 1; if (b.hit) hit += 1; }
     }
     return {
@@ -5342,6 +5350,52 @@ export default function App() {
       hitRate: judged ? (hit / judged * 100) : null,
       roi: spent ? (ret / spent * 100) : null,
       judged, hit,
+    };
+  }, [statFilter]);
+
+  // 実際に記録したAI買い目（本線・対抗・穴・超穴）だけを区分別に集計。
+  const aiBetStats = useMemo(() => {
+    const labels = ["本線", "対抗", "穴", "超穴"];
+    const source = (Array.isArray(statFilter?.bets) ? statFilter.bets : [])
+      .filter((b) => labels.includes(String(b?.label || "")));
+
+    const summarize = (rows, name) => {
+      const races = new Set();
+      let spent = 0;
+      let ret = 0;
+      let judged = 0;
+      let hit = 0;
+      for (const b of rows) {
+        races.add(`${b?.date || ""}_${b?.venue || ""}_${b?.race || ""}`);
+        spent += Number(b?.amount || 0);
+        ret += Number(b?.payout || 0);
+        if (b?.result) {
+          judged += 1;
+          if (b?.hit) hit += 1;
+        }
+      }
+      return {
+        name,
+        races: races.size,
+        bets: rows.length,
+        spent,
+        ret,
+        profit: ret - spent,
+        hit,
+        judged,
+        hitRate: judged ? hit / judged * 100 : null,
+        roi: spent ? ret / spent * 100 : null,
+      };
+    };
+
+    const rows = labels
+      .map((label) => summarize(source.filter((b) => String(b?.label || "") === label), label))
+      .filter((row) => row.bets > 0);
+
+    return {
+      rows,
+      total: summarize(source, "合計"),
+      hasData: source.length > 0,
     };
   }, [statFilter]);
 
@@ -7726,6 +7780,56 @@ export default function App() {
             })}
           </div>
 
+          {aiBetStats.hasData && (
+            <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
+              <div style={{ fontSize: 12, fontWeight: 900, color: "#fff", marginBottom: 3 }}>
+                AI予想収支表
+              </div>
+              <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.6, marginBottom: 9 }}>
+                実際に舟券履歴へ記録した本線・対抗・穴・超穴の買い目だけを集計しています。
+              </div>
+              <div style={{ overflowX: "auto" }}>
+                <div style={{ minWidth: 620, display: "grid", gap: 5 }}>
+                  <div style={{
+                    display: "grid",
+                    gridTemplateColumns: "1.1fr .7fr .9fr .9fr .9fr .8fr .8fr",
+                    gap: 6, padding: "0 8px 4px", fontSize: 10, color: "#6f8ba6",
+                  }}>
+                    <span>区分</span><span>R数</span><span>購入</span><span>払戻</span><span>収支</span><span>的中率</span><span>回収率</span>
+                  </div>
+                  {[...aiBetStats.rows, aiBetStats.total].map((row) => {
+                    const profitPositive = Number(row.profit) >= 0;
+                    const roiPositive = Number(row.roi) >= 100;
+                    return (
+                      <div key={row.name} style={{
+                        display: "grid",
+                        gridTemplateColumns: "1.1fr .7fr .9fr .9fr .9fr .8fr .8fr",
+                        gap: 6, alignItems: "center",
+                        background: row.name === "合計" ? "#1b3550" : "#0e1b2c",
+                        borderRadius: 8, padding: "8px",
+                        fontSize: 11,
+                      }}>
+                        <span style={{ color: "#cfe0f0", fontWeight: 800 }}>{row.name}</span>
+                        <span style={{ color: "#9db5cc" }}>{row.races}R</span>
+                        <span style={{ color: "#9db5cc" }}>{row.spent.toLocaleString()}円</span>
+                        <span style={{ color: "#9db5cc" }}>{row.ret.toLocaleString()}円</span>
+                        <span style={{ color: profitPositive ? "#5dd39e" : "#ff8a80", fontWeight: 800 }}>
+                          {profitPositive ? "+" : ""}{row.profit.toLocaleString()}円
+                        </span>
+                        <span style={{ color: "#9db5cc" }}>
+                          {row.hitRate == null ? "—" : `${safeFixed(row.hitRate, 1)}%`}
+                        </span>
+                        <span style={{ color: row.roi == null ? "#9db5cc" : (roiPositive ? "#5dd39e" : "#ff8a80"), fontWeight: 800 }}>
+                          {row.roi == null ? "—" : `${safeFixed(row.roi, 1)}%`}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+
           <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
             <div style={{ fontSize: 12, fontWeight: 800, color: "#cfe0f0", marginBottom: 6 }}>
               1R〜12RのAI買い目を一括記録
@@ -7975,7 +8079,28 @@ export default function App() {
               <summary style={{ fontSize: 12, color: "#9db5cc", cursor: "pointer" }}>
                 舟券の履歴（{betRecords.length}件）
               </summary>
-              <div style={{ display: "grid", gap: 6, marginTop: 8 }}>
+              <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8, marginBottom: 8 }}>
+                <button
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    clearAllBetRecords();
+                  }}
+                  style={{
+                    padding: "7px 11px",
+                    borderRadius: 7,
+                    border: "1px solid #7e3340",
+                    background: "#3a1e28",
+                    color: "#ff9ca8",
+                    cursor: "pointer",
+                    fontSize: 11,
+                    fontWeight: 800,
+                  }}
+                >
+                  🗑 舟券履歴を一括削除
+                </button>
+              </div>
+              <div style={{ display: "grid", gap: 6 }}>
                 {betRecords.map((b) => (
                   <div key={b.id} style={{
                     display: "flex", alignItems: "center", gap: 8,
