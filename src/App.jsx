@@ -5549,9 +5549,8 @@ export default function App() {
                 {!venueLedger.predictedRaces && <div style={{ fontSize: 10, color: "#7da3c8" }}>本アップデート以降、締切前に自動保存できたレースから集計されます。</div>}
               </>
             ) : null}
-          )}
-
           </div>
+          )}
 
           <div style={{ fontSize: 11, color: "#7da3c8", marginBottom: 6 }}>開催場を選択</div>
           <select
