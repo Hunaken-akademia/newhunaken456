@@ -242,6 +242,12 @@ function todayIso() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// 数値欠損時に画面全体を落とさないための共通フォーマッター。
+function safeFixed(value, digits = 1, fallback = "—") {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : fallback;
+}
+
 function normalizeRaceGrade(v) {
   const s = String(v || "").trim().toUpperCase();
   if (!s) return "";
