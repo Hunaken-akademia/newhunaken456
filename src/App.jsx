@@ -1698,14 +1698,15 @@ export default function App() {
   // 「買い目組む」: 対象の組み合わせ(最大4)と点数を選んでAIに厳選させる
   const [pickerParts, setPickerParts] = useState(["本線"]);
   const [pickerCount, setPickerCount] = useState(6);
-  const [pickerMode, setPickerMode] = useState("balance"); // "hit"=当たりやすさ / "ev"=期待値 / "balance"=バランス
-  const [pickerAlloc, setPickerAlloc] = useState("even"); // 配分: "even"=均等ミックス / "solid"=堅い順優先 / "ana"=穴寄り
+  const [pickerMode, setPickerMode] = useState("none"); // "none"=上段の買い目をそのまま / "hit" / "ev" / "balance"
+  const [pickerAlloc, setPickerAlloc] = useState("none"); // "none"=上段の買い目をそのまま / "even" / "solid" / "ana"
 
   // ── 舟券の収支記録 ──
   // 記録関連（予想・的中率・収支・AI収支・舟券収支・バックアップ）の表示フラグ。
   // Webアプリ版（Vercel）では localStorage に永続保存されるため有効。
   const SHOW_RECORDS = true;
-  // AI予想収支は廃止。各利用者が「買い目を追加」したレースだけ舟券収支へ表示する。
+  // 下段の選び順・配分は任意。未選択なら上段の本線・対抗・穴の点数設定をそのまま使う。
+  const SHOW_CUSTOM_AI_PICKER = true;
   const SHOW_VENUE_AI_LEDGER = false;
   const [betRecords, setBetRecords] = useState([]); // 確定した購入履歴
   const [venueLedgerPoints, setVenueLedgerPoints] = useState(() => {
@@ -5057,6 +5058,7 @@ export default function App() {
   //   各カードの並び順（＝そのカードの狙い・軸）を保ったまま、配分方式に従って拾う。
   //   選び方(pickerMode)はカード内の並べ替えに使う。配分(pickerAlloc)はカード間の取り方を決める。
   const pickedTickets = useMemo(() => {
+    if (pickerMode === "none" || pickerAlloc === "none") return null;
     if (!aiEval) return null;
     const order = aiEval.ranked.map((r) => r.boat);
     const rankPos = Object.fromEntries(order.map((b, i) => [b, i]));
@@ -5187,6 +5189,45 @@ export default function App() {
     };
     setCart((c) => [...c, line]);
     setBetMsg(`✓ ${label} をリストに追加`);
+  };
+
+  const addConfiguredAiBetsToCart = () => {
+    if (!Array.isArray(aiEval?.bets) || !aiEval.bets.length) {
+      setBetMsg("先にAI評価を表示してください");
+      return;
+    }
+
+    const labels = ["本線", "対抗", "穴"];
+    const lines = labels.flatMap((label, index) => {
+      const source = aiEval.bets.find((b) => String(b?.label || "") === label);
+      const max = Array.isArray(source?.tickets) ? source.tickets.length : 0;
+      const configured = Math.max(0, Number(betLimits?.[label] ?? max));
+      const tickets = Array.isArray(source?.tickets)
+        ? source.tickets.slice(0, Math.min(configured, max)).filter(Boolean)
+        : [];
+      if (!tickets.length) return [];
+      return [{
+        id: `${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`,
+        label,
+        tickets,
+        amountPerPoint: 100,
+        perTicket: null,
+        expanded: false,
+      }];
+    });
+
+    if (!lines.length) {
+      setBetMsg("現在の点数設定で追加できるAI買い目がありません");
+      return;
+    }
+
+    setCart((current) => {
+      const replace = new Set(lines.map((line) => line.label));
+      return [...current.filter((line) => !replace.has(String(line?.label || ""))), ...lines];
+    });
+
+    const summary = lines.map((line) => `${line.label}${line.tickets.length}`).join("・");
+    setBetMsg(`✓ 上段の点数設定（${summary}）をリストに追加`);
   };
 
   const addToCart = () => {
@@ -5407,9 +5448,14 @@ export default function App() {
       .map((def) => summarize(def.labels.flatMap((label) => byLabel[label] || []), def.name))
       .filter((row) => row.bets > 0);
 
+    const venueRows = [...new Set(source.map((b) => String(b?.venue || "").trim()).filter(Boolean))]
+      .map((venueName) => summarize(source.filter((b) => String(b?.venue || "").trim() === venueName), venueName))
+      .sort((a, b) => b.races - a.races || a.name.localeCompare(b.name, "ja"));
+
     return {
       rows,
       total: summarize(source, "AI全体"),
+      venueRows,
       hasData: source.length > 0,
     };
   }, [statFilter]);
@@ -7295,7 +7341,7 @@ export default function App() {
                     </div>
 
                     {/* 買い目を組む（AI厳選） */}
-                    {pickedTickets && (
+                    {SHOW_CUSTOM_AI_PICKER && pickedTickets && (
                       <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginTop: 16, border: "1px solid #243b56" }}>
                         <div style={{ fontSize: 12, fontWeight: 800, color: "#fff", marginBottom: 8 }}>
                           買い目を組む（AIが厳選）
@@ -7445,7 +7491,7 @@ export default function App() {
                                 padding: "9px 16px", borderRadius: 8, cursor: "pointer",
                                 background: "#5a9e2e", color: "#fff", fontSize: 13, fontWeight: 700, border: "none",
                               }}
-                            >この買い目をリストに追加</button>
+                            >{pickerMode === "none" || pickerAlloc === "none" ? "上段の点数設定をリストに追加" : "この買い目をリストに追加"}</button>
                             )}
                           </>
                         ) : (
@@ -7840,6 +7886,56 @@ export default function App() {
                   );
                 })}
               </div>
+
+              {aiBetStats.venueRows?.length > 0 && (
+                <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #2c4762" }}>
+                  <div style={{ fontSize: 12, fontWeight: 900, color: "#fff", marginBottom: 8 }}>
+                    開催場別
+                  </div>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {aiBetStats.venueRows.map((row) => {
+                      const profitPositive = Number(row.profit) >= 0;
+                      const roiPositive = Number(row.roi) >= 100;
+                      return (
+                        <div key={`venue_${row.name}`} style={{
+                          background: "#0e1b2c",
+                          borderRadius: 9,
+                          padding: "10px 11px",
+                          border: "1px solid #263e57",
+                        }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", marginBottom: 7 }}>
+                            <div style={{ color: "#fff", fontWeight: 900, fontSize: 14 }}>{row.name}</div>
+                            <div style={{ color: profitPositive ? "#5dd39e" : "#ff8a80", fontWeight: 900, fontSize: 16 }}>
+                              {profitPositive ? "+" : ""}{row.profit.toLocaleString()}円
+                            </div>
+                          </div>
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 7 }}>
+                            {[
+                              ["R数", `${row.races}R`],
+                              ["購入", `${row.spent.toLocaleString()}円`],
+                              ["払戻", `${row.ret.toLocaleString()}円`],
+                              ["的中", `${row.hit}/${row.judged || 0}`],
+                              ["的中率", row.hitRate == null ? "—" : `${safeFixed(row.hitRate, 1)}%`],
+                              ["回収率", row.roi == null ? "—" : `${safeFixed(row.roi, 1)}%`],
+                            ].map(([label, value]) => (
+                              <div key={`${row.name}_${label}`} style={{ background: "rgba(255,255,255,.03)", borderRadius: 7, padding: "7px 8px" }}>
+                                <div style={{ fontSize: 9, color: "#7da3c8", marginBottom: 3 }}>{label}</div>
+                                <div style={{
+                                  fontSize: 12,
+                                  fontWeight: 800,
+                                  color: label === "回収率" && row.roi != null
+                                    ? (roiPositive ? "#5dd39e" : "#ff8a80")
+                                    : "#e8eef5",
+                                }}>{value}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -7850,7 +7946,7 @@ export default function App() {
             <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.7, marginBottom: 9 }}>
               風を設定済みの各レースについて、それぞれのAI予想から現在の点数設定
               （本線{Number(betLimits?.["本線"] ?? 0)}・対抗{Number(betLimits?.["対抗"] ?? 0)}・穴{Number(betLimits?.["穴"] ?? 0)}）
-              を1点100円で記録します。公開前などAI予想を取得できないレースはスキップされます。
+              を上段の表示順のまま1点100円で記録します。下段の選び順・配分は使用しません。公開前などAI予想を取得できないレースはスキップされます。
             </div>
             <button
               onClick={startBatchBetRecording}
@@ -7890,6 +7986,38 @@ export default function App() {
                   {cmpMode === "overlap" ? "被り買い目のみ追加" : "全部の買い目を追加"}
                 </span>
               )}
+            </div>
+
+            <div style={{
+              background: "#0e1b2c",
+              border: "1px solid #2c4762",
+              borderRadius: 9,
+              padding: "10px",
+              marginBottom: 10,
+            }}>
+              <div style={{ fontSize: 11, color: "#cfe0f0", fontWeight: 800, marginBottom: 6 }}>
+                上段のAI買い目をそのまま記録
+              </div>
+              <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.6, marginBottom: 8 }}>
+                本線{Number(betLimits?.["本線"] ?? 0)}・対抗{Number(betLimits?.["対抗"] ?? 0)}・穴{Number(betLimits?.["穴"] ?? 0)}
+                の設定をそのまま使います。下の選び順・配分を選んだ場合だけ、カスタム厳選へ切り替わります。
+              </div>
+              <button
+                onClick={addConfiguredAiBetsToCart}
+                style={{
+                  width: "100%",
+                  padding: "10px 12px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: "#5a9e2e",
+                  color: "#fff",
+                  fontSize: 13,
+                  fontWeight: 800,
+                  cursor: "pointer",
+                }}
+              >
+                上段の点数設定をこのレースに追加
+              </button>
             </div>
 
             {/* 買い目ソース選択 */}
