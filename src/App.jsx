@@ -1764,6 +1764,8 @@ export default function App() {
   // 記録関連（予想・的中率・収支・AI収支・舟券収支・バックアップ）の表示フラグ。
   // Webアプリ版（Vercel）では localStorage に永続保存されるため有効。
   const SHOW_RECORDS = true;
+  // 一括記録の保存形式。過去版はレースずれの可能性があるため集計対象外にする。
+  const BATCH_CAPTURE_VERSION = 3;
   // 下段の選び順・配分は任意。未選択なら上段の本線・対抗・穴の点数設定をそのまま使う。
   const SHOW_CUSTOM_AI_PICKER = true;
   const SHOW_VENUE_AI_LEDGER = false;
@@ -1793,6 +1795,8 @@ export default function App() {
   const [captureLoadedKey, setCaptureLoadedKey] = useState("");
   const aiCaptureAttemptRef = useRef(new Map());
   const predictionSaveRef = useRef("");
+  const captureStableTimerRef = useRef(null);
+  const captureLastSignatureRef = useRef("");
   useEffect(() => { aiCaptureQueueRef.current = aiCaptureQueue; }, [aiCaptureQueue]);
   const betRecordsRef = useRef([]);              // 保存処理用の最新値ミラー
   const settlementVerifiedRef = useRef(new Set()); // 公式結果と払戻をこの画面で再照合済みのレース
@@ -1836,8 +1840,20 @@ export default function App() {
         } catch (e) { /* noop */ }
       }
       if (Array.isArray(loaded)) {
-        betRecordsRef.current = loaded;
-        setBetRecords(loaded);
+        // 旧方式の一括記録は、誤ったレースの買い目が紐づいた可能性があるため自動削除する。
+        // 手動で追加した舟券履歴は削除しない。
+        const cleaned = loaded.filter((b) => !(
+          b?.batchRecorded && Number(b?.batchCaptureVersion || 0) < BATCH_CAPTURE_VERSION
+        ));
+        const removed = loaded.length - cleaned.length;
+        if (removed > 0) {
+          const json = JSON.stringify(cleaned);
+          try { await window.storage.set("betRecords", json); } catch (e) { /* noop */ }
+          try { localStorage.setItem("hunaken_betRecords", json); } catch (e) { /* noop */ }
+          setBatchBetStatus(`旧方式の一括記録${removed}件を削除しました。正しい収支を作るため、一括記録をもう一度実行してください。`);
+        }
+        betRecordsRef.current = cleaned;
+        setBetRecords(cleaned);
       }
     })();
   }, []);
@@ -2676,6 +2692,11 @@ export default function App() {
     window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "loading", date: d, venue: v, race: r };
     setCaptureLoadedKey("");
     predictionSaveRef.current = "";
+    captureLastSignatureRef.current = "";
+    if (captureStableTimerRef.current) {
+      window.clearTimeout(captureStableTimerRef.current);
+      captureStableTimerRef.current = null;
+    }
     resetRaceAutoData();
     setAutoRefreshEnabled(false);
     setRaceDate(d);
@@ -4556,73 +4577,90 @@ export default function App() {
 
 
   // 一括記録用の非表示画面では、そのレースのAI買い目を親画面へ返す。
-  // サーバーへのAI予想自動保存は行わない。
+  // レース切替直後の古い評価を送らないよう、同じ買い目が2.5秒安定してから送信する。
   useEffect(() => {
-    if (!captureAiMode) return;
+    if (!captureAiMode) return undefined;
 
     const targetVenue = captureAiTarget.venue;
     const targetDate = captureAiTarget.date || raceDate;
     const targetRace = Number(captureAiTarget.race);
 
-    if (!targetVenue || !targetDate || !Number.isInteger(targetRace) || targetRace < 1 || targetRace > 12) return;
+    if (!targetVenue || !targetDate || !Number.isInteger(targetRace) || targetRace < 1 || targetRace > 12) return undefined;
     const targetKey = `${targetDate}_${targetVenue}_${targetRace}`;
-    if (!captureAiTarget.token) return;
-    if (captureLoadedKey !== targetKey) return;
-    if (autoLoading) return;
-    if (venue !== targetVenue || raceDate !== targetDate || Number(raceNo) !== targetRace) return;
-    if (!aiEval?.bets?.length) return;
+    if (!captureAiTarget.token) return undefined;
+    if (captureLoadedKey !== targetKey) return undefined;
+    if (autoLoading) return undefined;
+    if (venue !== targetVenue || raceDate !== targetDate || Number(raceNo) !== targetRace) return undefined;
+    if (!aiEval?.bets?.length) return undefined;
 
     const selectedManualWind = raceWinds?.[targetRace] || "";
     if (!selectedManualWind) {
-      if (!raceWindsLoading) {
-        window.__HUNAKEN_AI_CAPTURE_STATUS__ = {
-          state: "error",
+      if (!raceWindsLoading && window.parent !== window) {
+        window.parent.postMessage({
+          type: "hunaken-ai-batch-error",
           date: targetDate,
           venue: targetVenue,
           race: targetRace,
-          error: "このレースの風が未設定です",
-        };
-        if (window.parent !== window) {
-          window.parent.postMessage({
-            type: "hunaken-ai-batch-error",
-            date: targetDate,
-            venue: targetVenue,
-            race: targetRace,
-            captureToken: captureAiTarget.token,
-            loadedKey: targetKey,
-            error: "風未設定",
-          }, window.location.origin);
-        }
+          capturedRace: Number(raceNo),
+          captureToken: captureAiTarget.token,
+          loadedKey: targetKey,
+          batchCaptureVersion: BATCH_CAPTURE_VERSION,
+          error: "風未設定",
+        }, window.location.origin);
       }
-      return;
+      return undefined;
     }
 
     const bets = aiEval.bets.map((b) => ({
       label: String(b?.label || ""),
       tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
     }));
-    const signature = `${targetDate}_${targetVenue}_${targetRace}_${JSON.stringify(bets)}`;
-    if (predictionSaveRef.current === signature) return;
-    predictionSaveRef.current = signature;
+    const signature = `${targetKey}_${JSON.stringify(bets)}`;
+    captureLastSignatureRef.current = signature;
+    if (captureStableTimerRef.current) window.clearTimeout(captureStableTimerRef.current);
 
     window.__HUNAKEN_AI_CAPTURE_STATUS__ = {
-      state: "ready",
+      state: "stabilizing",
       date: targetDate,
       venue: targetVenue,
       race: targetRace,
     };
 
-    if (window.parent !== window) {
-      window.parent.postMessage({
-        type: "hunaken-ai-batch-ready",
+    captureStableTimerRef.current = window.setTimeout(() => {
+      if (captureLastSignatureRef.current !== signature) return;
+      if (predictionSaveRef.current === signature) return;
+      if (Number(raceNo) !== targetRace || venue !== targetVenue || raceDate !== targetDate) return;
+      predictionSaveRef.current = signature;
+
+      window.__HUNAKEN_AI_CAPTURE_STATUS__ = {
+        state: "ready",
         date: targetDate,
         venue: targetVenue,
         race: targetRace,
-        captureToken: captureAiTarget.token,
-        loadedKey: targetKey,
-        bets,
-      }, window.location.origin);
-    }
+      };
+
+      if (window.parent !== window) {
+        window.parent.postMessage({
+          type: "hunaken-ai-batch-ready",
+          date: targetDate,
+          venue: targetVenue,
+          race: targetRace,
+          capturedRace: Number(raceNo),
+          captureToken: captureAiTarget.token,
+          loadedKey: targetKey,
+          batchCaptureVersion: BATCH_CAPTURE_VERSION,
+          betsSignature: signature,
+          bets,
+        }, window.location.origin);
+      }
+    }, 2500);
+
+    return () => {
+      if (captureStableTimerRef.current) {
+        window.clearTimeout(captureStableTimerRef.current);
+        captureStableTimerRef.current = null;
+      }
+    };
   }, [aiEval, venue, raceDate, raceNo, captureAiMode, captureAiTarget, captureLoadedKey, autoLoading, raceWinds, raceWindsLoading]);
 
 
@@ -4686,6 +4724,8 @@ export default function App() {
       if (event.source !== aiCaptureFrameRef.current?.contentWindow) return;
       if (!current.captureToken || String(event.data?.captureToken || "") !== String(current.captureToken)) return;
       if (String(event.data?.loadedKey || "") !== expectedKey) return;
+      if (Number(event.data?.capturedRace) !== Number(current.race)) return;
+      if (Number(event.data?.batchCaptureVersion || 0) !== BATCH_CAPTURE_VERSION) return;
 
       if (type === "hunaken-ai-batch-ready") {
         const sourceBets = Array.isArray(event.data?.bets) ? event.data.bets : [];
@@ -4720,10 +4760,11 @@ export default function App() {
             settlementStatus: "pending",
             recordedAt: now,
             batchRecorded: true,
-            batchCaptureVersion: 2,
+            batchCaptureVersion: BATCH_CAPTURE_VERSION,
             batchCaptureToken: current.captureToken,
             batchSourceKey: expectedKey,
             batchSourceRace: targetRace,
+            batchBetsSignature: String(event.data?.betsSignature || ""),
           }];
         });
 
@@ -4758,6 +4799,11 @@ export default function App() {
 
       aiCaptureAttemptRef.current.set(queueKey, Date.now());
       predictionSaveRef.current = "";
+      captureLastSignatureRef.current = "";
+      if (captureStableTimerRef.current) {
+        window.clearTimeout(captureStableTimerRef.current);
+        captureStableTimerRef.current = null;
+      }
       setAiCaptureQueue((q) => q.filter((x) => `${x.date}_${x.venue}_${x.race}` !== queueKey));
     };
 
@@ -5589,13 +5635,13 @@ export default function App() {
 
   const reliableStatBets = useMemo(() => (
     (Array.isArray(statFilter?.bets) ? statFilter.bets : []).filter((b) => (
-      !b?.batchRecorded || Number(b?.batchCaptureVersion || 0) >= 2
+      !b?.batchRecorded || Number(b?.batchCaptureVersion || 0) >= BATCH_CAPTURE_VERSION
     ))
   ), [statFilter]);
 
   const legacyBatchCount = useMemo(() => (
     (Array.isArray(betRecords) ? betRecords : []).filter((b) => (
-      b?.batchRecorded && Number(b?.batchCaptureVersion || 0) < 2
+      b?.batchRecorded && Number(b?.batchCaptureVersion || 0) < BATCH_CAPTURE_VERSION
     )).length
   ), [betRecords]);
 
@@ -8073,7 +8119,7 @@ export default function App() {
               fontSize: 11,
               lineHeight: 1.7,
             }}>
-              旧方式の一括記録が{legacyBatchCount}件あります。レースずれの可能性があるため収支集計から除外しています。下の「1R〜12Rを一括記録」をもう一度押すと、旧記録を削除して正しく作り直します。
+              旧方式の一括記録が{legacyBatchCount}件あります。誤判定を防ぐため収支集計から除外しています。「1R〜12Rを一括記録」をもう一度押して作り直してください。
             </div>
           )}
 
