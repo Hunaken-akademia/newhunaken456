@@ -5058,8 +5058,13 @@ export default function App() {
   //   各カードの並び順（＝そのカードの狙い・軸）を保ったまま、配分方式に従って拾う。
   //   選び方(pickerMode)はカード内の並べ替えに使う。配分(pickerAlloc)はカード間の取り方を決める。
   const pickedTickets = useMemo(() => {
-    if (pickerMode === "none" || pickerAlloc === "none") return null;
     if (!aiEval) return null;
+    if (pickerMode === "none" || pickerAlloc === "none") {
+      const pool = (Array.isArray(aiEval?.bets) ? aiEval.bets : [])
+        .filter((b) => pickerParts.includes(String(b?.label || "")))
+        .reduce((sum, b) => sum + (Array.isArray(b?.tickets) ? b.tickets.length : 0), 0);
+      return { tickets: [], pool: Math.max(1, pool), comp: null, usingUpperConfig: true };
+    }
     const order = aiEval.ranked.map((r) => r.boat);
     const rankPos = Object.fromEntries(order.map((b, i) => [b, i]));
     const likeli = (t) => t.split("-").reduce((a, b) => a + (rankPos[Number(b)] ?? 9), 0);
@@ -7341,7 +7346,7 @@ export default function App() {
                     </div>
 
                     {/* 買い目を組む（AI厳選） */}
-                    {SHOW_CUSTOM_AI_PICKER && pickedTickets && (
+                    {SHOW_CUSTOM_AI_PICKER && aiEval && (
                       <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginTop: 16, border: "1px solid #243b56" }}>
                         <div style={{ fontSize: 12, fontWeight: 800, color: "#fff", marginBottom: 8 }}>
                           買い目を組む（AIが厳選）
@@ -7404,12 +7409,15 @@ export default function App() {
                           <span style={{ fontSize: 10, color: "#5e7a92" }}>（候補 {pickedTickets.pool}点から厳選）</span>
                         </div>
 
-                        <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>並び順</div>
+                        <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>
+                          並び順
+                          {pickerMode === "none" && <span style={{ marginLeft: 8, color: "#5dd39e" }}>未選択（上段の点数設定を使用）</span>}
+                        </div>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
                           {[["hit", "当たりやすさ重視", "堅い順"], ["ev", "期待値重視", "妙味・高配当"], ["balance", "バランス", "堅さ＋配当"]].map(([m, t, sub]) => (
                             <button
                               key={m}
-                              onClick={() => setPickerMode(m)}
+                              onClick={() => setPickerMode((v) => v === m ? "none" : m)}
                               style={{
                                 display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
                                 fontSize: 12, fontWeight: 700, padding: "6px 12px", borderRadius: 8, cursor: "pointer",
@@ -7430,12 +7438,15 @@ export default function App() {
 
                         {pickerParts.length >= 2 && (
                           <>
-                            <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>配分（カードの取り方）</div>
+                            <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>
+                              配分（カードの取り方）
+                              {pickerAlloc === "none" && <span style={{ marginLeft: 8, color: "#5dd39e" }}>未選択（上段の点数設定を使用）</span>}
+                            </div>
                             <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
                               {[["even", "均等ミックス", "1点ずつ交互"], ["solid", "堅い順優先", "本命カード多め"], ["ana", "穴寄り", "高配当カード多め"]].map(([m, t, sub]) => (
                                 <button
                                   key={m}
-                                  onClick={() => setPickerAlloc(m)}
+                                  onClick={() => setPickerAlloc((v) => v === m ? "none" : m)}
                                   style={{
                                     display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
                                     fontSize: 12, fontWeight: 700, padding: "6px 12px", borderRadius: 8, cursor: "pointer",
@@ -7449,6 +7460,21 @@ export default function App() {
                               ))}
                             </div>
                           </>
+                        )}
+
+                        {(pickerMode === "none" || pickerAlloc === "none") && (
+                          <div style={{
+                            background: "#0e1b2c",
+                            border: "1px solid #2c4762",
+                            borderRadius: 8,
+                            padding: "10px",
+                            marginBottom: 10,
+                            color: "#cfe0f0",
+                            fontSize: 11,
+                            lineHeight: 1.7,
+                          }}>
+                            並び順・配分を選ばない場合は、上段の本線・対抗・穴の点数設定をそのまま使います。
+                          </div>
                         )}
 
                         {pickedTickets.tickets.length > 0 ? (
@@ -7491,7 +7517,9 @@ export default function App() {
                                 padding: "9px 16px", borderRadius: 8, cursor: "pointer",
                                 background: "#5a9e2e", color: "#fff", fontSize: 13, fontWeight: 700, border: "none",
                               }}
-                            >{pickerMode === "none" || pickerAlloc === "none" ? "上段の点数設定をリストに追加" : "この買い目をリストに追加"}</button>
+                            >{pickerMode === "none" || pickerAlloc === "none" ? "上段の点数設定をリストに追加" : "{pickerMode === "none" || pickerAlloc === "none"
+                                  ? "上段の点数設定をリストに追加"
+                                  : "この買い目をリストに追加"}"}</button>
                             )}
                           </>
                         ) : (
