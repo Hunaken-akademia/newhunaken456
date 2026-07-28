@@ -242,41 +242,6 @@ function todayIso() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function jstDateTimeParts() {
-  try {
-    const parts = new Intl.DateTimeFormat("ja-JP", {
-      timeZone: "Asia/Tokyo",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    }).formatToParts(new Date()).reduce((out, part) => {
-      if (part.type !== "literal") out[part.type] = part.value;
-      return out;
-    }, {});
-    const hour = Number(parts.hour === "24" ? "0" : parts.hour);
-    return {
-      date: `${parts.year}-${parts.month}-${parts.day}`,
-      hour,
-      minute: Number(parts.minute || 0),
-    };
-  } catch {
-    const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
-    return {
-      date: d.toISOString().slice(0, 10),
-      hour: d.getUTCHours(),
-      minute: d.getUTCMinutes(),
-    };
-  }
-}
-
-function safeFixed(value, digits = 1, fallback = "—") {
-  const n = Number(value);
-  return Number.isFinite(n) ? n.toFixed(digits) : fallback;
-}
-
 function normalizeRaceGrade(v) {
   const s = String(v || "").trim().toUpperCase();
   if (!s) return "";
@@ -1734,6 +1699,8 @@ export default function App() {
   // 記録関連（予想・的中率・収支・AI収支・舟券収支・バックアップ）の表示フラグ。
   // Webアプリ版（Vercel）では localStorage に永続保存されるため有効。
   const SHOW_RECORDS = true;
+  // AI予想収支は廃止。各利用者が「買い目を追加」したレースだけ舟券収支へ表示する。
+  const SHOW_VENUE_AI_LEDGER = false;
   const [betRecords, setBetRecords] = useState([]); // 確定した購入履歴
   const [venueLedgerPoints, setVenueLedgerPoints] = useState(() => {
     try {
@@ -3659,7 +3626,7 @@ export default function App() {
 
       // 2連対率・3連対率の評価（1着率だけで切らない）
       if (r.racerR3final != null && r3Avg != null) {
-        const v3 = r.racerR3final.toFixed(1);
+        const v3 = safeFixed(r?.racerR3final, 1);
         const lo1 = r.racerR1final != null && r1Avg != null && r.racerR1final <= r1Avg - 1;
         const hi1 = r.racerR1final != null && r1Avg != null && r.racerR1final >= r1Avg + 1;
         const hi3 = r.racerR3final >= r3Avg + 3;
@@ -3677,7 +3644,7 @@ export default function App() {
         }
       }
       if (r.racerR2final != null && r2Avg != null && r.racerR2final >= r2Avg + 3 && crit.time === true) {
-        plus.push(`2連対率${r.racerR2final.toFixed(1)}%上位で相手筆頭級`);
+        plus.push(`2連対率${safeFixed(r?.racerR2final, 1)}%上位で相手筆頭級`);
       }
 
       // 逃げシミュレーション
@@ -4159,7 +4126,7 @@ export default function App() {
         const i = r.boat - 1;
         const cur = w1cur(i), best = w1best(i);
         if (cur != null && best != null && r1Avg != null && cur <= r1Avg && best >= cur + 3) {
-          reasons.push(`直近6ヶ月等は好成績（${best.toFixed(0)}%）も直近1年で人気落とし`);
+          reasons.push(`直近6ヶ月等は好成績（${safeFixed(best, 0)}%）も直近1年で人気落とし`);
         }
         if (reasons.length === 0) continue;
         const mo = meanOdds(r.boat);
@@ -4573,34 +4540,11 @@ export default function App() {
   }, [aiEval, venue, raceDate, raceNo, captureAiMode, captureAiTarget, raceWinds, raceWindsLoading]);
 
 
-  const venueLedgerDisplayState = useMemo(() => {
-    const now = jstDateTimeParts();
-    const isToday = raceDate === now.date;
-    const available = !isToday || now.hour >= 23;
-    return { isToday, available, now };
-  }, [raceDate]);
-
   const loadVenueAiLedger = async ({ quiet = false } = {}) => {
     if (!venue || !raceDate) {
       setVenueLedger(null);
       return null;
     }
-
-    const displayState = (() => {
-      const now = jstDateTimeParts();
-      const isToday = raceDate === now.date;
-      return { isToday, available: !isToday || now.hour >= 23 };
-    })();
-
-    // 当日分は23:00の最終取得後だけ集計する。
-    // 日中は未完成データを集計せず、欠損値による画面停止を防ぐ。
-    if (!displayState.available) {
-      setVenueLedger(null);
-      setVenueLedgerError("");
-      setVenueLedgerLoading(false);
-      return null;
-    }
-
     if (!quiet) setVenueLedgerLoading(true);
     setVenueLedgerError("");
     try {
@@ -4627,6 +4571,12 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!SHOW_VENUE_AI_LEDGER) {
+      setVenueLedger(null);
+      setVenueLedgerError("");
+      setVenueLedgerLoading(false);
+      return undefined;
+    }
     try { localStorage.setItem("hunaken_venue_ledger_points_v2", JSON.stringify(venueLedgerPoints)); } catch { /* noop */ }
     loadVenueAiLedger();
     const timer = window.setInterval(() => loadVenueAiLedger({ quiet: true }), 60000);
@@ -4640,7 +4590,9 @@ export default function App() {
       const key = `${event.data.date}_${event.data.venue}_${event.data.race}`;
       aiCaptureAttemptRef.current.set(key, Date.now());
       setAiCaptureQueue((q) => q.filter((x) => `${x.date}_${x.venue}_${x.race}` !== key));
-      if (event.data.date === raceDate && event.data.venue === venue) loadVenueAiLedger({ quiet: true });
+      if (SHOW_VENUE_AI_LEDGER && event.data.date === raceDate && event.data.venue === venue) {
+        loadVenueAiLedger({ quiet: true });
+      }
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
@@ -4901,7 +4853,7 @@ export default function App() {
       verdict = "勝負";
       color = "#5dd39e";
       reasons.push(`自信度${conf}で評価が明確`);
-      if (bestEv != null && bestEv >= 1.0) reasons.push(`期待値${bestEv.toFixed(2)}の妙味あり`);
+      if (bestEv != null && bestEv >= 1.0) reasons.push(`期待値${safeFixed(bestEv, 2)}の妙味あり`);
     } else {
       if (conf < 70) reasons.push(`自信度${conf}`);
       if (bestEv != null && bestEv < 1.0) reasons.push("オッズ妙味は薄め");
@@ -5167,7 +5119,7 @@ export default function App() {
   const deleteRecord = async (key) => {
     await persistRecords((prev) => prev.filter((r) => r.key !== key));
   };
-  // 保存済みレースの点数設定を後から変更（AI収支が再計算される）
+  // 保存済みレースの点数設定を後から変更
   const updateRecordLimit = async (key, label, n) => {
     await persistRecords((prev) => prev.map((r) =>
       r.key === key ? { ...r, betLimits: { ...(r.betLimits || {}), [label]: n } } : r
@@ -5319,7 +5271,7 @@ export default function App() {
     };
   }, [statFilter]);
 
-  const fmt = (n, d = 2) => n.toFixed(d);
+  const fmt = (n, d = 2) => safeFixed(n, d);
   const sign = (n) => (n > 0 ? `+${n}` : `${n}`);
   const col = (n) => (n > 0 ? "#5dd39e" : n < 0 ? "#ff8a80" : "#9db5cc");
 
@@ -5541,13 +5493,12 @@ export default function App() {
             })()}
           </select>
 
+          {SHOW_VENUE_AI_LEDGER && (
           <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
               <div>
                 <div style={{ fontSize: 12, fontWeight: 900, color: "#fff" }}>開催場AI予想収支</div>
-                <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 2 }}>
-                  当日分は23:00の最終取得後に表示
-                </div>
+                <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 2 }}>選択日のうち、結果確定済みレースまでを自動集計</div>
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6, width: "100%", marginTop: 8 }}>
                 {[
@@ -5570,18 +5521,6 @@ export default function App() {
             </div>
             {!venue ? (
               <div style={{ fontSize: 11, color: "#7da3c8" }}>開催場を選択すると表示されます。</div>
-            ) : !venueLedgerDisplayState.available ? (
-              <div style={{
-                fontSize: 12,
-                color: "#cfe0f0",
-                background: "#0e1b2c",
-                border: "1px solid #2c4762",
-                borderRadius: 8,
-                padding: "12px 10px",
-                lineHeight: 1.7,
-              }}>
-                本日のAI収支は集計中です。23:00の全レース最終取得後に表示されます。
-              </div>
             ) : venueLedgerLoading && !venueLedger ? (
               <div style={{ fontSize: 11, color: "#7da3c8" }}>集計中…</div>
             ) : venueLedgerError ? (
@@ -5595,21 +5534,14 @@ export default function App() {
                 </div>
                 <div style={{ display: "grid", gap: 6 }}>
                   {(venueLedger.patterns || []).map((p) => {
-                    const rawStat = venueLedger.stats?.[p.key];
-                    const st = rawStat && typeof rawStat === "object"
-                      ? rawStat
-                      : { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
-                    const races = Number(st.races);
-                    const spent = Number(st.spent);
-                    const ret = Number(st.ret);
-                    const hit = Number(st.hit);
-                    const roi = Number.isFinite(spent) && spent > 0 && Number.isFinite(ret) ? ret / spent * 100 : null;
-                    const hitRate = Number.isFinite(races) && races > 0 && Number.isFinite(hit) ? hit / races * 100 : null;
+                    const st = venueLedger.stats?.[p.key] || { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
+                    const roi = st.spent ? st.ret / st.spent * 100 : 0;
+                    const hitRate = st.races ? st.hit / st.races * 100 : 0;
                     return (
                       <div key={p.key} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr", gap: 6, alignItems: "center", background: "#0e1b2c", borderRadius: 8, padding: "8px 10px" }}>
                         <span style={{ fontSize: 12, fontWeight: 700, color: "#cfe0f0" }}>{st.name}</span>
-                        <span style={{ fontSize: 11, color: "#9db5cc" }}>的中 {safeFixed(hitRate, 0)}% <span style={{ color: "#5e7a92" }}>({Number.isFinite(hit) ? hit : 0}/{Number.isFinite(races) ? races : 0})</span></span>
-                        <span style={{ fontSize: 13, fontWeight: 800, textAlign: "right", color: Number.isFinite(roi) && roi >= 100 ? "#5dd39e" : "#ff8a80" }}>回収 {safeFixed(roi, 1)}%</span>
+                        <span style={{ fontSize: 11, color: "#9db5cc" }}>的中 {safeFixed(hitRate, 0)}% <span style={{ color: "#5e7a92" }}>({st.hit}/{st.races})</span></span>
+                        <span style={{ fontSize: 13, fontWeight: 800, textAlign: "right", color: roi >= 100 ? "#5dd39e" : "#ff8a80" }}>回収 {safeFixed(roi, 1)}%</span>
                       </div>
                     );
                   })}
@@ -5617,6 +5549,8 @@ export default function App() {
                 {!venueLedger.predictedRaces && <div style={{ fontSize: 10, color: "#7da3c8" }}>本アップデート以降、締切前に自動保存できたレースから集計されます。</div>}
               </>
             ) : null}
+          )}
+
           </div>
 
           <div style={{ fontSize: 11, color: "#7da3c8", marginBottom: 6 }}>開催場を選択</div>
@@ -6113,7 +6047,7 @@ export default function App() {
                     モーター{motors[b].no != null ? ` ${motors[b].no}号機` : ""}
                   </span>
                   {motors[b].rate != null && (
-                    <span>勝率 <b style={{ color: "#fff" }}>{motors[b].rate.toFixed(2)}</b></span>
+                    <span>勝率 <b style={{ color: "#fff" }}>{safeFixed(motors?.[b]?.rate, 2)}</b></span>
                   )}
                   {motors[b].win1 != null && (
                     <span>1着 <b style={{ color: "#fff" }}>{motors[b].win1}%</b></span>
@@ -6227,7 +6161,7 @@ export default function App() {
                         </div>
                       </div>
                       <span style={{ width: 34, fontSize: 11, color: "#9db5cc", textAlign: "right", flexShrink: 0 }}>
-                        .{(r.st.toFixed(2)).split(".")[1]}
+                        .{safeFixed(r?.st, 2, "0.00").split(".")[1]}
                       </span>
                     </div>
                   );
@@ -6559,7 +6493,7 @@ export default function App() {
                         <div style={{ width: `${Math.min(100, p.pct)}%`, height: "100%", background: "linear-gradient(90deg, #74c4ea 0%, #96defa 100%)", borderRadius: 999 }} />
                       </div>
                       <span style={{ width: 52, fontSize: 11, color: "#f5c518", fontVariantNumeric: "tabular-nums", textAlign: "right" }}>
-                        {p.pct.toFixed(1)}%
+                        {safeFixed(p?.pct, 1)}%
                       </span>
                     </div>
                   ))}
@@ -6612,7 +6546,7 @@ export default function App() {
                           </div>
                           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                             {nigeSim.c1RacerWin != null && <span>1C本人1着 <b style={{ color: "#fff" }}>{nigeSim.c1RacerWin}%</b></span>}
-                            {nigeSim.stAdv != null && <span>ST優位 <b style={{ color: nigeSim.stAdv > 0 ? "#5dd39e" : "#ff7b7b" }}>{nigeSim.stAdv > 0 ? "+" : ""}{nigeSim.stAdv.toFixed(2)}</b></span>}
+                            {nigeSim.stAdv != null && <span>ST優位 <b style={{ color: nigeSim.stAdv > 0 ? "#5dd39e" : "#ff7b7b" }}>{nigeSim.stAdv > 0 ? "+" : ""}{safeFixed(nigeSim?.stAdv, 2)}</b></span>}
                             {nigeSim.wall2 != null && <span>2C壁性能 <b style={{ color: nigeSim.wall2 >= 55 ? "#5dd39e" : nigeSim.wall2 <= 35 ? "#ff7b7b" : "#fff" }}>{nigeSim.wall2}</b></span>}
                             {nigeSim.attack3 != null && <span>3C攻撃警戒 <b style={{ color: nigeSim.attack3 >= 45 ? "#ff7b7b" : "#fff" }}>{nigeSim.attack3}</b></span>}
                           </div>
@@ -7003,7 +6937,7 @@ export default function App() {
                           ))}
                         </div>
                         <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 6, lineHeight: 1.6 }}>
-                          上は両期間の全買い目を表示し、<span style={{ color: "#6fb3ff" }}>青い目</span>が2期間で被っている買い目です。「被りだけ使う」を選ぶと、本線・対抗・穴は被り目だけに絞られ、保存・AI収支もその買い目で計算されます。
+                          上は両期間の全買い目を表示し、<span style={{ color: "#6fb3ff" }}>青い目</span>が2期間で被っている買い目です。「被りだけ使う」を選ぶと、本線・対抗・穴は被り目だけに絞られ、保存内容もその買い目で計算されます。
                         </div>
                       </div>
                     )}
@@ -7114,12 +7048,12 @@ export default function App() {
                               }}>
                                 <span style={{ fontWeight: 800, color: "#cfe0f0", minWidth: 52 }}>{e.t}</span>
                                 <span style={{ color: "#7da3c8", fontSize: 10 }}>{e.from}</span>
-                                <span style={{ color: "#9db5cc" }}>推定 {(e.p * 100).toFixed(1)}%</span>
-                                <span style={{ color: "#f5c518" }}>{e.o.toFixed(1)}倍</span>
+                                <span style={{ color: "#9db5cc" }}>推定 {safeFixed(Number(e?.p) * 100, 1)}%</span>
+                                <span style={{ color: "#f5c518" }}>{safeFixed(e?.o, 1)}倍</span>
                                 <span style={{
                                   marginLeft: "auto", fontWeight: 800,
                                   color: good ? "#5dd39e" : "#8aa0b8",
-                                }}>EV {e.ev.toFixed(2)}{good ? " ◎" : ""}</span>
+                                }}>EV {safeFixed(e?.ev, 2)}{good ? " ◎" : ""}</span>
                               </div>
                             );
                           })}
@@ -7188,7 +7122,7 @@ export default function App() {
                             </div>
                             {compShown ? (
                               <div style={{ fontSize: 12, color: "#5dd39e", fontWeight: 800, marginBottom: 6 }}>
-                                合成オッズ 約{compShown.odds.toFixed(1)}倍
+                                合成オッズ 約{safeFixed(compShown?.odds, 1)}倍
                                 {compShown.covered < compShown.total && (
                                   <span style={{ fontSize: 10, color: "#7da3c8", fontWeight: 400 }}>
                                     （{compShown.covered}/{compShown.total}点のオッズで計算）
@@ -7333,7 +7267,7 @@ export default function App() {
                           <>
                             {pickedTickets.comp ? (
                               <div style={{ fontSize: 12, color: "#5dd39e", fontWeight: 800, marginBottom: 6 }}>
-                                合成オッズ 約{pickedTickets.comp.odds.toFixed(1)}倍
+                                合成オッズ 約{safeFixed(pickedTickets?.comp?.odds, 1)}倍
                                 {pickedTickets.comp.covered < pickedTickets.comp.total && (
                                   <span style={{ fontSize: 10, color: "#7da3c8", fontWeight: 400 }}>
                                     （{pickedTickets.comp.covered}/{pickedTickets.comp.total}点のオッズで計算）
@@ -7414,7 +7348,7 @@ export default function App() {
           <div style={{ background: "#16273c", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
             <div style={{ fontSize: 12, fontWeight: 800, color: "#fff", marginBottom: 4 }}>結果・払戻は自動反映</div>
             <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.7 }}>
-              公式の結果出目と確定オッズを自動取得します。結果確定前に購入を記録した場合も、確定後に舟券収支・AI予想収支へ自動反映されます。
+              公式の結果出目と確定オッズを自動取得します。結果確定前に購入を記録した場合も、確定後に舟券収支へ自動反映されます。
             </div>
           </div>
 
@@ -7501,7 +7435,7 @@ export default function App() {
                     borderRadius: 6, padding: "2px 10px", minWidth: 44, textAlign: "center",
                   }}>合計</span>
                   <span style={{ fontSize: 14, fontWeight: 800, color: "#f9c513" }}>
-                    {(hitStats.comboHit / hitStats.judged * 100).toFixed(1)}%
+                    {safeFixed(Number(hitStats?.comboHit) / Number(hitStats?.judged) * 100, 1)}%
                   </span>
                   <span style={{ fontSize: 11, color: "#7da3c8" }}>
                     （{hitStats.comboHit}/{hitStats.judged}・いずれか1つでも的中）
@@ -7534,7 +7468,7 @@ export default function App() {
                     }}>
                       <span style={{ fontSize: 12, fontWeight: 700, color: "#cfe0f0" }}>{s.name}</span>
                       <span style={{ fontSize: 11, color: "#9db5cc" }}>
-                        的中 {safeFixed(hitRate, 0)}%<span style={{ color: "#5e7a92" }}>（{Number(s.hit) || 0}/{Number(s.races) || 0}）</span>
+                        的中 {safeFixed(hitRate, 0)}%<span style={{ color: "#5e7a92" }}>（{s.hit}/{s.races}）</span>
                       </span>
                       <span style={{ fontSize: 13, fontWeight: 800, color: pos ? "#5dd39e" : "#ff8a80", textAlign: "right" }}>
                         回収 {safeFixed(roi, 1)}%
@@ -7578,7 +7512,7 @@ export default function App() {
                           }}
                         >削除</button>
                       </div>
-                      {/* 点数の後から変更（AI収支が再計算される） */}
+                      {/* 点数の後から変更 */}
                       {r.bets && r.bets.length > 0 && (
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 6 }}>
                           {r.bets.map((b) => {
@@ -7701,8 +7635,8 @@ export default function App() {
               ["購入金額", `${betStats.spent.toLocaleString()}円`],
               ["払戻金額", `${betStats.ret.toLocaleString()}円`],
               ["収支", `${(betStats.ret - betStats.spent).toLocaleString()}円`],
-              ["的中率", betStats.hitRate == null ? "—" : `${betStats.hitRate.toFixed(1)}%`],
-              ["回収率", betStats.roi == null ? "—" : `${betStats.roi.toFixed(1)}%`],
+              ["的中率", betStats?.hitRate == null ? "—" : `${safeFixed(betStats.hitRate, 1)}%`],
+              ["回収率", betStats?.roi == null ? "—" : `${safeFixed(betStats.roi, 1)}%`],
             ].map(([label, val], i) => {
               const isMoney = label === "収支";
               const pos = betStats.ret - betStats.spent >= 0;
