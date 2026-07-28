@@ -7532,14 +7532,22 @@ export default function App() {
                             </div>
                             {SHOW_RECORDS && (
                             <button
-                              onClick={addPickedToCart}
+                              onClick={() => {
+                                if (pickerMode === "none" || pickerAlloc === "none") {
+                                  addConfiguredAiBetsToCart();
+                                } else {
+                                  addPickedToCart();
+                                }
+                              }}
                               style={{
                                 padding: "9px 16px", borderRadius: 8, cursor: "pointer",
                                 background: "#5a9e2e", color: "#fff", fontSize: 13, fontWeight: 700, border: "none",
                               }}
-                            >{pickerMode === "none" || pickerAlloc === "none" ? "上段の点数設定をリストに追加" : "{pickerMode === "none" || pickerAlloc === "none"
-                                  ? "上段の点数設定をリストに追加"
-                                  : "この買い目をリストに追加"}"}</button>
+                            >
+                              {pickerMode === "none" || pickerAlloc === "none"
+                                ? "上段の点数設定をリストに追加"
+                                : "この買い目をリストに追加"}
+                            </button>
                             )}
                           </>
                         ) : (
