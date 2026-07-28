@@ -242,6 +242,41 @@ function todayIso() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function jstDateTimeParts() {
+  try {
+    const parts = new Intl.DateTimeFormat("ja-JP", {
+      timeZone: "Asia/Tokyo",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date()).reduce((out, part) => {
+      if (part.type !== "literal") out[part.type] = part.value;
+      return out;
+    }, {});
+    const hour = Number(parts.hour === "24" ? "0" : parts.hour);
+    return {
+      date: `${parts.year}-${parts.month}-${parts.day}`,
+      hour,
+      minute: Number(parts.minute || 0),
+    };
+  } catch {
+    const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
+    return {
+      date: d.toISOString().slice(0, 10),
+      hour: d.getUTCHours(),
+      minute: d.getUTCMinutes(),
+    };
+  }
+}
+
+function safeFixed(value, digits = 1, fallback = "—") {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : fallback;
+}
+
 function normalizeRaceGrade(v) {
   const s = String(v || "").trim().toUpperCase();
   if (!s) return "";
@@ -4538,11 +4573,34 @@ export default function App() {
   }, [aiEval, venue, raceDate, raceNo, captureAiMode, captureAiTarget, raceWinds, raceWindsLoading]);
 
 
+  const venueLedgerDisplayState = useMemo(() => {
+    const now = jstDateTimeParts();
+    const isToday = raceDate === now.date;
+    const available = !isToday || now.hour >= 23;
+    return { isToday, available, now };
+  }, [raceDate]);
+
   const loadVenueAiLedger = async ({ quiet = false } = {}) => {
     if (!venue || !raceDate) {
       setVenueLedger(null);
       return null;
     }
+
+    const displayState = (() => {
+      const now = jstDateTimeParts();
+      const isToday = raceDate === now.date;
+      return { isToday, available: !isToday || now.hour >= 23 };
+    })();
+
+    // 当日分は23:00の最終取得後だけ集計する。
+    // 日中は未完成データを集計せず、欠損値による画面停止を防ぐ。
+    if (!displayState.available) {
+      setVenueLedger(null);
+      setVenueLedgerError("");
+      setVenueLedgerLoading(false);
+      return null;
+    }
+
     if (!quiet) setVenueLedgerLoading(true);
     setVenueLedgerError("");
     try {
@@ -5487,7 +5545,9 @@ export default function App() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
               <div>
                 <div style={{ fontSize: 12, fontWeight: 900, color: "#fff" }}>開催場AI予想収支</div>
-                <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 2 }}>選択日のうち、結果確定済みレースまでを自動集計</div>
+                <div style={{ fontSize: 10, color: "#7da3c8", marginTop: 2 }}>
+                  当日分は23:00の最終取得後に表示
+                </div>
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6, width: "100%", marginTop: 8 }}>
                 {[
@@ -5510,6 +5570,18 @@ export default function App() {
             </div>
             {!venue ? (
               <div style={{ fontSize: 11, color: "#7da3c8" }}>開催場を選択すると表示されます。</div>
+            ) : !venueLedgerDisplayState.available ? (
+              <div style={{
+                fontSize: 12,
+                color: "#cfe0f0",
+                background: "#0e1b2c",
+                border: "1px solid #2c4762",
+                borderRadius: 8,
+                padding: "12px 10px",
+                lineHeight: 1.7,
+              }}>
+                本日のAI収支は集計中です。23:00の全レース最終取得後に表示されます。
+              </div>
             ) : venueLedgerLoading && !venueLedger ? (
               <div style={{ fontSize: 11, color: "#7da3c8" }}>集計中…</div>
             ) : venueLedgerError ? (
@@ -5523,14 +5595,21 @@ export default function App() {
                 </div>
                 <div style={{ display: "grid", gap: 6 }}>
                   {(venueLedger.patterns || []).map((p) => {
-                    const st = venueLedger.stats?.[p.key] || { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
-                    const roi = st.spent ? st.ret / st.spent * 100 : 0;
-                    const hitRate = st.races ? st.hit / st.races * 100 : 0;
+                    const rawStat = venueLedger.stats?.[p.key];
+                    const st = rawStat && typeof rawStat === "object"
+                      ? rawStat
+                      : { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
+                    const races = Number(st.races);
+                    const spent = Number(st.spent);
+                    const ret = Number(st.ret);
+                    const hit = Number(st.hit);
+                    const roi = Number.isFinite(spent) && spent > 0 && Number.isFinite(ret) ? ret / spent * 100 : null;
+                    const hitRate = Number.isFinite(races) && races > 0 && Number.isFinite(hit) ? hit / races * 100 : null;
                     return (
                       <div key={p.key} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr", gap: 6, alignItems: "center", background: "#0e1b2c", borderRadius: 8, padding: "8px 10px" }}>
                         <span style={{ fontSize: 12, fontWeight: 700, color: "#cfe0f0" }}>{st.name}</span>
-                        <span style={{ fontSize: 11, color: "#9db5cc" }}>的中 {hitRate.toFixed(0)}% <span style={{ color: "#5e7a92" }}>({st.hit}/{st.races})</span></span>
-                        <span style={{ fontSize: 13, fontWeight: 800, textAlign: "right", color: roi >= 100 ? "#5dd39e" : "#ff8a80" }}>回収 {roi.toFixed(1)}%</span>
+                        <span style={{ fontSize: 11, color: "#9db5cc" }}>的中 {safeFixed(hitRate, 0)}% <span style={{ color: "#5e7a92" }}>({Number.isFinite(hit) ? hit : 0}/{Number.isFinite(races) ? races : 0})</span></span>
+                        <span style={{ fontSize: 13, fontWeight: 800, textAlign: "right", color: Number.isFinite(roi) && roi >= 100 ? "#5dd39e" : "#ff8a80" }}>回収 {safeFixed(roi, 1)}%</span>
                       </div>
                     );
                   })}
@@ -7455,10 +7534,10 @@ export default function App() {
                     }}>
                       <span style={{ fontSize: 12, fontWeight: 700, color: "#cfe0f0" }}>{s.name}</span>
                       <span style={{ fontSize: 11, color: "#9db5cc" }}>
-                        的中 {hitRate.toFixed(0)}%<span style={{ color: "#5e7a92" }}>（{s.hit}/{s.races}）</span>
+                        的中 {safeFixed(hitRate, 0)}%<span style={{ color: "#5e7a92" }}>（{Number(s.hit) || 0}/{Number(s.races) || 0}）</span>
                       </span>
                       <span style={{ fontSize: 13, fontWeight: 800, color: pos ? "#5dd39e" : "#ff8a80", textAlign: "right" }}>
-                        回収 {roi.toFixed(1)}%
+                        回収 {safeFixed(roi, 1)}%
                       </span>
                     </div>
                   );

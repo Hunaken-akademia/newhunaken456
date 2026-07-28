@@ -1,17 +1,11 @@
-# 確定済みレース再取得停止
+# 当日AI収支を23時以降だけ表示
 
-## 変更内容
-- 実行開始時に `/api/yoso?action=confirmed_results` を1回だけ呼び出す
-- Supabaseで1〜3着が揃っているレースを `confirmedKeys` として保持
-- 確定済みレースは展示・オッズ・結果取得のjobsへ入れない
-- API取得失敗時は安全側で従来どおり全件確認
-- ログとsummaryに次を追加
-  - skippedConfirmed
-  - confirmedLookupFailed
+変更内容:
+- 当日分の開催場AI収支APIは23:00まで呼び出さない
+- 23:00までは「本日のAI収支は集計中」と表示
+- 過去日の収支は従来どおり表示
+- AI収支内の数値を安全に整形し、undefined.toFixedで画面全体が落ちるのを防止
+- 23:00のcron実行で結果取得後、画面側は1分以内に再取得
 
-## 上書き先
-`pipeline/capture_all_active_races.mjs`
-
-## 正常ログ例
-`confirmed results loaded=86`
-`capture/result jobs=18 skipped_confirmed=86`
+上書き先:
+`src/App.jsx`
