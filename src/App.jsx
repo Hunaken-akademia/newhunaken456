@@ -4543,7 +4543,7 @@ export default function App() {
     //     超穴は穴とほぼ同じ目が出る（オッズ条件が重なる）ことが多く、
     //     独立したカードとして機能していなかったためです。
     const FUKU_REH_MIN = 8;   // 頭出現率がこれ未満の艇は対象外(%)
-    const FUKU_REH_RANK_MAX = 3; // 展開リハ頭率の上位3艇だけを対象にする
+    const FUKU_REH_RANK_MAX = 3; // 展開リハ総合1着率の上位3艇だけを対象にする
     const FUKU_MAX = 12;      // 最大点数
     const all120Tickets = buildTickets([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], 120);
     const hasOdds = odds && Object.values(odds).some((o) => Number.isFinite(Number(o)) && Number(o) > 0);
@@ -4566,7 +4566,7 @@ export default function App() {
       let gaps = [];
       if (rehBoatPct) {
         // 新ルール:
-        //  1) 展開リハ頭率3位以内
+        //  1) 展開リハ総合1着率3位以内
         //  2) 頭率8%以上
         //  3) 本線・対抗で頭として採用されていない
         // 条件該当艇がなければカード自体を表示しない。
@@ -4602,11 +4602,11 @@ export default function App() {
           }
         }
         const gapStr = gaps
-          .map((g) => `${g.boat}号艇（リハ頭${round1(g.reh)}%・本線・対抗で頭なし）`)
+          .map((g) => `${g.boat}号艇（総合1着率${round1(g.reh)}%・本線・対抗で頭なし）`)
           .join("、");
-        desc = `展開リハ頭率3位以内・8%以上で、本線・対抗に頭がない艇＝${gapStr}${hasOdds ? "／その艇頭からEV1.0以上を優先" : "／その艇頭を推定確率順"}`;
+        desc = `展開リハ1000回試走での総合1着率が3位以内・8%以上で、本線・対抗に頭がない艇＝${gapStr}${hasOdds ? "／その艇頭からEV1.0以上を優先" : "／その艇頭を推定確率順"}`;
       } else if (rehBoatPct) {
-        desc = "展開リハ頭率3位以内・8%以上の艇は本線または対抗で頭として拾えています";
+        desc = "展開リハ1000回試走で総合1着率3位以内・8%以上の艇は、本線または対抗で頭として拾えています";
       } else {
         desc = "全艇の平均STを入力すると、展開リハーサル発の買い目が出ます";
       }
@@ -7879,10 +7879,15 @@ export default function App() {
                                     borderRadius: 6, padding: "3px 9px",
                                     fontVariantNumeric: "tabular-nums",
                                   }}>
-                                    {g.boat}号艇 リハ頭{safeFixed(g.reh, 1)}%
+                                    {g.boat}号艇 総合1着率{safeFixed(g.reh, 1)}%
                                     <span style={{ color: "#9c7ec7", marginLeft: 5 }}>／本線・対抗で頭なし</span>
                                   </span>
                                 ))}
+                              </div>
+                            )}
+                            {bet.label === "展開リハ" && (
+                              <div style={{ fontSize: 10, color: "#8ea1b5", lineHeight: 1.6, marginBottom: 8 }}>
+                                ※総合1着率＝展開リハーサル1000回で、決まり手を問わずその艇が1着になった割合です。
                               </div>
                             )}
                             {compShown ? (
