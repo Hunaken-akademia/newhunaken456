@@ -44,7 +44,7 @@ for (const s of schedules) {
   for (const r of s.schedule) {
     const left = Number(r.deadlineMinutes) - now.minutes;
     // 展示公開前後は繰り返し取得。締切後も90分間は結果・確定オッズを再確認する。
-    if (left <= 30 && left >= -90) jobs.push({ venue:s.venue, race:Number(r.race), left, final:left <= -1 });
+    if (left <= 60 && left >= -90) jobs.push({ venue:s.venue, race:Number(r.race), left, final:left <= -1 });
   }
 }
 
@@ -53,8 +53,9 @@ const results = await mapLimit(jobs, CONCURRENCY, async j => {
   const q = new URLSearchParams({ action:"capture", venue:j.venue, race:String(j.race), date:now.date, final:j.final?"1":"0", t:String(Date.now()) });
   let data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
   let rows = Array.isArray(data.rows) ? data.rows.length : 0;
-  // ナイター場などで展示公開が遅れる場合、締切15分前以降だけ同一run内で再確認する。
-  if (rows < 6 && j.left <= 15 && j.left >= -2) {
+  // 展示公開が遅れた場合は、締切30分前以降かつ締切前に同一run内でもう一度だけ確認する。
+  // 60分前から取得対象にすることで通常runでも複数回の保存機会を確保しつつ、早すぎる再試行は避ける。
+  if (rows < 6 && j.left <= 30 && j.left >= 0) {
     await new Promise((resolve) => setTimeout(resolve, 35000));
     q.set("t", String(Date.now()));
     data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
