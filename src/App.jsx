@@ -248,6 +248,33 @@ function safeFixed(value, digits = 1, fallback = "—") {
   return Number.isFinite(n) ? n.toFixed(digits) : fallback;
 }
 
+const AI_DISPLAY_DRAFTS_KEY = "hunaken_ai_display_drafts_v1";
+
+function loadAiDisplayDrafts() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(AI_DISPLAY_DRAFTS_KEY) || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAiDisplayDraft(raceKey, payload) {
+  if (!raceKey || !payload) return;
+  try {
+    const all = loadAiDisplayDrafts();
+    all[raceKey] = payload;
+    localStorage.setItem(AI_DISPLAY_DRAFTS_KEY, JSON.stringify(all));
+  } catch (e) {
+    console.warn("AI display draft save failed", e);
+  }
+}
+
+function getAiDisplayDraft(raceKey) {
+  const row = loadAiDisplayDrafts()?.[raceKey];
+  return row && typeof row === "object" ? row : null;
+}
+
 function normalizeRaceGrade(v) {
   const s = String(v || "").trim().toUpperCase();
   if (!s) return "";
@@ -876,18 +903,6 @@ const SEASON_PERIOD = { "春": "3〜5月", "夏": "6〜8月", "秋": "9〜11月"
 //         シナリオ選定・頭候補の判定から参照できるようにした。
 function runTenkaiRehearsal({ slit, scoreByBoat = {}, seedKey = "", iters = 1000 }) {
   if (!slit || !Array.isArray(slit) || slit.length !== 6) return null;
-  // 平均STとして扱えない値（NaN・Infinity・負値）や重複/欠落コースは、
-  // Math.abs 等で補正せずリハーサル自体を無効化する。誤入力を「速いST」に変換しないため。
-  const courseSet = new Set();
-  for (const e of slit) {
-    const course = Number(e?.course);
-    const boat = Number(e?.boat);
-    const st = Number(e?.st);
-    if (!Number.isInteger(course) || course < 1 || course > 6
-      || !Number.isInteger(boat) || boat < 1 || boat > 6
-      || !Number.isFinite(st) || st < 0 || courseSet.has(course)) return null;
-    courseSet.add(course);
-  }
   let seed = 0;
   const key = String(seedKey || "");
   for (let i = 0; i < key.length; i++) seed = (seed * 31 + key.charCodeAt(i)) >>> 0;
@@ -904,6 +919,19 @@ function runTenkaiRehearsal({ slit, scoreByBoat = {}, seedKey = "", iters = 1000
     while (v === 0) v = rnd();
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
   };
+  // ST・進入の異常値は、絶対値化などで正常値へ見せかけずリハーサル自体を無効にする。
+  const validSlit = slit.every((e) => {
+    const st = Number(e?.st);
+    const boat = Number(e?.boat);
+    const course = Number(e?.course);
+    return Number.isFinite(st) && st >= 0 && st <= 0.6
+      && Number.isInteger(boat) && boat >= 1 && boat <= 6
+      && Number.isInteger(course) && course >= 1 && course <= 6;
+  });
+  const uniqueBoats = new Set(slit.map((e) => Number(e.boat)));
+  const uniqueCourses = new Set(slit.map((e) => Number(e.course)));
+  if (!validSlit || uniqueBoats.size !== 6 || uniqueCourses.size !== 6) return null;
+
   const byCourse = {};
   slit.forEach((e) => { byCourse[e.course] = e; });
   if (!byCourse[1]) return null;
@@ -925,13 +953,13 @@ function runTenkaiRehearsal({ slit, scoreByBoat = {}, seedKey = "", iters = 1000
 
   for (let i = 0; i < ITERS; i++) {
     const s = {};
-    // コースだけを理由に4〜6コースを一律0.01秒速くする補正は、実測校正がないため撤廃。
+    // コースによる一律ST補正は入れず、入力された平均STと同一分散の揺らぎだけを使う。
     slit.forEach((e) => { s[e.course] = Number(e.st) + gauss() * 0.05; });
     const c1 = byCourse[1];
 
     // 攻め手判定: 各コースの「1号艇に対するST差 − 必要量」を比べ、最も余裕が大きい艇が攻める。
     // （旧実装のように固定順で先着勝ちにすると、内側コースの攻めが構造的に過大評価される）
-    let attacker = null, attackerAdv = null, attackerTh = null, bestMargin = 0;
+    let attacker = null, attackerAdv = 0, attackerTh = 0, bestMargin = 0;
     for (const c of [3, 4, 5, 6]) {
       const e = byCourse[c];
       if (!e) continue;
@@ -946,11 +974,13 @@ function runTenkaiRehearsal({ slit, scoreByBoat = {}, seedKey = "", iters = 1000
       attackerTh = th;
     }
     if (attacker) {
-      // 攻め手が確定してから決まり手抽選を1回だけ行う。候補走査中の乱数消費による順序依存を避ける。
+      // 最終的な攻め手が決まってから、乱数を1回だけ使って決まり手を判定する。
       const c = Number(attacker.course);
       const zashiWindow = c <= 4 ? 0.05 : 0.06;
       const zashiP = c <= 4 ? 0.45 : 0.55;
-      const attackKind = attackerAdv < attackerTh + zashiWindow && rnd() < zashiP ? "まくり差し" : "まくり";
+      const attackKind = attackerAdv < attackerTh + zashiWindow && rnd() < zashiP
+        ? "まくり差し"
+        : "まくり";
       addResult(attackKind, attacker.boat);
       continue;
     }
@@ -1097,23 +1127,6 @@ function ticketListIncludesResult(tickets, result) {
   if (!normalized || !Array.isArray(tickets)) return false;
   return tickets.some((ticket) => expandTrifectaTicket(ticket).includes(normalized));
 }
-
-// 保存用の正規化: 表示配列（圧縮表記が混ざっていても可）を完全展開した3連単の配列にする。
-// 例: ["3-1-245","3-2-1"] → ["3-1-2","3-1-4","3-1-5","3-2-1"]
-// 重複は先勝ちで除去し、表示順は維持する。保存する tickets は必ずこの関数を通す。
-function expandTicketsForSave(tickets) {
-  const out = [];
-  const seen = new Set();
-  for (const t of Array.isArray(tickets) ? tickets : []) {
-    for (const e of expandTrifectaTicket(t)) {
-      if (!seen.has(e)) { seen.add(e); out.push(e); }
-    }
-  }
-  return out;
-}
-
-// 表示スナップショットの保存キー
-const AI_BET_SNAPSHOT_STORAGE_KEY = "hunaken_ai_bet_snapshots_v1";
 
 function stakeForTrifectaResult(record, result) {
   const normalized = normalizeTrifectaResult(result);
@@ -1761,14 +1774,6 @@ export default function App() {
     const rn = Number(race);
     setRaceWinds((p) => ({ ...p, [rn]: value }));
     if (rn === Number(raceNo)) setWind(value || "無風");
-    // 共有風を変えたレースは、変更前の表示スナップショットを破棄する。
-    // 現在表示中のレースなら、新しい風でのAI買い目が表示された時点でスナップショットが自動更新される。
-    // 別レースなら、そのレース画面を開いて表示を確認するまで一括記録の対象外になる（旧買い目の誤保存防止）。
-    try {
-      const snapKey = `${raceDate}_${venue}_${rn}`;
-      const snap = aiBetSnapshotsRef.current?.[snapKey];
-      if (snap && String(snap.wind || "") !== String(value || "")) invalidateAiBetSnapshot(snapKey);
-    } catch (e) { /* noop */ }
     setRaceWindsMsg("保存中…");
     try {
       const res = await fetch("/api/yoso?action=save_manual_wind", {
@@ -1902,7 +1907,7 @@ export default function App() {
     try { localStorage.setItem("hunaken_breakdown_fixed_order_v1", breakdownFixedOrder ? "1" : "0"); } catch { /* noop */ }
   }, [breakdownFixedOrder]);
   // 各買い目で実際に買う点数（このレース用）。未設定キーは「全点」扱い
-  const [betLimits, setBetLimits] = useState({}); // {本線:6, 対抗:4, 穴:8, 超穴:3}
+  const [betLimits, setBetLimits] = useState({}); // {本線:6, 対抗:4, 穴:8, 展開リハ:12}
   const setBetLimit = (label, n) => setBetLimits((p) => ({ ...p, [label]: n }));
   // 「買い目組む」: 対象の組み合わせ(最大4)と点数を選んでAIに厳選させる
   const [pickerParts, setPickerParts] = useState(["本線"]);
@@ -1914,10 +1919,8 @@ export default function App() {
   // 記録関連（予想・的中率・収支・AI収支・舟券収支・バックアップ）の表示フラグ。
   // Webアプリ版（Vercel）では localStorage に永続保存されるため有効。
   const SHOW_RECORDS = true;
-  // 一括記録の保存形式。過去版はレースずれ・iframe再計算による買い目ずれの可能性があるため集計対象外にする。
-  // v3以前: iframeで再計算した買い目を保存（画面表示と不一致になる不具合あり）
-  // v4: 画面表示スナップショットをそのまま保存
-  const BATCH_CAPTURE_VERSION = 4;
+  // 一括記録の保存形式。過去版はレースずれの可能性があるため集計対象外にする。
+  const BATCH_CAPTURE_VERSION = 3;
   // 下段の選び順・配分は任意。未選択なら上段の本線・対抗・穴の点数設定をそのまま使う。
   const SHOW_CUSTOM_AI_PICKER = true;
   const SHOW_VENUE_AI_LEDGER = false;
@@ -1942,39 +1945,6 @@ export default function App() {
   const [venueLedgerLoading, setVenueLedgerLoading] = useState(false);
   const [venueLedgerError, setVenueLedgerError] = useState("");
   const [aiCaptureQueue, setAiCaptureQueue] = useState([]); // [{date,venue,race,captureToken}] 一括記録キュー
-  // ── 画面表示AI買い目スナップショット ──
-  // key = `${date}_${venue}_${race}`。そのレース画面で実際に表示した本線/対抗/穴（点数設定適用後・完全展開済み）を保持する。
-  // 一括記録はこのスナップショットだけを保存元にする（iframe再計算は使わない）。
-  const aiBetSnapshotsRef = useRef({});
-  const persistAiBetSnapshots = (next) => {
-    aiBetSnapshotsRef.current = next;
-    try { localStorage.setItem(AI_BET_SNAPSHOT_STORAGE_KEY, JSON.stringify(next)); } catch (e) { /* noop */ }
-  };
-  const storeAiBetSnapshot = (snap) => {
-    if (!snap?.key) return;
-    persistAiBetSnapshots({ ...(aiBetSnapshotsRef.current || {}), [snap.key]: snap });
-  };
-  const invalidateAiBetSnapshot = (key) => {
-    if (!key || !(aiBetSnapshotsRef.current || {})[key]) return;
-    const next = { ...(aiBetSnapshotsRef.current || {}) };
-    delete next[key];
-    persistAiBetSnapshots(next);
-  };
-  useEffect(() => {
-    if (captureAiMode) return;
-    try {
-      const raw = localStorage.getItem(AI_BET_SNAPSHOT_STORAGE_KEY);
-      const parsed = raw ? JSON.parse(raw) : null;
-      if (!parsed || typeof parsed !== "object") return;
-      const maxAge = 48 * 60 * 60 * 1000;
-      const next = {};
-      for (const [k, v] of Object.entries(parsed)) {
-        if (v && Array.isArray(v.bets) && Date.now() - Number(v.updatedAt || 0) <= maxAge) next[k] = v;
-      }
-      persistAiBetSnapshots(next);
-    } catch (e) { /* noop */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [captureAiMode]);
   const aiCaptureQueueRef = useRef([]);
   const aiCaptureFrameRef = useRef(null);
   const [captureLoadedKey, setCaptureLoadedKey] = useState("");
@@ -4324,7 +4294,6 @@ export default function App() {
         if (scenarioHeads.length >= 2) break;
       }
     }
-
     // 展開リハーサルで頭出現率が高い艇も頭候補に格上げする。
     //   決まり手率は場全体の平均なので「今日この隊形なら攻めが決まりやすい」形を拾えない。
     //   リハーサルで頭率18%以上（＝1000回中180回以上その艇が頭）なら実戦的な頭候補とみなす。
@@ -4361,14 +4330,31 @@ export default function App() {
       : "";
 
     if (hasUsableProbMap && taikouHeads.length > 0) {
-      for (const head of taikouHeads) {
+      // 旧実装は先頭の頭候補が12点すべてを埋めてしまい、展開濃厚艇が頭の目が
+      // 1点も残らないことがあった（＝リハーサルで濃い艇が買い目に出てこない原因）。
+      // 頭候補ごとに枠を割り当ててから、余りを埋める方式に変更する。
+      const TK_MAX = 12;
+      const lists = taikouHeads.map((head) => {
         const others = [1, 2, 3, 4, 5, 6].filter((b) => b !== head);
-        const headCandidates = sortByProb(buildTickets([head], others, others, 20));
-        for (const t of headCandidates) {
+        return sortByProb(buildTickets([head], others, others, 20));
+      });
+      const quota = Math.max(3, Math.floor(TK_MAX / lists.length));
+      lists.forEach((list) => {
+        let n = 0;
+        for (const t of list) {
+          if (n >= quota || taikouTickets.length >= TK_MAX) break;
+          const before = taikouTickets.length;
           pushUnique(t);
-          if (taikouTickets.length >= 12) break;
+          if (taikouTickets.length > before) n += 1;
         }
-        if (taikouTickets.length >= 12) break;
+      });
+      // 余りは先頭の頭候補（＝1着率2位 or 最有力の展開濃厚艇）から順に埋める
+      for (const list of lists) {
+        for (const t of list) {
+          if (taikouTickets.length >= TK_MAX) break;
+          pushUnique(t);
+        }
+        if (taikouTickets.length >= TK_MAX) break;
       }
     }
 
@@ -4544,53 +4530,96 @@ export default function App() {
       return { odds: 1 / inv, covered: vals.length, total: tickets.length };
     };
 
-    // 超穴: 120通り全体からEV1.0以上・50倍以上を抽出し、合成10倍を維持して最大12点。
-    const rankPos = Object.fromEntries(order.map((b, i) => [b, i]));
-    const likeliness = (t) => t.split("-").reduce((a, b) => a + (rankPos[Number(b)] ?? 9), 0);
+    // ── 展開リハ（展開リハーサル発の「拾えていない買い目」） ──
+    //
+    //   本線・対抗・穴はいずれも「どの艇が強いか」の総合評価から組む。
+    //   そのため、展開リハーサル（今日のST・進入・評価で1000回試走した結果）で
+    //   頭に来やすい艇でも、総合評価が低いと3カードのどこにも頭として現れないことがある。
+    //   （例: リハーサルで頭率19%の4号艇が、本線〜穴で1点も頭になっていない）
+    //
+    //   このカードは「リハーサル的には濃いのに、上3カードで頭として拾えていない艇」を
+    //   検出して、その艇頭の目だけを出す“抜け拾い”専用カードです。
+    //   ※ v141: 旧「超穴」を廃止し、その枠をこのカードに置き換えました。
+    //     超穴は穴とほぼ同じ目が出る（オッズ条件が重なる）ことが多く、
+    //     独立したカードとして機能していなかったためです。
+    const FUKU_REH_MIN = 8;   // 頭出現率がこれ未満の艇は対象外(%)
+    const FUKU_REH_RANK_MAX = 3; // 展開リハ頭率の上位3艇だけを対象にする
+    const FUKU_MAX = 12;      // 最大点数
     const all120Tickets = buildTickets([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], 120);
-    let choBet;
-    if (odds && Object.values(odds).some((o) => Number.isFinite(Number(o)) && Number(o) > 0)) {
-      const evLongshots = sortByEv(all120Tickets.filter((t) => {
-        const o = Number(odds?.[t]);
-        return Number.isFinite(o) && o >= 50 && probOf(t) * o >= 1.0;
-      }));
-      const picked = [];
-      for (const t of evLongshots) {
-        const trial = [...picked, t];
-        const c = compOdds(trial);
-        if (trial.length <= 12 && c && c.odds >= 10) picked.push(t);
-        if (picked.length >= 12) break;
-      }
-      if (picked.length > 0) {
-        choBet = {
-          label: "超穴",
-          desc: "120通りからEV1.0以上・50倍以上をEV順／合成10倍以上を維持",
-          tickets: picked,
-        };
-      } else {
-        // 条件該当0点は現行の1点勝負（最大3点）へフォールバック。
-        const single = sortByEv(all120Tickets.filter((t) => Number(odds?.[t]) > 10))
-          .slice(0, 3);
-        const safeSingle = single.length ? single : sortByProb(all120Tickets).slice(0, 3);
-        choBet = {
-          label: "超穴",
-          desc: "条件該当なしのため1点勝負（最大3点）",
-          tickets: safeSingle,
-        };
-      }
-    } else {
-      const cand = sortByProb(all120Tickets).slice(0, 3);
-      const safeCand = cand.length ? cand : all120Tickets.slice(0, 3);
-      choBet = {
-        label: "超穴",
-        desc: "オッズ未取得のため推定確率上位を目安表示",
-        tickets: safeCand,
+    const hasOdds = odds && Object.values(odds).some((o) => Number.isFinite(Number(o)) && Number(o) > 0);
+    let fukuhei;
+    {
+      // 買い目の重複除外は本線・対抗・穴すべてを対象にする。
+      const coveredSet = new Set([...honmei.tickets, ...taikou.tickets, ...ana.tickets]);
+      // 「展開リハ」の採用判定は、本線・対抗で既に頭として使われているかだけを見る。
+      const mainCounterSet = new Set([...honmei.tickets, ...taikou.tickets]);
+      const mainCounterHeads = new Set(
+        [...mainCounterSet].map((t) => Number(String(t).split("-")[0])).filter(Number.isFinite)
+      );
+      const headCountOf = (b) => {
+        let n = 0;
+        mainCounterSet.forEach((t) => { if (Number(String(t).split("-")[0]) === b) n += 1; });
+        return n;
       };
+      let tickets = [];
+      let desc;
+      let gaps = [];
+      if (rehBoatPct) {
+        // 新ルール:
+        //  1) 展開リハ頭率3位以内
+        //  2) 頭率8%以上
+        //  3) 本線・対抗で頭として採用されていない
+        // 条件該当艇がなければカード自体を表示しない。
+        gaps = [1, 2, 3, 4, 5, 6]
+          .map((b) => ({ boat: b, reh: Number(rehBoatPct[b] ?? 0) }))
+          .filter((g) => Number.isFinite(g.reh))
+          .sort((a, b) => b.reh - a.reh)
+          .slice(0, FUKU_REH_RANK_MAX)
+          .filter((g) => g.reh >= FUKU_REH_MIN && !mainCounterHeads.has(g.boat))
+          .map((g) => ({ ...g, cov: headCountOf(g.boat), gap: g.reh }))
+          .slice(0, 2);
+      }
+      if (gaps.length > 0) {
+        const per = gaps.length >= 2 ? 6 : FUKU_MAX;
+        for (const g of gaps) {
+          const others = [1, 2, 3, 4, 5, 6].filter((b) => b !== g.boat);
+          const cand = buildTickets([g.boat], others, others, 20).filter((t) => !coveredSet.has(t));
+          // オッズがあるときは「EV1.0以上」に絞ってから確率上位を採る。
+          //   単純なEV降順だと最も人気の無い目ばかりになり、拾いの意味が薄れるため。
+          const evOk = hasOdds
+            ? cand.filter((t) => {
+              const o = Number(odds?.[t]);
+              return Number.isFinite(o) && o > 0 && probOf(t) * o >= 1.0;
+            })
+            : [];
+          const sorted = evOk.length ? sortByProb(evOk) : sortByProb(cand);
+          let n = 0;
+          for (const t of sorted) {
+            if (n >= per || tickets.length >= FUKU_MAX) break;
+            if (tickets.includes(t)) continue;
+            tickets.push(t);
+            n += 1;
+          }
+        }
+        const gapStr = gaps
+          .map((g) => `${g.boat}号艇（リハ頭${round1(g.reh)}%・本線・対抗で頭なし）`)
+          .join("、");
+        desc = `展開リハ頭率3位以内・8%以上で、本線・対抗に頭がない艇＝${gapStr}${hasOdds ? "／その艇頭からEV1.0以上を優先" : "／その艇頭を推定確率順"}`;
+      } else if (rehBoatPct) {
+        desc = "展開リハ頭率3位以内・8%以上の艇は本線または対抗で頭として拾えています";
+      } else {
+        desc = "全艇の平均STを入力すると、展開リハーサル発の買い目が出ます";
+      }
+      fukuhei = { label: "展開リハ", desc, tickets, gaps };
     }
 
-    [honmei, taikou, ana, choBet].forEach((b) => { b.comp = compOdds(b.tickets); });
+    // 合成オッズは展開リハにも付ける（0点のときは null になる）
+    [honmei, taikou, ana, fukuhei].forEach((b) => { b.comp = compOdds(b.tickets); });
 
-    const bets = [honmei, taikou, ana, choBet];
+    // 展開リハは「抜けがあるときだけ」出す。抜けが無いレースでカードを出しても情報にならないため。
+    const bets = fukuhei.tickets.length > 0
+      ? [honmei, taikou, ana, fukuhei]
+      : [honmei, taikou, ana];
 
     // EVランキングは選択済みの買い目だけでなく、3連単120通り全体を対象にする。
     let evList = [];
@@ -4701,16 +4730,12 @@ export default function App() {
       //   3) 残りはブレンドスコア順
       const SC_MAX = rehPct ? 4 : 3;
       const seenScenario = new Set();
-      const scenarioCountByBoat = new Map();
       const top = [];
       const pushSc = (c) => {
         if (!c || top.length >= SC_MAX) return;
         const key = `${c.type}-${c.boat}`;
         if (seenScenario.has(key)) return;
-        // 同じ艇の別決まり手だけで4枠を占有しない。最大2展開までは設計意図どおり許容。
-        if ((scenarioCountByBoat.get(c.boat) || 0) >= 2) return;
         seenScenario.add(key);
-        scenarioCountByBoat.set(c.boat, (scenarioCountByBoat.get(c.boat) || 0) + 1);
         top.push(c);
       };
       if (rehPct) {
@@ -4809,13 +4834,19 @@ export default function App() {
       // 点数は3〜18点に収める
       total = Math.max(3, Math.min(18, total));
 
-      // 配分の目安（本線・対抗・穴・超穴）
+      // 配分の目安（本線・対抗・穴・展開リハ）
+      //   展開リハは展開リハーサルの抜け拾いなので、荒れ寄りのときに厚くする。
       let dist;
-      if (lean === "honmei") dist = { 本線: 0.5, 対抗: 0.3, 穴: 0.2, 超穴: 0 };
-      else if (lean === "ana") dist = { 本線: 0.2, 対抗: 0.25, 穴: 0.3, 超穴: 0.25 };
-      else dist = { 本線: 0.35, 対抗: 0.3, 穴: 0.25, 超穴: 0.1 };
+      if (lean === "honmei") dist = { 本線: 0.5, 対抗: 0.3, 穴: 0.2, 展開リハ: 0 };
+      else if (lean === "ana") dist = { 本線: 0.2, 対抗: 0.25, 穴: 0.3, 展開リハ: 0.25 };
+      else dist = { 本線: 0.35, 対抗: 0.3, 穴: 0.25, 展開リハ: 0.1 };
       const alloc = {};
-      for (const k of ["本線", "対抗", "穴", "超穴"]) alloc[k] = Math.round(total * dist[k]);
+      for (const k of ["本線", "対抗", "穴", "展開リハ"]) alloc[k] = Math.round(total * dist[k]);
+      // 展開リハカードが出ないレース（＝リハーサルの抜けが無い）では、その配分を穴に寄せる。
+      if (!bets.some((b) => b.label === "展開リハ")) {
+        alloc["穴"] += alloc["展開リハ"];
+        alloc["展開リハ"] = 0;
+      }
 
       const leanLabel = lean === "honmei" ? "本命寄り（手堅く絞る）" : lean === "ana" ? "荒れ寄り（穴を厚く）" : "バランス";
       recommend = { total, lean, leanLabel, alloc, notes };
@@ -4870,8 +4901,36 @@ export default function App() {
   // メイン評価（選択中の区分）
   const aiEval = useMemo(
     () => (result ? evaluateRows(result.rows) : null),
-    [result, sts, fHold, fSts, motors, tilts, wind, racerCat, kimari, kimariPeriod, nigeSim, odds, slit, raceDate, venue, raceNo]
+    // slit（進入・平均ST）と固定シードのキーも展開リハーサル経由で評価に効くため依存に含める
+    [result, sts, fHold, fSts, motors, tilts, wind, racerCat, kimari, kimariPeriod, nigeSim, odds,
+      slit, courses, raceDate, venue, raceNo]
   );
+
+  // 通常画面に実際に表示されたAI買い目を、正式な舟券履歴とは別の下書きとして保存する。
+  // 後から一括記録するときは再計算結果ではなく、この表示済み買い目を優先して使用する。
+  useEffect(() => {
+    if (captureAiMode) return;
+    const r = Number(raceNo);
+    if (!venue || !raceDate || !Number.isInteger(r) || r < 1 || r > 12) return;
+    if (!aiEval?.bets?.length || autoLoading) return;
+    const selectedWind = String(raceWinds?.[r] || wind || "").trim();
+    if (!selectedWind) return;
+    const raceKey = `${raceDate}_${venue}_${r}`;
+    const bets = aiEval.bets.map((b) => ({
+      label: String(b?.label || ""),
+      tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
+    }));
+    saveAiDisplayDraft(raceKey, {
+      date: raceDate,
+      venue,
+      race: r,
+      wind: selectedWind,
+      bets,
+      betsSignature: `${raceKey}_${JSON.stringify(bets)}`,
+      savedAt: Date.now(),
+      source: "visible_ai_panel",
+    });
+  }, [captureAiMode, venue, raceDate, raceNo, aiEval, autoLoading, raceWinds, wind]);
 
 
   // 一括記録用の非表示画面では、そのレースのAI買い目を親画面へ返す。
@@ -4909,11 +4968,24 @@ export default function App() {
       return undefined;
     }
 
-    const bets = aiEval.bets.map((b) => ({
-      label: String(b?.label || ""),
-      tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
-    }));
-    const signature = `${targetKey}_${JSON.stringify(bets)}`;
+    // 同じ風で通常画面に表示済みの買い目があれば、それを唯一の保存元として使用する。
+    // 表示済み下書きがない場合だけ、非表示画面の現在評価をフォールバックにする。
+    const visibleDraft = getAiDisplayDraft(targetKey);
+    const canUseVisibleDraft = visibleDraft
+      && String(visibleDraft.wind || "").trim() === String(selectedManualWind).trim()
+      && Array.isArray(visibleDraft.bets)
+      && visibleDraft.bets.length;
+    const bets = canUseVisibleDraft
+      ? visibleDraft.bets.map((b) => ({
+          label: String(b?.label || ""),
+          tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
+        }))
+      : aiEval.bets.map((b) => ({
+          label: String(b?.label || ""),
+          tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
+        }));
+    const captureSource = canUseVisibleDraft ? "visible_ai_panel" : "capture_fallback";
+    const signature = `${targetKey}_${captureSource}_${JSON.stringify(bets)}`;
     captureLastSignatureRef.current = signature;
     if (captureStableTimerRef.current) window.clearTimeout(captureStableTimerRef.current);
 
@@ -4949,6 +5021,8 @@ export default function App() {
           batchCaptureVersion: BATCH_CAPTURE_VERSION,
           betsSignature: signature,
           bets,
+          captureSource,
+          displayedDraftSavedAt: canUseVisibleDraft ? Number(visibleDraft?.savedAt || 0) : null,
         }, window.location.origin);
       }
     }, 2500);
@@ -5031,9 +5105,10 @@ export default function App() {
           "本線": Math.max(0, Number(betLimits?.["本線"] ?? 0)),
           "対抗": Math.max(0, Number(betLimits?.["対抗"] ?? 0)),
           "穴": Math.max(0, Number(betLimits?.["穴"] ?? 0)),
+          "展開リハ": Math.max(0, Number(betLimits?.["展開リハ"] ?? 0)),
         };
         const now = Date.now();
-        const recs = ["本線", "対抗", "穴"].flatMap((label, index) => {
+        const recs = ["本線", "対抗", "穴", "展開リハ"].flatMap((label, index) => {
           const source = sourceBets.find((b) => String(b?.label) === label);
           const limit = limits[label];
           const tickets = Array.isArray(source?.tickets)
@@ -5063,13 +5138,15 @@ export default function App() {
             batchSourceKey: expectedKey,
             batchSourceRace: targetRace,
             batchBetsSignature: String(event.data?.betsSignature || ""),
+            batchCaptureSource: String(event.data?.captureSource || "capture_fallback"),
+            displayedDraftSavedAt: Number(event.data?.displayedDraftSavedAt || 0) || null,
           }];
         });
 
         if (recs.length) {
           await persistBets((prev) => {
             // このレースの旧一括記録は、本線・対抗・穴をまとめて完全置換する。
-            const batchLabels = new Set(["本線", "対抗", "穴"]);
+            const batchLabels = new Set(["本線", "対抗", "穴", "展開リハ", "伏兵"]);
             const kept = prev.filter((r) => !(
               r?.batchRecorded
               && r?.date === targetDate
@@ -5113,8 +5190,13 @@ export default function App() {
   // AI買い目の自動保存は廃止。一括記録ボタンを押した時だけキューを作る。
 
 
-  // （旧）iframe一括記録の完了通知effectは廃止。一括記録は同期処理になり、
-  //  startBatchBetRecording が最終ステータス（スキップ理由つき）を直接設定する。
+  useEffect(() => {
+    if (batchBetProgress.total > 0 && batchBetProgress.done >= batchBetProgress.total && aiCaptureQueue.length === 0) {
+      setBatchBetStatus(
+        `✓ 一括記録完了：${batchBetProgress.saved}レース記録、${batchBetProgress.skipped}レーススキップ`
+      );
+    }
+  }, [batchBetProgress, aiCaptureQueue.length]);
 
   useEffect(() => {
     if (!aiCaptureQueue.length || captureAiMode) return;
@@ -5333,7 +5415,7 @@ export default function App() {
   // ── 的中率の集計（結果が入っているレコードが対象） ──
   const hitStats = useMemo(() => {
     const judged = statFilter.recs.filter((r) => r.result && r.bets && r.bets.length);
-    const labels = ["本線", "対抗", "穴"];
+    const labels = ["本線", "対抗", "穴", "展開リハ"];
     const per = Object.fromEntries(labels.map((l) => [l, { hit: 0, total: 0 }]));
     let comboHit = 0;
     for (const r of judged) {
@@ -5400,6 +5482,9 @@ export default function App() {
       { key: "h_a", name: "本線＋穴", parts: ["本線", "穴"] },
       { key: "t_a", name: "対抗＋穴", parts: ["対抗", "穴"] },
       { key: "h_t_a", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
+      { key: "fuku", name: "展開リハ", parts: ["展開リハ"] },
+      { key: "h_f", name: "本線＋展開リハ", parts: ["本線", "展開リハ"] },
+      { key: "h_t_f", name: "本線＋対抗＋展開リハ", parts: ["本線", "対抗", "展開リハ"] },
     ];
     const stats = {};
     for (const p of patterns) stats[p.key] = { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
@@ -5454,63 +5539,6 @@ export default function App() {
       evalB: evalView(evB),
     };
   }, [aiEval, result, racerStats, cmpA, cmpB, sts, fHold, fSts, motors, tilts, wind, kimari, kimariPeriod, nigeSim, odds]);
-
-  // ── 画面表示と保存の唯一の共通元 ──
-  // AI予想パネルの本線/対抗/穴の表示（被りのみモード・点数プルダウン適用後）を1か所で計算する。
-  // 画面のレンダリングも、個別記録も、一括記録スナップショットも、必ずこの関数の結果を使う。
-  const displayedTicketsForBet = (bet) => {
-    let baseTickets = Array.isArray(bet?.tickets) ? bet.tickets : [];
-    if (cmpMode === "overlap" && periodCompare) {
-      if (bet.label === "本線") baseTickets = baseTickets.filter((t) => periodCompare.honmei.overlap.includes(t));
-      if (bet.label === "対抗") baseTickets = baseTickets.filter((t) => periodCompare.taikou.overlap.includes(t));
-      if (bet.label === "穴") baseTickets = baseTickets.filter((t) => periodCompare.ana.overlap.includes(t));
-    }
-    const maxPts = baseTickets.length;
-    const lim = betLimits[bet.label] != null ? Math.min(betLimits[bet.label], maxPts) : maxPts;
-    const shown = baseTickets.slice(0, lim);
-    return { baseTickets, maxPts, lim, shown };
-  };
-
-  // いま画面に表示している本線/対抗/穴の買い目（保存用に完全展開・重複除去済み）。
-  const displayedAiBetLines = useMemo(() => {
-    if (!Array.isArray(aiEval?.bets)) return [];
-    return ["本線", "対抗", "穴"].flatMap((label) => {
-      const bet = aiEval.bets.find((b) => String(b?.label || "") === label);
-      if (!bet) return [];
-      const { shown } = displayedTicketsForBet(bet);
-      const tickets = expandTicketsForSave(shown);
-      return tickets.length ? [{ label, tickets }] : [];
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [aiEval, betLimits, cmpMode, periodCompare]);
-
-  // 表示中のAI買い目を、そのレースのスナップショットとして即時保存する（同じレンダーの値のみ）。
-  // 共有風を変更すると aiEval が再計算され、この effect が更新後の表示でスナップショットを上書きする（仕様B-1）。
-  useEffect(() => {
-    if (captureAiMode) return;
-    if (!venue || !raceDate) return;
-    const rn = Number(raceNo);
-    if (!Number.isInteger(rn) || rn < 1 || rn > 12) return;
-    if (autoLoading || raceWindsLoading) return;
-    if (!displayedAiBetLines.length) return;
-    const selectedWind = String(raceWinds?.[rn] || "");
-    if (!selectedWind) return; // 風未設定のレースは一括記録対象外なのでスナップショットも作らない
-    const key = `${raceDate}_${venue}_${rn}`;
-    const signature = `${key}_${JSON.stringify(displayedAiBetLines)}`;
-    const prev = aiBetSnapshotsRef.current?.[key];
-    if (prev && prev.signature === signature && String(prev.wind || "") === selectedWind) return;
-    storeAiBetSnapshot({
-      key,
-      date: raceDate,
-      venue,
-      race: rn,
-      wind: selectedWind,
-      bets: displayedAiBetLines,
-      signature,
-      updatedAt: Date.now(),
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [displayedAiBetLines, venue, raceDate, raceNo, autoLoading, raceWindsLoading, raceWinds, captureAiMode]);
 
   // ── 「買い目組む」: 選んだ対象（カード）順を尊重してラウンドロビン抽出 ──
   //   各カードの並び順（＝そのカードの狙い・軸）を保ったまま、配分方式に従って拾う。
@@ -5581,10 +5609,10 @@ export default function App() {
 
     // 配分方式に応じてカードの取り出し順を決める
     //   even = 全カードを1点ずつ交互（カード入力順）
-    //   solid = 堅いカード優先（本線→対抗→穴→超穴→シナリオ）
-    //   ana = 穴寄り優先（超穴→穴→対抗→本線→シナリオ）
+    //   solid = 堅いカード優先（本線→対抗→穴→展開リハ→シナリオ）
+    //   ana = 穴寄り優先（展開リハ→穴→対抗→本線→シナリオ）
     const solidRank = (part) => {
-      const map = { "本線": 0, "対抗": 1, "穴": 2, "超穴": 3 };
+      const map = { "本線": 0, "対抗": 1, "穴": 2, "展開リハ": 3 };
       if (part in map) return map[part];
       return 5; // シナリオは後ろ
     };
@@ -5660,16 +5688,24 @@ export default function App() {
       return;
     }
 
-    // 画面に表示している本線/対抗/穴と同じレンダー値（displayedAiBetLines）をそのまま使う。
-    // 表示が圧縮表記でも、保存する tickets は完全展開・重複除去済み（expandTicketsForSave適用済み）。
-    const lines = displayedAiBetLines.map((line, index) => ({
-      id: `${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`,
-      label: line.label,
-      tickets: [...line.tickets],
-      amountPerPoint: 100,
-      perTicket: null,
-      expanded: false,
-    }));
+    const labels = ["本線", "対抗", "穴", "展開リハ"];
+    const lines = labels.flatMap((label, index) => {
+      const source = aiEval.bets.find((b) => String(b?.label || "") === label);
+      const max = Array.isArray(source?.tickets) ? source.tickets.length : 0;
+      const configured = Math.max(0, Number(betLimits?.[label] ?? max));
+      const tickets = Array.isArray(source?.tickets)
+        ? source.tickets.slice(0, Math.min(configured, max)).filter(Boolean)
+        : [];
+      if (!tickets.length) return [];
+      return [{
+        id: `${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`,
+        label,
+        tickets,
+        amountPerPoint: 100,
+        perTicket: null,
+        expanded: false,
+      }];
+    });
 
     if (!lines.length) {
       setBetMsg("現在の点数設定で追加できるAI買い目がありません");
@@ -5771,112 +5807,42 @@ export default function App() {
       "本線": Math.max(0, Number(betLimits?.["本線"] ?? 0)),
       "対抗": Math.max(0, Number(betLimits?.["対抗"] ?? 0)),
       "穴": Math.max(0, Number(betLimits?.["穴"] ?? 0)),
+      "展開リハ": Math.max(0, Number(betLimits?.["展開リハ"] ?? 0)),
     };
-    if (!limits["本線"] && !limits["対抗"] && !limits["穴"]) {
-      setBatchBetStatus("本線・対抗・穴の点数を1つ以上設定してください");
+    if (!limits["本線"] && !limits["対抗"] && !limits["穴"] && !limits["展開リハ"]) {
+      setBatchBetStatus("本線・対抗・穴・展開リハの点数を1つ以上設定してください");
       return;
     }
 
-    const targetRaces = Array.from({ length: 12 }, (_, i) => i + 1)
-      .filter((r) => String(raceWinds?.[r] || "").trim());
+    const batchStartedAt = Date.now();
+    const targets = Array.from({ length: 12 }, (_, i) => i + 1)
+      .filter((r) => String(raceWinds?.[r] || "").trim())
+      .map((r) => ({
+        date: raceDate,
+        venue,
+        race: r,
+        captureToken: `${batchStartedAt}_${r}_${Math.random().toString(36).slice(2, 10)}`,
+      }));
 
-    if (!targetRaces.length) {
+    if (!targets.length) {
       setBatchBetStatus("風が設定されているレースがありません");
       return;
     }
 
-    // 一括記録は「各レース画面で実際に表示した買い目スナップショット」だけを保存する。
-    // iframeによる再計算は行わない（表示と保存の不一致の原因だったため廃止）。
-    const nowTs = Date.now();
-    const recsAll = [];
-    const skippedRaces = [];
-    for (const r of targetRaces) {
-      const key = `${raceDate}_${venue}_${r}`;
-      const snap = aiBetSnapshotsRef.current?.[key];
-      const targetWind = String(raceWinds?.[r] || "");
-      // スナップショットが無い／風が現在の設定と食い違う場合は保存しない（誤保存防止）。
-      if (
-        !snap
-        || !Array.isArray(snap.bets)
-        || !snap.bets.length
-        || String(snap.date || "") !== String(raceDate)
-        || String(snap.venue || "") !== String(venue)
-        || Number(snap.race) !== r
-        || String(snap.wind || "") !== targetWind
-      ) {
-        skippedRaces.push(r);
-        continue;
-      }
-      const recs = ["本線", "対抗", "穴"].flatMap((label, index) => {
-        if (!limits[label]) return [];
-        const source = snap.bets.find((b) => String(b?.label || "") === label);
-        // スナップショットは表示時点で展開・重複除去済みだが、保存直前にも必ず正規化する（要件C）。
-        const tickets = expandTicketsForSave(Array.isArray(source?.tickets) ? source.tickets : []);
-        if (!tickets.length) return [];
-        return [{
-          id: `batch_${key}_${label}_${nowTs}_${index}`,
-          date: raceDate,
-          venue,
-          race: r,
-          label,
-          points: tickets.length,
-          tickets,
-          amountPerPoint: 100,
-          perTicket: null,
-          amount: tickets.length * 100,
-          result: null,
-          hit: null,
-          payoutOdds: null,
-          payout: 0,
-          settlementStatus: "pending",
-          recordedAt: nowTs,
-          batchRecorded: true,
-          batchCaptureVersion: BATCH_CAPTURE_VERSION,
-          batchSourceKey: key,
-          batchSourceRace: r,
-          batchBetsSignature: String(snap.signature || ""),
-          batchSnapshotAt: Number(snap.updatedAt || 0),
-          wind: String(snap.wind || ""),
-          draftOnly: false,
-        }];
-      });
-      if (recs.length) recsAll.push(...recs);
-      else skippedRaces.push(r);
-    }
+    // 以前の一括記録はレース紐付けがずれている可能性があるため、この日・場の分を先に除去して作り直す。
+    await persistBets((prev) => prev.filter((b) => !(
+      b?.batchRecorded
+      && b?.date === raceDate
+      && b?.venue === venue
+      && ["本線", "対抗", "穴", "展開リハ", "伏兵"].includes(String(b?.label || ""))
+    )));
 
-    const savedRaceCount = new Set(recsAll.map((b) => Number(b.race))).size;
-
-    if (!recsAll.length) {
-      setBatchBetProgress({ done: 0, total: 0, saved: 0, skipped: 0 });
-      setBatchBetStatus(
-        "保存できる表示スナップショットがありません。各レース画面を開いてAI買い目の表示を確認してから、もう一度実行してください。"
-      );
-      return;
-    }
-
-    // 以前の一括記録はレース紐付け・買い目がずれている可能性があるため、この日・場の分を先に除去して作り直す。
-    const saved = await persistBets((prev) => {
-      const kept = prev.filter((b) => !(
-        b?.batchRecorded
-        && b?.date === raceDate
-        && b?.venue === venue
-        && ["本線", "対抗", "穴"].includes(String(b?.label || ""))
-      ));
-      return [...recsAll, ...kept];
-    });
-    if (!saved) {
-      setBatchBetStatus("✗ 一括記録の保存に失敗しました。ページを閉じずに、もう一度お試しください");
-      return;
-    }
-
-    setBatchBetProgress({ done: targetRaces.length, total: targetRaces.length, saved: savedRaceCount, skipped: skippedRaces.length });
+    setBatchBetProgress({ done: 0, total: targets.length, saved: 0, skipped: 0 });
     setBatchBetStatus(
-      `✓ 一括記録完了：表示スナップショットから${savedRaceCount}レースを記録`
-      + `（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}／1点100円）`
-      + (skippedRaces.length
-        ? `。${skippedRaces.join("・")}Rはスナップショット未作成または風設定変更後に未表示のためスキップしました。該当レースの画面を開いて表示を確認後、もう一度実行してください。`
-        : "")
+      `旧一括記録を削除して再作成中（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}・展開リハ${limits["展開リハ"]}／1点100円）`
     );
+    predictionSaveRef.current = "";
+    setAiCaptureQueue(targets);
   };
 
   // カートをこのレースの購入として確定。結果・払戻は公式結果確定後に自動反映する。
@@ -6007,7 +5973,8 @@ export default function App() {
 
   // 実際に記録したAI買い目を、単体・組み合わせ・開催場別で同じ判定関数に通す。
   const aiBetStats = useMemo(() => {
-    const labels = ["本線", "対抗", "穴", "超穴"];
+    // 超穴は廃止済みだが、過去に記録した履歴を集計から落とさないためラベルは残す。
+    const labels = ["本線", "対抗", "穴", "展開リハ", "伏兵", "超穴"];
     const source = reliableStatBets
       .filter((b) => labels.includes(String(b?.label || "")));
     const byLabel = Object.fromEntries(
@@ -6018,7 +5985,8 @@ export default function App() {
       { name: "本線", labels: ["本線"] },
       { name: "対抗", labels: ["対抗"] },
       { name: "穴", labels: ["穴"] },
-      { name: "超穴", labels: ["超穴"] },
+      { name: "展開リハ", labels: ["展開リハ", "伏兵"] },
+      { name: "超穴（廃止）", labels: ["超穴"] },
       { name: "本線+対抗", labels: ["本線", "対抗"] },
       { name: "本線+穴", labels: ["本線", "穴"] },
       { name: "対抗+穴", labels: ["対抗", "穴"] },
@@ -7267,7 +7235,9 @@ export default function App() {
                   ))}
                 </div>
                 <div style={{ fontSize: 9, color: "#5e7a92", marginTop: 6, lineHeight: 1.5 }}>
-                  ※ 当日気配ベースの試走です。参考指標としてご利用ください。
+                  ※ 当日気配ベースの試走です。参考指標としてご利用ください。<br />
+                  ※ この分布は下の「展開予想」のシナリオ選定に反映されます。最上位の展開は必ずシナリオに1枠採用され、
+                  頭出現率{18}%以上の艇は対抗・穴の頭候補にも格上げされます。
                 </div>
               </div>
             )}
@@ -7717,7 +7687,7 @@ export default function App() {
                           展開予想（気配→ST→モーター→F→風で絞り込み）
                         </div>
                         <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 8, lineHeight: 1.6, background: "#10202f", borderRadius: 6, padding: "6px 9px" }}>
-                          こちらは「レースがどう決まるか」の<b style={{ color: "#a9c8e8" }}>展開</b>から組む買い目です。決まり手率（逃げ・差し・まくり）をもとに、起こりやすい決着パターンごとに目を出します。展開を読んで狙いたいとき向け。（下の本線〜穴は「どの艇が強いか」の総合評価から組みます）
+                          こちらは「レースがどう決まるか」の<b style={{ color: "#a9c8e8" }}>展開</b>から組む買い目です。<b style={{ color: "#a9c8e8" }}>決まり手率</b>（＝その場の平均的な傾向）と<b style={{ color: "#f5c518" }}>展開リハーサル</b>（＝今日のST・進入・評価での1000回試走）の<b style={{ color: "#a9c8e8" }}>両方</b>をブレンドして、起こりやすい決着パターンごとに目を出します。両方が示す展開ほど上に来ます。（下の本線〜穴は「どの艇が強いか」の総合評価から組みます）
                         </div>
                         <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 10 }}>
                           頭候補：
@@ -7740,7 +7710,18 @@ export default function App() {
                                       シナリオ{i + 1}
                                     </span>
                                     <span style={{ fontSize: 13, fontWeight: 800, color: "#e8eef5" }}>{sc.label}</span>
-                                    <span style={{ fontSize: 11, color: "#7da3c8", marginLeft: "auto" }}>{sc.type}率 {sc.rate}%</span>
+                                    <span style={{ display: "flex", gap: 8, marginLeft: "auto", alignItems: "center", flexWrap: "wrap" }}>
+                                      {sc.rate > 0 && (
+                                        <span style={{ fontSize: 11, color: "#7da3c8" }}>{sc.type}率 {sc.rate}%</span>
+                                      )}
+                                      {sc.reh != null && (
+                                        <span style={{
+                                          fontSize: 11, fontWeight: 800, color: "#f5c518",
+                                          background: "#1a2d44", borderRadius: 6, padding: "2px 8px",
+                                          fontVariantNumeric: "tabular-nums",
+                                        }}>リハ {safeFixed(sc.reh, 1)}%</span>
+                                      )}
+                                    </span>
                                   </div>
                                   <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>{sc.desc}</div>
                                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -7756,7 +7737,8 @@ export default function App() {
                               );
                             })}
                             <div style={{ fontSize: 10, color: "#5e7a92", lineHeight: 1.6 }}>
-                              ※ 決まり手率データから可能性の高い展開を抽出。買い目はその展開での目安です。
+                              ※ 「◯◯率」＝その場の決まり手率（平均的な傾向）、「リハ」＝展開リハーサルの出現率（今日の隊形での試走結果）。
+                              この2つをブレンドして可能性の高い展開を抽出しています。リハーサル最上位の展開は必ず1枠採用されます。買い目はその展開での目安です。
                             </div>
                           </div>
                         ) : (
@@ -7782,7 +7764,7 @@ export default function App() {
                         </div>
                         <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>
                           配分の目安：
-                          {["本線", "対抗", "穴", "超穴"].filter((k) => aiEval.recommend.alloc[k] > 0).map((k, i, arr) => (
+                          {["本線", "対抗", "穴", "展開リハ"].filter((k) => aiEval.recommend.alloc[k] > 0).map((k, i, arr) => (
                             <span key={k}>{k} {aiEval.recommend.alloc[k]}点{i < arr.length - 1 ? " ／ " : ""}</span>
                           ))}
                         </div>
@@ -7835,10 +7817,17 @@ export default function App() {
                       {aiEval.bets.map((bet) => {
                         const color = bet.label === "本線" ? "#3d7ab8"
                           : bet.label === "対抗" ? "#5a9e2e"
-                          : bet.label === "超穴" ? "#9c5ec7" : "#b8893d";
-                        // 期間「被りのみ」モード・点数設定の適用は displayedTicketsForBet に一本化
-                        //（保存スナップショットと必ず同じ配列になるようにする）。
-                        const { maxPts, lim, shown } = displayedTicketsForBet(bet);
+                          : bet.label === "展開リハ" ? "#9c5ec7" : "#b8893d";
+                        // 期間「被りのみ」モード: 本線〜展開リハを共通買い目だけに絞る
+                        let baseTickets = bet.tickets;
+                        if (cmpMode === "overlap" && periodCompare) {
+                          if (bet.label === "本線") baseTickets = bet.tickets.filter((t) => periodCompare.honmei.overlap.includes(t));
+                          if (bet.label === "対抗") baseTickets = bet.tickets.filter((t) => periodCompare.taikou.overlap.includes(t));
+                          if (bet.label === "穴") baseTickets = bet.tickets.filter((t) => periodCompare.ana.overlap.includes(t));
+                        }
+                        const maxPts = baseTickets.length;
+                        const lim = betLimits[bet.label] != null ? Math.min(betLimits[bet.label], maxPts) : maxPts;
+                        const shown = baseTickets.slice(0, lim);
                         // 表示点数に応じた合成オッズ
                         let compShown = null;
                         if (odds) {
@@ -7881,6 +7870,21 @@ export default function App() {
                                 )}
                               </span>
                             </div>
+                            {bet.label === "展開リハ" && Array.isArray(bet.gaps) && bet.gaps.length > 0 && (
+                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+                                {bet.gaps.map((g) => (
+                                  <span key={g.boat} style={{
+                                    fontSize: 11, fontWeight: 700, color: "#e8d5f5",
+                                    background: "#2a1c3a", border: "1px solid #4a3560",
+                                    borderRadius: 6, padding: "3px 9px",
+                                    fontVariantNumeric: "tabular-nums",
+                                  }}>
+                                    {g.boat}号艇 リハ頭{safeFixed(g.reh, 1)}%
+                                    <span style={{ color: "#9c7ec7", marginLeft: 5 }}>／本線・対抗で頭なし</span>
+                                  </span>
+                                ))}
+                              </div>
+                            )}
                             {compShown ? (
                               <div style={{ fontSize: 12, color: "#5dd39e", fontWeight: 800, marginBottom: 6 }}>
                                 合成オッズ 約{safeFixed(compShown?.odds, 1)}倍
@@ -7923,9 +7927,11 @@ export default function App() {
                           対象（最大4つまで選択）{cmpMode === "overlap" ? "・被り買い目から" : ""}
                         </div>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
-                          {["本線", "対抗", "穴", "超穴"].map((p) => {
+                          {["本線", "対抗", "穴", "展開リハ"]
+                            .filter((p) => aiEval.bets.some((b) => b.label === p))
+                            .map((p) => {
                             const sel = pickerParts.includes(p);
-                            const c = p === "本線" ? "#3d7ab8" : p === "対抗" ? "#5a9e2e" : p === "超穴" ? "#9c5ec7" : "#b8893d";
+                            const c = p === "本線" ? "#3d7ab8" : p === "対抗" ? "#5a9e2e" : p === "展開リハ" ? "#9c5ec7" : "#b8893d";
                             return (
                               <button
                                 key={p}
@@ -8206,10 +8212,10 @@ export default function App() {
                 的中率（結果入力済み {hitStats.judged} レース）
               </div>
               <div style={{ display: "grid", gap: 6 }}>
-                {["本線", "対抗", "穴"].map((l) => {
+                {["本線", "対抗", "穴", "展開リハ"].map((l) => {
                   const s = hitStats.per[l];
                   const rate = s.total ? (s.hit / s.total * 100).toFixed(1) : "—";
-                  const color = l === "本線" ? "#3d7ab8" : l === "対抗" ? "#5a9e2e" : "#b8893d";
+                  const color = l === "本線" ? "#3d7ab8" : l === "対抗" ? "#5a9e2e" : l === "展開リハ" ? "#9c5ec7" : "#b8893d";
                   return (
                     <div key={l} style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <span style={{
@@ -8311,7 +8317,7 @@ export default function App() {
                             const maxP = b.tickets.length;
                             if (!maxP) return null;
                             const cur = (r.betLimits && r.betLimits[b.label] != null) ? Math.min(r.betLimits[b.label], maxP) : maxP;
-                            const c = b.label === "本線" ? "#3d7ab8" : b.label === "対抗" ? "#5a9e2e" : b.label === "超穴" ? "#9c5ec7" : "#b8893d";
+                            const c = b.label === "本線" ? "#3d7ab8" : b.label === "対抗" ? "#5a9e2e" : b.label === "展開リハ" ? "#9c5ec7" : "#b8893d";
                             return (
                               <span key={b.label} style={{ display: "flex", alignItems: "center", gap: 3 }}>
                                 <span style={{ color: c, fontWeight: 700 }}>{b.label}</span>
@@ -8568,10 +8574,9 @@ export default function App() {
               1R〜12RのAI買い目を一括記録
             </div>
             <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.7, marginBottom: 9 }}>
-              風を設定済みの各レースについて、そのレース画面で実際に表示したAI買い目（現在の点数設定
-              本線{Number(betLimits?.["本線"] ?? 0)}・対抗{Number(betLimits?.["対抗"] ?? 0)}・穴{Number(betLimits?.["穴"] ?? 0)}
-              適用後の表示スナップショット）を、表示順のまま1点100円で記録します。下段の選び順・配分は使用しません。
-              一度も画面で表示していないレースや、共有風を変更した後にまだ表示し直していないレースは、誤保存防止のためスキップされます（該当レースを開いて表示を確認すると記録できます）。
+              風を設定済みの各レースについて、それぞれのAI予想から現在の点数設定
+              （本線{Number(betLimits?.["本線"] ?? 0)}・対抗{Number(betLimits?.["対抗"] ?? 0)}・穴{Number(betLimits?.["穴"] ?? 0)}）
+              を上段の表示順のまま1点100円で記録します。下段の選び順・配分は使用しません。各レースの読込完了を確認してから保存します。公開前などAI予想を取得できないレースはスキップされます。
             </div>
             <button
               onClick={startBatchBetRecording}
