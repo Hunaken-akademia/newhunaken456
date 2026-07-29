@@ -4280,6 +4280,20 @@ export default function App() {
       tickets: honTickets,
     };
 
+    // ── 展開リハーサル（当日ST・進入・評価ベースのモンテカルロ） ──
+    //   決まり手率は「その場の平均的な傾向」、リハーサルは「今日この隊形ならどう動くか」。
+    //   この2つは別物なので、以降のシナリオ選定・頭候補の両方で併用する。
+    //   （全艇の平均STが未入力だと slit が null になり、その場合は従来どおり決まり手率のみで動く）
+    const rehScoreByBoat = {};
+    ranked.forEach((r) => { rehScoreByBoat[r.boat] = r.score || 0; });
+    const rehearsal = runTenkaiRehearsal({
+      slit,
+      scoreByBoat: rehScoreByBoat,
+      seedKey: `${raceDate}_${venue}_${raceNo}`,
+    });
+    const rehPct = rehearsal?.pctOf || null;    // {"まくり(4)": 27.6, ...}
+    const rehBoatPct = rehearsal?.boatPct || null; // {4: 36.3, ...}
+
     // ── 展開連動: 決まり手から「1号艇を脅かす濃い攻め手艇」を抽出 ──
     //   シナリオ（展開予想）と同じ決まり手データを使い、まくり/差し/まくり差しが濃い艇を特定。
     //   これを対抗・穴の頭候補に格上げして、展開を買い目の頭構成に反映する。
@@ -4309,6 +4323,24 @@ export default function App() {
         else if (c.atk >= 18) scenarioHeads.push(c.boat); // 単独で強い攻め手
         if (scenarioHeads.length >= 2) break;
       }
+    }
+
+    // 展開リハーサルで頭出現率が高い艇も頭候補に格上げする。
+    //   決まり手率は場全体の平均なので「今日この隊形なら攻めが決まりやすい」形を拾えない。
+    //   リハーサルで頭率18%以上（＝1000回中180回以上その艇が頭）なら実戦的な頭候補とみなす。
+    const REH_HEAD_MIN = 18;
+    if (rehBoatPct) {
+      const rehHeads = Object.entries(rehBoatPct)
+        .map(([b, pct]) => ({ boat: Number(b), pct }))
+        .filter((x) => x.boat !== 1 && x.pct >= REH_HEAD_MIN)
+        .sort((a, b) => b.pct - a.pct);
+      for (const h of rehHeads) {
+        if (scenarioHeads.includes(h.boat)) continue;
+        // 決まり手ベースの頭より前に入れる（当日の隊形の方が情報として新しい）
+        scenarioHeads.unshift(h.boat);
+        if (scenarioHeads.length >= 3) break;
+      }
+      scenarioHeads.splice(3); // 頭は最大3艇まで
     }
 
     // 対抗（確率モデル駆動）: 頭候補は現行どおり1着率2位＋展開濃厚艇。
@@ -4595,35 +4627,79 @@ export default function App() {
     const headRank = [...order].sort((a, b) => headScore(b) - headScore(a));
     const heads = headRank.slice(0, 2); // 頭1〜2艇に確定
 
-    // 決まり手シナリオ（決まり手率データから可能性が高い2〜3個を採用）
+    // 決まり手シナリオ（決まり手率＋展開リハーサルのブレンドで3〜4個を採用）
+    //
+    //   v139 まで: 決まり手率（場全体の平均）×気配係数 のみで選定していた。
+    //   その結果、展開リハーサル（当日の隊形シミュレーション）で最も濃い展開が
+    //   シナリオにも買い目にも一切出てこない、というズレが起きていた。
+    //   （例: リハーサルで4号艇まくり27.6%なのに、シナリオは5号艇まくり差し3.7%）
+    //
+    //   v140 から: 2つの情報源を明示的にブレンドする。
+    //     prior = 決まり手率ベースのシェア（その場でその決まり手が出る平均的な割合）
+    //     reh   = 展開リハーサル出現率（今日のST・進入・評価ならどう動くか）
+    //     score = prior × 0.45 + reh × 0.55
+    //   両方が指す展開ほど上位に来る。片方しか無い展開も候補には残るが順位は下がる。
+    const REH_W_PRIOR = 0.45; // 決まり手率（場の平均傾向）の重み
+    const REH_W_REH = 0.55;   // 展開リハーサル（当日の隊形）の重み
     let scenarios = [];
-    if (km) {
+    if (km || rehPct) {
       const cand = [];
-      // 逃げ（1号艇）
-      if (km.nige != null) cand.push({ type: "逃げ", boat: 1, rate: km.nige });
-      // 2〜6号艇のまくり・まくり差し・差し
-      const arrAt = (arr, boat) => (arr && arr[boat - 2] != null ? arr[boat - 2] : null);
-      for (let b = 2; b <= 6; b++) {
-        const mk = arrAt(km.makuri, b);
-        const mz = arrAt(km.makurizashi, b);
-        const sa = arrAt(km.sashi, b);
-        if (mk != null && mk > 0) cand.push({ type: "まくり", boat: b, rate: mk });
-        if (mz != null && mz > 0) cand.push({ type: "まくり差し", boat: b, rate: mz });
-        if (sa != null && sa > 0) cand.push({ type: "差し", boat: b, rate: sa });
+      const seenCand = new Set();
+      const addCand = (type, boat, rate) => {
+        const key = `${type}-${boat}`;
+        if (seenCand.has(key)) return;
+        seenCand.add(key);
+        cand.push({ type, boat, rate: rate ?? 0 });
+      };
+      if (km) {
+        // 逃げ（1号艇）
+        if (km.nige != null) addCand("逃げ", 1, km.nige);
+        // 2〜6号艇のまくり・まくり差し・差し
+        const arrAt = (arr, boat) => (arr && arr[boat - 2] != null ? arr[boat - 2] : null);
+        for (let b = 2; b <= 6; b++) {
+          const mk = arrAt(km.makuri, b);
+          const mz = arrAt(km.makurizashi, b);
+          const sa = arrAt(km.sashi, b);
+          if (mk != null && mk > 0) addCand("まくり", b, mk);
+          if (mz != null && mz > 0) addCand("まくり差し", b, mz);
+          if (sa != null && sa > 0) addCand("差し", b, sa);
+        }
       }
+      // リハーサルで出現した展開も候補に加える（決まり手率データが薄い/未取得でも拾える）
+      if (rehPct) {
+        for (const k of Object.keys(rehPct)) {
+          const m = /^(.+)\((\d)\)$/.exec(k);
+          if (!m) continue;
+          const type = m[1];
+          const boat = Number(m[2]);
+          if (type === "抜き") continue; // 抜きは買い目の頭として扱わない
+          if (rehPct[k] < 3) continue;   // ノイズ級の出現率は候補にしない
+          addCand(type, boat, 0);
+        }
+      }
+
       // 気配で重み付け（気配上位の決まり手ほど現実味）→ rate × 気配係数
+      const kehaiOf = (boat) => {
+        const pos = order.indexOf(boat);
+        return pos >= 0 ? (1 + (6 - pos) * 0.06) : 1;
+      };
+      const priorSum = cand.reduce((a, c) => a + c.rate * kehaiOf(c.boat), 0);
       const weighted = cand.map((c) => {
-        const pos = order.indexOf(c.boat);
-        const kehai = pos >= 0 ? (1 + (6 - pos) * 0.06) : 1;
-        return { ...c, score: c.rate * kehai };
+        const kehai = kehaiOf(c.boat);
+        // prior をシェア(%)に正規化して、リハーサル出現率(%)と同じ土俵に乗せる
+        const prior = priorSum > 0 ? ((c.rate * kehai) / priorSum) * 100 : 0;
+        const reh = rehPct ? (rehPct[`${c.type}(${c.boat})`] ?? 0) : null;
+        const score = reh == null ? prior : prior * REH_W_PRIOR + reh * REH_W_REH;
+        return { ...c, kehai, prior, reh, score };
       }).sort((a, b) => b.score - a.score);
 
-      // 本命頭候補の艇は必ずシナリオ候補に含める。
-      // 例：4号艇が本命なら、4号艇のまくり/差し/まくり差しで一番現実味のある展開を表示する。
-      const picked = weighted.filter((c) => c.rate >= 10).slice(0, 3);
-      const headPicked = heads
-        .map((h) => weighted.filter((c) => c.boat === h).sort((a, b) => b.score - a.score)[0])
-        .filter(Boolean);
+      // 採用ルール（枠の取り合いで濃い展開が押し出されないように優先順位を明示）
+      //   1) 展開リハーサル最上位の展開は必ず入れる ← 視聴者指摘の本丸
+      //   2) 本命頭（heads[0]）の展開を1枠だけ確保
+      //      ※ 旧実装は heads 2艇ぶん確保していたため、3枠中2枠が埋まり
+      //        リハーサルで濃い展開が入る余地が無かった
+      //   3) 残りはブレンドスコア順
+      const SC_MAX = rehPct ? 4 : 3;
       const seenScenario = new Set();
       const scenarioCountByBoat = new Map();
       const top = [];
@@ -4672,12 +4748,28 @@ export default function App() {
         }
         const label = c.type === "逃げ" ? `逃げ（1号艇）`
           : `${c.type}（${head}号艇）`;
+        // 説明文は「決まり手率（場の平均）」と「リハーサル出現率（今日の隊形）」を併記する。
+        const rehTxt = c.reh != null ? `リハーサル出現率${round1(c.reh)}%` : null;
+        const rateTxt = c.rate > 0 ? `${c.type}率${c.rate}%` : null;
+        let desc;
+        if (rateTxt && rehTxt) {
+          desc = c.type === "逃げ"
+            ? `1号艇の${rateTxt}／${rehTxt}。1号艇先マイから気配上位へ`
+            : `${head}号艇の${rateTxt}／${rehTxt}。外から${c.type}が決まる展開`;
+        } else if (rehTxt) {
+          desc = `${head}号艇の${rehTxt}。決まり手率データでは薄いが、当日のST・進入だと現実味のある展開`;
+        } else {
+          desc = c.type === "逃げ"
+            ? `1号艇の${rateTxt}。1号艇先マイから気配上位へ`
+            : `${head}号艇の${rateTxt}。外から${c.type}が決まる展開`;
+        }
         return {
           type: c.type, boat: head, rate: c.rate,
+          reh: c.reh != null ? round1(c.reh) : null,   // 展開リハーサル出現率(%)
+          prior: round1(c.prior),                       // 決まり手率ベースのシェア(%)
+          blend: round1(c.score),                       // ブレンド後スコア
           label,
-          desc: c.type === "逃げ"
-            ? `1号艇の逃げ率${c.rate}%。1号艇先マイから気配上位へ`
-            : `${head}号艇の${c.type}率${c.rate}%。外から${c.type}が決まる展開`,
+          desc,
           tickets,
         };
       });
@@ -4772,13 +4864,13 @@ export default function App() {
       confidence = { total, level, color, advice, reasons };
     }
 
-    return { ranked, badge, badgeColor, usedData, bets, flow, recommend, confidence, winProb, probMap, evList };
+    return { ranked, badge, badgeColor, usedData, bets, flow, recommend, confidence, winProb, probMap, evList, rehearsal };
   };
 
   // メイン評価（選択中の区分）
   const aiEval = useMemo(
     () => (result ? evaluateRows(result.rows) : null),
-    [result, sts, fHold, fSts, motors, tilts, wind, racerCat, kimari, kimariPeriod, nigeSim, odds]
+    [result, sts, fHold, fSts, motors, tilts, wind, racerCat, kimari, kimariPeriod, nigeSim, odds, slit, raceDate, venue, raceNo]
   );
 
 
@@ -5290,80 +5382,11 @@ export default function App() {
   }, [aiEval]);
 
   // ── 展開リハーサル（スタート隊形のモンテカルロ試走） ──
-  //   平均ST・進入・当日評価スコアから、スタート隊形を1000回試走して決まり手の出現分布を出す。
-  const tenkaiRehearsal = useMemo(() => {
-    if (!aiEval || !slit || !Array.isArray(slit) || slit.length !== 6) return null;
-    let seed = 0;
-    const key = `${raceDate}_${venue}_${raceNo}`;
-    for (let i = 0; i < key.length; i++) seed = (seed * 31 + key.charCodeAt(i)) >>> 0;
-    const mulberry32 = (a) => () => {
-      a |= 0; a = (a + 0x6D2B79F5) | 0;
-      let t = Math.imul(a ^ (a >>> 15), 1 | a);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-    const rnd = mulberry32(seed || 1);
-    const gauss = () => {
-      let u = 0, v = 0;
-      while (u === 0) u = rnd();
-      while (v === 0) v = rnd();
-      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-    };
-    const byCourse = {};
-    slit.forEach((e) => { byCourse[e.course] = e; });
-    if (!byCourse[1]) return null;
-    const scores = {};
-    aiEval.ranked.forEach((r) => { scores[r.boat] = r.score || 0; });
-    const vals = slit.map((e) => scores[e.boat] ?? 0);
-    const mn = Math.min(...vals), mx = Math.max(...vals);
-    const pow = {};
-    slit.forEach((e) => { pow[e.boat] = mx === mn ? 0.5 : ((scores[e.boat] ?? 0) - mn) / (mx - mn); });
-    const ITERS = 1000;
-    const tally = {};
-    const winCount = {};
-    slit.forEach((e) => { winCount[e.boat] = 0; });
-    const addResult = (kind, boat) => {
-      const k = `${kind}(${boat})`;
-      tally[k] = (tally[k] || 0) + 1;
-      winCount[boat] += 1;
-    };
-    for (let i = 0; i < ITERS; i++) {
-      const s = {};
-      slit.forEach((e) => { s[e.course] = Math.abs(e.st) + gauss() * 0.05 - (e.course >= 4 ? 0.01 : 0); });
-      const c1 = byCourse[1];
-      let attacker = null, attackKind = null;
-      for (const c of [4, 3, 5, 6]) {
-        const e = byCourse[c];
-        if (!e) continue;
-        const adv = s[1] - s[c];
-        const th = 0.055 - 0.05 * pow[e.boat];
-        if (adv > th + rnd() * 0.03) {
-          attacker = e;
-          attackKind = (c === 3 || c === 4) && adv < th + 0.05 && rnd() < 0.45 ? "まくり差し" : "まくり";
-          break;
-        }
-      }
-      if (attacker) { addResult(attackKind, attacker.boat); continue; }
-      const c2 = byCourse[2];
-      if (c2) {
-        const gap = s[2] - s[1];
-        const sashiP = Math.max(0, 0.30 - gap * 3) * (0.4 + 0.8 * pow[c2.boat]) * (1 - 0.5 * pow[c1.boat]);
-        if (rnd() < sashiP) { addResult("差し", c2.boat); continue; }
-      }
-      if (rnd() < 0.04) {
-        const cand = slit.filter((e) => e.course >= 3).sort((a, b) => pow[b.boat] - pow[a.boat])[0];
-        if (cand && rnd() < pow[cand.boat] * 0.6) { addResult("抜き", cand.boat); continue; }
-      }
-      addResult("逃げ", c1.boat);
-    }
-    const patterns = Object.entries(tally)
-      .map(([k, n]) => ({ k, pct: (n / ITERS) * 100 }))
-      .sort((a, b) => b.pct - a.pct);
-    const winPct = slit
-      .map((e) => ({ boat: e.boat, course: e.course, pct: (winCount[e.boat] / ITERS) * 100 }))
-      .sort((a, b) => b.pct - a.pct);
-    return { iters: ITERS, patterns, winPct };
-  }, [aiEval, slit, raceDate, venue, raceNo]);
+  //   v140: シミュレーション本体は evaluateRows 内（runTenkaiRehearsal）に移設した。
+  //   表示用のこの値と、シナリオ選定に使う値が必ず同一になるようにするため、
+  //   画面側は aiEval.rehearsal をそのまま参照する。
+  //   （旧実装は表示専用の別memoだったため、リハーサルの結果が買い目に一切反映されなかった）
+  const tenkaiRehearsal = aiEval?.rehearsal || null;
 
   // ── AI予想の収支（もし機械的に買っていたら・1点100円固定） ──
   const aiLedger = useMemo(() => {
