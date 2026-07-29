@@ -248,33 +248,6 @@ function safeFixed(value, digits = 1, fallback = "—") {
   return Number.isFinite(n) ? n.toFixed(digits) : fallback;
 }
 
-const AI_DISPLAY_DRAFTS_KEY = "hunaken_ai_display_drafts_v1";
-
-function loadAiDisplayDrafts() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(AI_DISPLAY_DRAFTS_KEY) || "{}");
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveAiDisplayDraft(raceKey, payload) {
-  if (!raceKey || !payload) return;
-  try {
-    const all = loadAiDisplayDrafts();
-    all[raceKey] = payload;
-    localStorage.setItem(AI_DISPLAY_DRAFTS_KEY, JSON.stringify(all));
-  } catch (e) {
-    console.warn("AI display draft save failed", e);
-  }
-}
-
-function getAiDisplayDraft(raceKey) {
-  const row = loadAiDisplayDrafts()?.[raceKey];
-  return row && typeof row === "object" ? row : null;
-}
-
 function normalizeRaceGrade(v) {
   const s = String(v || "").trim().toUpperCase();
   if (!s) return "";
@@ -889,6 +862,131 @@ const VENUES_SEASONAL = {
 // 季節の集計期間ラベル
 const SEASON_PERIOD = { "春": "3〜5月", "夏": "6〜8月", "秋": "9〜11月", "冬": "12〜2月" };
 
+// ── 展開リハーサル（スタート隊形のモンテカルロ試走・純関数版） ──
+//   各艇の平均ST・F持ち・進入・当日評価スコアから、スタート隊形を ITERS 回試走し、
+//   決まり手の出現分布を出す。固定シードなので同じレースでは常に同じ結果になる。
+//
+//   ※ v139 変更点（視聴者フィードバック反映）
+//     (1) 攻め手の選定を「4→3→5→6の先着勝ち」から「最も余裕のある艇が攻める」に変更。
+//         旧実装は4コースが常に先に判定されるため、4号艇の攻め成功率が構造的に過大だった。
+//     (2) 5・6コースからの「まくり差し」、3コースからの「差し」を出現候補に追加。
+//         旧実装ではリハーサル側にこれらの決まり手が存在せず、シナリオ（決まり手率ベース）と
+//         同じ土俵で比較できなかった。
+//     (3) 艇別の攻め出現率（boatPct）と決まり手キー別の出現率（pctOf）を返し、
+//         シナリオ選定・頭候補の判定から参照できるようにした。
+function runTenkaiRehearsal({ slit, scoreByBoat = {}, seedKey = "", iters = 1000 }) {
+  if (!slit || !Array.isArray(slit) || slit.length !== 6) return null;
+  // 平均STとして扱えない値（NaN・Infinity・負値）や重複/欠落コースは、
+  // Math.abs 等で補正せずリハーサル自体を無効化する。誤入力を「速いST」に変換しないため。
+  const courseSet = new Set();
+  for (const e of slit) {
+    const course = Number(e?.course);
+    const boat = Number(e?.boat);
+    const st = Number(e?.st);
+    if (!Number.isInteger(course) || course < 1 || course > 6
+      || !Number.isInteger(boat) || boat < 1 || boat > 6
+      || !Number.isFinite(st) || st < 0 || courseSet.has(course)) return null;
+    courseSet.add(course);
+  }
+  let seed = 0;
+  const key = String(seedKey || "");
+  for (let i = 0; i < key.length; i++) seed = (seed * 31 + key.charCodeAt(i)) >>> 0;
+  const mulberry32 = (a) => () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const rnd = mulberry32(seed || 1);
+  const gauss = () => {
+    let u = 0, v = 0;
+    while (u === 0) u = rnd();
+    while (v === 0) v = rnd();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+  const byCourse = {};
+  slit.forEach((e) => { byCourse[e.course] = e; });
+  if (!byCourse[1]) return null;
+
+  const vals = slit.map((e) => scoreByBoat[e.boat] ?? 0);
+  const mn = Math.min(...vals), mx = Math.max(...vals);
+  const pow = {};
+  slit.forEach((e) => { pow[e.boat] = mx === mn ? 0.5 : ((scoreByBoat[e.boat] ?? 0) - mn) / (mx - mn); });
+
+  const ITERS = Math.max(100, iters);
+  const tally = {};
+  const winCount = {};
+  slit.forEach((e) => { winCount[e.boat] = 0; });
+  const addResult = (kind, boat) => {
+    const k = `${kind}(${boat})`;
+    tally[k] = (tally[k] || 0) + 1;
+    winCount[boat] += 1;
+  };
+
+  for (let i = 0; i < ITERS; i++) {
+    const s = {};
+    // コースだけを理由に4〜6コースを一律0.01秒速くする補正は、実測校正がないため撤廃。
+    slit.forEach((e) => { s[e.course] = Number(e.st) + gauss() * 0.05; });
+    const c1 = byCourse[1];
+
+    // 攻め手判定: 各コースの「1号艇に対するST差 − 必要量」を比べ、最も余裕が大きい艇が攻める。
+    // （旧実装のように固定順で先着勝ちにすると、内側コースの攻めが構造的に過大評価される）
+    let attacker = null, attackerAdv = null, attackerTh = null, bestMargin = 0;
+    for (const c of [3, 4, 5, 6]) {
+      const e = byCourse[c];
+      if (!e) continue;
+      const adv = s[1] - s[c];
+      const th = 0.055 - 0.05 * pow[e.boat];
+      const need = th + rnd() * 0.03;
+      const margin = adv - need;
+      if (margin <= 0 || margin <= bestMargin) continue;
+      bestMargin = margin;
+      attacker = e;
+      attackerAdv = adv;
+      attackerTh = th;
+    }
+    if (attacker) {
+      // 攻め手が確定してから決まり手抽選を1回だけ行う。候補走査中の乱数消費による順序依存を避ける。
+      const c = Number(attacker.course);
+      const zashiWindow = c <= 4 ? 0.05 : 0.06;
+      const zashiP = c <= 4 ? 0.45 : 0.55;
+      const attackKind = attackerAdv < attackerTh + zashiWindow && rnd() < zashiP ? "まくり差し" : "まくり";
+      addResult(attackKind, attacker.boat);
+      continue;
+    }
+
+    // 差し: 2コースが本命だが、3コースからの差しも一定確率で発生させる。
+    let sashiBoat = null;
+    for (const c of [2, 3]) {
+      const e = byCourse[c];
+      if (!e) continue;
+      const gap = s[c] - s[1];
+      const base = c === 2 ? 0.30 : 0.12;
+      const p = Math.max(0, base - gap * 3) * (0.4 + 0.8 * pow[e.boat]) * (1 - 0.5 * pow[c1.boat]);
+      if (rnd() < p) { sashiBoat = e.boat; break; }
+    }
+    if (sashiBoat) { addResult("差し", sashiBoat); continue; }
+
+    if (rnd() < 0.04) {
+      const cand = slit.filter((e) => e.course >= 3).sort((a, b) => pow[b.boat] - pow[a.boat])[0];
+      if (cand && rnd() < pow[cand.boat] * 0.6) { addResult("抜き", cand.boat); continue; }
+    }
+    addResult("逃げ", c1.boat);
+  }
+
+  const patterns = Object.entries(tally)
+    .map(([k, n]) => ({ k, pct: (n / ITERS) * 100 }))
+    .sort((a, b) => b.pct - a.pct);
+  const winPct = slit
+    .map((e) => ({ boat: e.boat, course: e.course, pct: (winCount[e.boat] / ITERS) * 100 }))
+    .sort((a, b) => b.pct - a.pct);
+  // 決まり手キー別の出現率（"まくり(4)" → 27.6）。シナリオ選定から直接引ける形にする。
+  const pctOf = Object.fromEntries(patterns.map((p) => [p.k, p.pct]));
+  // 艇別の頭出現率（逃げ・まくり・まくり差し・差し・抜きの合計）。頭候補の判定に使う。
+  const boatPct = Object.fromEntries(slit.map((e) => [e.boat, (winCount[e.boat] / ITERS) * 100]));
+  return { iters: ITERS, patterns, winPct, pctOf, boatPct };
+}
+
 // 買い目の「表示順」を整える: 1着→2着→3着の順に若い艇番（1号艇寄り）を先に並べる。
 //   ※ これは表示専用。点数選択（当たりやすい目を残す）ロジックには一切影響しない。
 function sortTicketsForDisplay(tickets) {
@@ -999,6 +1097,23 @@ function ticketListIncludesResult(tickets, result) {
   if (!normalized || !Array.isArray(tickets)) return false;
   return tickets.some((ticket) => expandTrifectaTicket(ticket).includes(normalized));
 }
+
+// 保存用の正規化: 表示配列（圧縮表記が混ざっていても可）を完全展開した3連単の配列にする。
+// 例: ["3-1-245","3-2-1"] → ["3-1-2","3-1-4","3-1-5","3-2-1"]
+// 重複は先勝ちで除去し、表示順は維持する。保存する tickets は必ずこの関数を通す。
+function expandTicketsForSave(tickets) {
+  const out = [];
+  const seen = new Set();
+  for (const t of Array.isArray(tickets) ? tickets : []) {
+    for (const e of expandTrifectaTicket(t)) {
+      if (!seen.has(e)) { seen.add(e); out.push(e); }
+    }
+  }
+  return out;
+}
+
+// 表示スナップショットの保存キー
+const AI_BET_SNAPSHOT_STORAGE_KEY = "hunaken_ai_bet_snapshots_v1";
 
 function stakeForTrifectaResult(record, result) {
   const normalized = normalizeTrifectaResult(result);
@@ -1646,6 +1761,14 @@ export default function App() {
     const rn = Number(race);
     setRaceWinds((p) => ({ ...p, [rn]: value }));
     if (rn === Number(raceNo)) setWind(value || "無風");
+    // 共有風を変えたレースは、変更前の表示スナップショットを破棄する。
+    // 現在表示中のレースなら、新しい風でのAI買い目が表示された時点でスナップショットが自動更新される。
+    // 別レースなら、そのレース画面を開いて表示を確認するまで一括記録の対象外になる（旧買い目の誤保存防止）。
+    try {
+      const snapKey = `${raceDate}_${venue}_${rn}`;
+      const snap = aiBetSnapshotsRef.current?.[snapKey];
+      if (snap && String(snap.wind || "") !== String(value || "")) invalidateAiBetSnapshot(snapKey);
+    } catch (e) { /* noop */ }
     setRaceWindsMsg("保存中…");
     try {
       const res = await fetch("/api/yoso?action=save_manual_wind", {
@@ -1791,8 +1914,10 @@ export default function App() {
   // 記録関連（予想・的中率・収支・AI収支・舟券収支・バックアップ）の表示フラグ。
   // Webアプリ版（Vercel）では localStorage に永続保存されるため有効。
   const SHOW_RECORDS = true;
-  // 一括記録の保存形式。過去版はレースずれの可能性があるため集計対象外にする。
-  const BATCH_CAPTURE_VERSION = 3;
+  // 一括記録の保存形式。過去版はレースずれ・iframe再計算による買い目ずれの可能性があるため集計対象外にする。
+  // v3以前: iframeで再計算した買い目を保存（画面表示と不一致になる不具合あり）
+  // v4: 画面表示スナップショットをそのまま保存
+  const BATCH_CAPTURE_VERSION = 4;
   // 下段の選び順・配分は任意。未選択なら上段の本線・対抗・穴の点数設定をそのまま使う。
   const SHOW_CUSTOM_AI_PICKER = true;
   const SHOW_VENUE_AI_LEDGER = false;
@@ -1817,6 +1942,39 @@ export default function App() {
   const [venueLedgerLoading, setVenueLedgerLoading] = useState(false);
   const [venueLedgerError, setVenueLedgerError] = useState("");
   const [aiCaptureQueue, setAiCaptureQueue] = useState([]); // [{date,venue,race,captureToken}] 一括記録キュー
+  // ── 画面表示AI買い目スナップショット ──
+  // key = `${date}_${venue}_${race}`。そのレース画面で実際に表示した本線/対抗/穴（点数設定適用後・完全展開済み）を保持する。
+  // 一括記録はこのスナップショットだけを保存元にする（iframe再計算は使わない）。
+  const aiBetSnapshotsRef = useRef({});
+  const persistAiBetSnapshots = (next) => {
+    aiBetSnapshotsRef.current = next;
+    try { localStorage.setItem(AI_BET_SNAPSHOT_STORAGE_KEY, JSON.stringify(next)); } catch (e) { /* noop */ }
+  };
+  const storeAiBetSnapshot = (snap) => {
+    if (!snap?.key) return;
+    persistAiBetSnapshots({ ...(aiBetSnapshotsRef.current || {}), [snap.key]: snap });
+  };
+  const invalidateAiBetSnapshot = (key) => {
+    if (!key || !(aiBetSnapshotsRef.current || {})[key]) return;
+    const next = { ...(aiBetSnapshotsRef.current || {}) };
+    delete next[key];
+    persistAiBetSnapshots(next);
+  };
+  useEffect(() => {
+    if (captureAiMode) return;
+    try {
+      const raw = localStorage.getItem(AI_BET_SNAPSHOT_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (!parsed || typeof parsed !== "object") return;
+      const maxAge = 48 * 60 * 60 * 1000;
+      const next = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (v && Array.isArray(v.bets) && Date.now() - Number(v.updatedAt || 0) <= maxAge) next[k] = v;
+      }
+      persistAiBetSnapshots(next);
+    } catch (e) { /* noop */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captureAiMode]);
   const aiCaptureQueueRef = useRef([]);
   const aiCaptureFrameRef = useRef(null);
   const [captureLoadedKey, setCaptureLoadedKey] = useState("");
@@ -4467,14 +4625,35 @@ export default function App() {
         .map((h) => weighted.filter((c) => c.boat === h).sort((a, b) => b.score - a.score)[0])
         .filter(Boolean);
       const seenScenario = new Set();
-      const top = [...headPicked, ...picked, ...weighted.slice(0, 3)]
-        .filter((c) => {
-          const key = `${c.type}-${c.boat}`;
-          if (seenScenario.has(key)) return false;
-          seenScenario.add(key);
-          return true;
-        })
-        .slice(0, 3);
+      const scenarioCountByBoat = new Map();
+      const top = [];
+      const pushSc = (c) => {
+        if (!c || top.length >= SC_MAX) return;
+        const key = `${c.type}-${c.boat}`;
+        if (seenScenario.has(key)) return;
+        // 同じ艇の別決まり手だけで4枠を占有しない。最大2展開までは設計意図どおり許容。
+        if ((scenarioCountByBoat.get(c.boat) || 0) >= 2) return;
+        seenScenario.add(key);
+        scenarioCountByBoat.set(c.boat, (scenarioCountByBoat.get(c.boat) || 0) + 1);
+        top.push(c);
+      };
+      if (rehPct) {
+        const rehTop = weighted.filter((c) => (c.reh ?? 0) > 0).sort((a, b) => b.reh - a.reh)[0];
+        pushSc(rehTop);
+      }
+      pushSc(weighted.filter((c) => c.boat === heads[0]).sort((a, b) => b.score - a.score)[0]);
+      // 実体のある展開のみ（決まり手率10%以上 or リハーサル5%以上）
+      for (const c of weighted) {
+        if (top.length >= SC_MAX) break;
+        if (c.rate < 10 && (c.reh ?? 0) < 5) continue;
+        pushSc(c);
+      }
+      // それでも埋まらなければスコア上位で補完
+      for (const c of weighted) {
+        if (top.length >= SC_MAX) break;
+        pushSc(c);
+      }
+      top.sort((a, b) => b.score - a.score);
 
       scenarios = top.map((c) => {
         const head = c.boat;
@@ -4602,32 +4781,6 @@ export default function App() {
     [result, sts, fHold, fSts, motors, tilts, wind, racerCat, kimari, kimariPeriod, nigeSim, odds]
   );
 
-  // 通常画面に実際に表示されたAI買い目を、正式な舟券履歴とは別の下書きとして保存する。
-  // 後から一括記録するときは再計算結果ではなく、この表示済み買い目を優先して使用する。
-  useEffect(() => {
-    if (captureAiMode) return;
-    const r = Number(raceNo);
-    if (!venue || !raceDate || !Number.isInteger(r) || r < 1 || r > 12) return;
-    if (!aiEval?.bets?.length || autoLoading) return;
-    const selectedWind = String(raceWinds?.[r] || wind || "").trim();
-    if (!selectedWind) return;
-    const raceKey = `${raceDate}_${venue}_${r}`;
-    const bets = aiEval.bets.map((b) => ({
-      label: String(b?.label || ""),
-      tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
-    }));
-    saveAiDisplayDraft(raceKey, {
-      date: raceDate,
-      venue,
-      race: r,
-      wind: selectedWind,
-      bets,
-      betsSignature: `${raceKey}_${JSON.stringify(bets)}`,
-      savedAt: Date.now(),
-      source: "visible_ai_panel",
-    });
-  }, [captureAiMode, venue, raceDate, raceNo, aiEval, autoLoading, raceWinds, wind]);
-
 
   // 一括記録用の非表示画面では、そのレースのAI買い目を親画面へ返す。
   // レース切替直後の古い評価を送らないよう、同じ買い目が2.5秒安定してから送信する。
@@ -4664,24 +4817,11 @@ export default function App() {
       return undefined;
     }
 
-    // 同じ風で通常画面に表示済みの買い目があれば、それを唯一の保存元として使用する。
-    // 表示済み下書きがない場合だけ、非表示画面の現在評価をフォールバックにする。
-    const visibleDraft = getAiDisplayDraft(targetKey);
-    const canUseVisibleDraft = visibleDraft
-      && String(visibleDraft.wind || "").trim() === String(selectedManualWind).trim()
-      && Array.isArray(visibleDraft.bets)
-      && visibleDraft.bets.length;
-    const bets = canUseVisibleDraft
-      ? visibleDraft.bets.map((b) => ({
-          label: String(b?.label || ""),
-          tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
-        }))
-      : aiEval.bets.map((b) => ({
-          label: String(b?.label || ""),
-          tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
-        }));
-    const captureSource = canUseVisibleDraft ? "visible_ai_panel" : "capture_fallback";
-    const signature = `${targetKey}_${captureSource}_${JSON.stringify(bets)}`;
+    const bets = aiEval.bets.map((b) => ({
+      label: String(b?.label || ""),
+      tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
+    }));
+    const signature = `${targetKey}_${JSON.stringify(bets)}`;
     captureLastSignatureRef.current = signature;
     if (captureStableTimerRef.current) window.clearTimeout(captureStableTimerRef.current);
 
@@ -4717,8 +4857,6 @@ export default function App() {
           batchCaptureVersion: BATCH_CAPTURE_VERSION,
           betsSignature: signature,
           bets,
-          captureSource,
-          displayedDraftSavedAt: canUseVisibleDraft ? Number(visibleDraft?.savedAt || 0) : null,
         }, window.location.origin);
       }
     }, 2500);
@@ -4833,8 +4971,6 @@ export default function App() {
             batchSourceKey: expectedKey,
             batchSourceRace: targetRace,
             batchBetsSignature: String(event.data?.betsSignature || ""),
-            batchCaptureSource: String(event.data?.captureSource || "capture_fallback"),
-            displayedDraftSavedAt: Number(event.data?.displayedDraftSavedAt || 0) || null,
           }];
         });
 
@@ -4885,13 +5021,8 @@ export default function App() {
   // AI買い目の自動保存は廃止。一括記録ボタンを押した時だけキューを作る。
 
 
-  useEffect(() => {
-    if (batchBetProgress.total > 0 && batchBetProgress.done >= batchBetProgress.total && aiCaptureQueue.length === 0) {
-      setBatchBetStatus(
-        `✓ 一括記録完了：${batchBetProgress.saved}レース記録、${batchBetProgress.skipped}レーススキップ`
-      );
-    }
-  }, [batchBetProgress, aiCaptureQueue.length]);
+  // （旧）iframe一括記録の完了通知effectは廃止。一括記録は同期処理になり、
+  //  startBatchBetRecording が最終ステータス（スキップ理由つき）を直接設定する。
 
   useEffect(() => {
     if (!aiCaptureQueue.length || captureAiMode) return;
@@ -5301,6 +5432,63 @@ export default function App() {
     };
   }, [aiEval, result, racerStats, cmpA, cmpB, sts, fHold, fSts, motors, tilts, wind, kimari, kimariPeriod, nigeSim, odds]);
 
+  // ── 画面表示と保存の唯一の共通元 ──
+  // AI予想パネルの本線/対抗/穴の表示（被りのみモード・点数プルダウン適用後）を1か所で計算する。
+  // 画面のレンダリングも、個別記録も、一括記録スナップショットも、必ずこの関数の結果を使う。
+  const displayedTicketsForBet = (bet) => {
+    let baseTickets = Array.isArray(bet?.tickets) ? bet.tickets : [];
+    if (cmpMode === "overlap" && periodCompare) {
+      if (bet.label === "本線") baseTickets = baseTickets.filter((t) => periodCompare.honmei.overlap.includes(t));
+      if (bet.label === "対抗") baseTickets = baseTickets.filter((t) => periodCompare.taikou.overlap.includes(t));
+      if (bet.label === "穴") baseTickets = baseTickets.filter((t) => periodCompare.ana.overlap.includes(t));
+    }
+    const maxPts = baseTickets.length;
+    const lim = betLimits[bet.label] != null ? Math.min(betLimits[bet.label], maxPts) : maxPts;
+    const shown = baseTickets.slice(0, lim);
+    return { baseTickets, maxPts, lim, shown };
+  };
+
+  // いま画面に表示している本線/対抗/穴の買い目（保存用に完全展開・重複除去済み）。
+  const displayedAiBetLines = useMemo(() => {
+    if (!Array.isArray(aiEval?.bets)) return [];
+    return ["本線", "対抗", "穴"].flatMap((label) => {
+      const bet = aiEval.bets.find((b) => String(b?.label || "") === label);
+      if (!bet) return [];
+      const { shown } = displayedTicketsForBet(bet);
+      const tickets = expandTicketsForSave(shown);
+      return tickets.length ? [{ label, tickets }] : [];
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aiEval, betLimits, cmpMode, periodCompare]);
+
+  // 表示中のAI買い目を、そのレースのスナップショットとして即時保存する（同じレンダーの値のみ）。
+  // 共有風を変更すると aiEval が再計算され、この effect が更新後の表示でスナップショットを上書きする（仕様B-1）。
+  useEffect(() => {
+    if (captureAiMode) return;
+    if (!venue || !raceDate) return;
+    const rn = Number(raceNo);
+    if (!Number.isInteger(rn) || rn < 1 || rn > 12) return;
+    if (autoLoading || raceWindsLoading) return;
+    if (!displayedAiBetLines.length) return;
+    const selectedWind = String(raceWinds?.[rn] || "");
+    if (!selectedWind) return; // 風未設定のレースは一括記録対象外なのでスナップショットも作らない
+    const key = `${raceDate}_${venue}_${rn}`;
+    const signature = `${key}_${JSON.stringify(displayedAiBetLines)}`;
+    const prev = aiBetSnapshotsRef.current?.[key];
+    if (prev && prev.signature === signature && String(prev.wind || "") === selectedWind) return;
+    storeAiBetSnapshot({
+      key,
+      date: raceDate,
+      venue,
+      race: rn,
+      wind: selectedWind,
+      bets: displayedAiBetLines,
+      signature,
+      updatedAt: Date.now(),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displayedAiBetLines, venue, raceDate, raceNo, autoLoading, raceWindsLoading, raceWinds, captureAiMode]);
+
   // ── 「買い目組む」: 選んだ対象（カード）順を尊重してラウンドロビン抽出 ──
   //   各カードの並び順（＝そのカードの狙い・軸）を保ったまま、配分方式に従って拾う。
   //   選び方(pickerMode)はカード内の並べ替えに使う。配分(pickerAlloc)はカード間の取り方を決める。
@@ -5449,24 +5637,16 @@ export default function App() {
       return;
     }
 
-    const labels = ["本線", "対抗", "穴"];
-    const lines = labels.flatMap((label, index) => {
-      const source = aiEval.bets.find((b) => String(b?.label || "") === label);
-      const max = Array.isArray(source?.tickets) ? source.tickets.length : 0;
-      const configured = Math.max(0, Number(betLimits?.[label] ?? max));
-      const tickets = Array.isArray(source?.tickets)
-        ? source.tickets.slice(0, Math.min(configured, max)).filter(Boolean)
-        : [];
-      if (!tickets.length) return [];
-      return [{
-        id: `${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`,
-        label,
-        tickets,
-        amountPerPoint: 100,
-        perTicket: null,
-        expanded: false,
-      }];
-    });
+    // 画面に表示している本線/対抗/穴と同じレンダー値（displayedAiBetLines）をそのまま使う。
+    // 表示が圧縮表記でも、保存する tickets は完全展開・重複除去済み（expandTicketsForSave適用済み）。
+    const lines = displayedAiBetLines.map((line, index) => ({
+      id: `${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`,
+      label: line.label,
+      tickets: [...line.tickets],
+      amountPerPoint: 100,
+      perTicket: null,
+      expanded: false,
+    }));
 
     if (!lines.length) {
       setBetMsg("現在の点数設定で追加できるAI買い目がありません");
@@ -5574,35 +5754,106 @@ export default function App() {
       return;
     }
 
-    const batchStartedAt = Date.now();
-    const targets = Array.from({ length: 12 }, (_, i) => i + 1)
-      .filter((r) => String(raceWinds?.[r] || "").trim())
-      .map((r) => ({
-        date: raceDate,
-        venue,
-        race: r,
-        captureToken: `${batchStartedAt}_${r}_${Math.random().toString(36).slice(2, 10)}`,
-      }));
+    const targetRaces = Array.from({ length: 12 }, (_, i) => i + 1)
+      .filter((r) => String(raceWinds?.[r] || "").trim());
 
-    if (!targets.length) {
+    if (!targetRaces.length) {
       setBatchBetStatus("風が設定されているレースがありません");
       return;
     }
 
-    // 以前の一括記録はレース紐付けがずれている可能性があるため、この日・場の分を先に除去して作り直す。
-    await persistBets((prev) => prev.filter((b) => !(
-      b?.batchRecorded
-      && b?.date === raceDate
-      && b?.venue === venue
-      && ["本線", "対抗", "穴"].includes(String(b?.label || ""))
-    )));
+    // 一括記録は「各レース画面で実際に表示した買い目スナップショット」だけを保存する。
+    // iframeによる再計算は行わない（表示と保存の不一致の原因だったため廃止）。
+    const nowTs = Date.now();
+    const recsAll = [];
+    const skippedRaces = [];
+    for (const r of targetRaces) {
+      const key = `${raceDate}_${venue}_${r}`;
+      const snap = aiBetSnapshotsRef.current?.[key];
+      const targetWind = String(raceWinds?.[r] || "");
+      // スナップショットが無い／風が現在の設定と食い違う場合は保存しない（誤保存防止）。
+      if (
+        !snap
+        || !Array.isArray(snap.bets)
+        || !snap.bets.length
+        || String(snap.date || "") !== String(raceDate)
+        || String(snap.venue || "") !== String(venue)
+        || Number(snap.race) !== r
+        || String(snap.wind || "") !== targetWind
+      ) {
+        skippedRaces.push(r);
+        continue;
+      }
+      const recs = ["本線", "対抗", "穴"].flatMap((label, index) => {
+        if (!limits[label]) return [];
+        const source = snap.bets.find((b) => String(b?.label || "") === label);
+        // スナップショットは表示時点で展開・重複除去済みだが、保存直前にも必ず正規化する（要件C）。
+        const tickets = expandTicketsForSave(Array.isArray(source?.tickets) ? source.tickets : []);
+        if (!tickets.length) return [];
+        return [{
+          id: `batch_${key}_${label}_${nowTs}_${index}`,
+          date: raceDate,
+          venue,
+          race: r,
+          label,
+          points: tickets.length,
+          tickets,
+          amountPerPoint: 100,
+          perTicket: null,
+          amount: tickets.length * 100,
+          result: null,
+          hit: null,
+          payoutOdds: null,
+          payout: 0,
+          settlementStatus: "pending",
+          recordedAt: nowTs,
+          batchRecorded: true,
+          batchCaptureVersion: BATCH_CAPTURE_VERSION,
+          batchSourceKey: key,
+          batchSourceRace: r,
+          batchBetsSignature: String(snap.signature || ""),
+          batchSnapshotAt: Number(snap.updatedAt || 0),
+          wind: String(snap.wind || ""),
+          draftOnly: false,
+        }];
+      });
+      if (recs.length) recsAll.push(...recs);
+      else skippedRaces.push(r);
+    }
 
-    setBatchBetProgress({ done: 0, total: targets.length, saved: 0, skipped: 0 });
+    const savedRaceCount = new Set(recsAll.map((b) => Number(b.race))).size;
+
+    if (!recsAll.length) {
+      setBatchBetProgress({ done: 0, total: 0, saved: 0, skipped: 0 });
+      setBatchBetStatus(
+        "保存できる表示スナップショットがありません。各レース画面を開いてAI買い目の表示を確認してから、もう一度実行してください。"
+      );
+      return;
+    }
+
+    // 以前の一括記録はレース紐付け・買い目がずれている可能性があるため、この日・場の分を先に除去して作り直す。
+    const saved = await persistBets((prev) => {
+      const kept = prev.filter((b) => !(
+        b?.batchRecorded
+        && b?.date === raceDate
+        && b?.venue === venue
+        && ["本線", "対抗", "穴"].includes(String(b?.label || ""))
+      ));
+      return [...recsAll, ...kept];
+    });
+    if (!saved) {
+      setBatchBetStatus("✗ 一括記録の保存に失敗しました。ページを閉じずに、もう一度お試しください");
+      return;
+    }
+
+    setBatchBetProgress({ done: targetRaces.length, total: targetRaces.length, saved: savedRaceCount, skipped: skippedRaces.length });
     setBatchBetStatus(
-      `旧一括記録を削除して再作成中（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}／1点100円）`
+      `✓ 一括記録完了：表示スナップショットから${savedRaceCount}レースを記録`
+      + `（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}／1点100円）`
+      + (skippedRaces.length
+        ? `。${skippedRaces.join("・")}Rはスナップショット未作成または風設定変更後に未表示のためスキップしました。該当レースの画面を開いて表示を確認後、もう一度実行してください。`
+        : "")
     );
-    predictionSaveRef.current = "";
-    setAiCaptureQueue(targets);
   };
 
   // カートをこのレースの購入として確定。結果・払戻は公式結果確定後に自動反映する。
@@ -7562,16 +7813,9 @@ export default function App() {
                         const color = bet.label === "本線" ? "#3d7ab8"
                           : bet.label === "対抗" ? "#5a9e2e"
                           : bet.label === "超穴" ? "#9c5ec7" : "#b8893d";
-                        // 期間「被りのみ」モード: 本線〜超穴を共通買い目だけに絞る
-                        let baseTickets = bet.tickets;
-                        if (cmpMode === "overlap" && periodCompare) {
-                          if (bet.label === "本線") baseTickets = bet.tickets.filter((t) => periodCompare.honmei.overlap.includes(t));
-                          if (bet.label === "対抗") baseTickets = bet.tickets.filter((t) => periodCompare.taikou.overlap.includes(t));
-                          if (bet.label === "穴") baseTickets = bet.tickets.filter((t) => periodCompare.ana.overlap.includes(t));
-                        }
-                        const maxPts = baseTickets.length;
-                        const lim = betLimits[bet.label] != null ? Math.min(betLimits[bet.label], maxPts) : maxPts;
-                        const shown = baseTickets.slice(0, lim);
+                        // 期間「被りのみ」モード・点数設定の適用は displayedTicketsForBet に一本化
+                        //（保存スナップショットと必ず同じ配列になるようにする）。
+                        const { maxPts, lim, shown } = displayedTicketsForBet(bet);
                         // 表示点数に応じた合成オッズ
                         let compShown = null;
                         if (odds) {
@@ -8301,9 +8545,10 @@ export default function App() {
               1R〜12RのAI買い目を一括記録
             </div>
             <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.7, marginBottom: 9 }}>
-              風を設定済みの各レースについて、それぞれのAI予想から現在の点数設定
-              （本線{Number(betLimits?.["本線"] ?? 0)}・対抗{Number(betLimits?.["対抗"] ?? 0)}・穴{Number(betLimits?.["穴"] ?? 0)}）
-              を上段の表示順のまま1点100円で記録します。下段の選び順・配分は使用しません。各レースの読込完了を確認してから保存します。公開前などAI予想を取得できないレースはスキップされます。
+              風を設定済みの各レースについて、そのレース画面で実際に表示したAI買い目（現在の点数設定
+              本線{Number(betLimits?.["本線"] ?? 0)}・対抗{Number(betLimits?.["対抗"] ?? 0)}・穴{Number(betLimits?.["穴"] ?? 0)}
+              適用後の表示スナップショット）を、表示順のまま1点100円で記録します。下段の選び順・配分は使用しません。
+              一度も画面で表示していないレースや、共有風を変更した後にまだ表示し直していないレースは、誤保存防止のためスキップされます（該当レースを開いて表示を確認すると記録できます）。
             </div>
             <button
               onClick={startBatchBetRecording}
