@@ -2679,6 +2679,27 @@ export default function App() {
     return task;
   };
 
+  const loadFrozenPreRaceSnapshot = async (v, r, d) => {
+    const qs = new URLSearchParams({
+      action: "prerace_day",
+      date: d,
+      venue: v,
+      t: String(Date.now()),
+    });
+    const res = await fetch(`/api/yoso?${qs.toString()}`, { cache: "no-store" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || "締切前スナップショットの取得に失敗しました");
+    const item = (data.items || []).find((x) => x?.venue === v && Number(x?.race) === Number(r));
+    if (!item?.snapshot) throw new Error(`${v}${r}Rは締切前データが保存されていないため、一括記録できません`);
+    const applied = applyPrefetchedYosoPayload(item.snapshot, v, String(r), d);
+    if (!applied) throw new Error(`${v}${r}Rの締切前データを画面へ適用できませんでした`);
+    setReviewMode(true);
+    setAutoLoading(false);
+    setAutoMsg(`${v}${r}Rの締切前スナップショットを使用しています。`);
+    setAutoRefreshInfo("");
+    return item.snapshot;
+  };
+
   useEffect(() => {
     if (!captureAiMode) return;
     let cancelled = false;
@@ -2703,10 +2724,22 @@ export default function App() {
     setVenue(v);
     setRaceNo(String(r));
     setReviewMode(true);
-    preloadReviewSnapshots(d, { force: true }).then(() => {
+    loadFrozenPreRaceSnapshot(v, String(r), d).catch((e) => {
       if (cancelled) return;
-      if (!applyCachedReviewSnapshot(v, String(r), d)) {
-        fetchOfficialYoso({ venue: v, raceNo: String(r), raceDate: d, force: true, ignoreSalesEnded: true });
+      const error = e?.message || String(e);
+      window.__HUNAKEN_AI_CAPTURE_STATUS__ = { state: "error", error, date: d, venue: v, race: r };
+      if (window.parent !== window) {
+        window.parent.postMessage({
+          type: "hunaken-ai-batch-error",
+          date: d,
+          venue: v,
+          race: Number(r),
+          capturedRace: Number(r),
+          captureToken: captureAiTarget.token,
+          loadedKey: `${d}_${v}_${Number(r)}`,
+          batchCaptureVersion: BATCH_CAPTURE_VERSION,
+          error,
+        }, window.location.origin);
       }
     });
     return () => { cancelled = true; };
@@ -4591,6 +4624,8 @@ export default function App() {
     if (captureLoadedKey !== targetKey) return undefined;
     if (autoLoading) return undefined;
     if (venue !== targetVenue || raceDate !== targetDate || Number(raceNo) !== targetRace) return undefined;
+    if (!result?.preRaceSnapshot && result?.cacheStatus !== "pre-race-frozen") return undefined;
+    if (/読込中/.test(dbRacerStatus) || /読込中/.test(nigeStatus)) return undefined;
     if (!aiEval?.bets?.length) return undefined;
 
     const selectedManualWind = raceWinds?.[targetRace] || "";
@@ -4615,7 +4650,21 @@ export default function App() {
       label: String(b?.label || ""),
       tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
     }));
-    const signature = `${targetKey}_${JSON.stringify(bets)}`;
+    const captureInputs = {
+      source: "frozen_pre_race_snapshot",
+      reviewMode: !!reviewMode,
+      preRaceSnapshot: !!result?.preRaceSnapshot || result?.cacheStatus === "pre-race-frozen",
+      preRaceCapturedAt: String(result?.reviewCapturedAt || result?.preRaceCapturedAt || result?.fetchedAt || ""),
+      courses: { ...courses },
+      wind: String(selectedManualWind || ""),
+      hasKimari: !!kimari,
+      hasRacerStats: !!racerStats,
+      hasNigeSim: !!nigeSim,
+      hasOdds: !!odds && Object.keys(odds).length > 0,
+      dbRacerStatus: String(dbRacerStatus || ""),
+      nigeStatus: String(nigeStatus || ""),
+    };
+    const signature = `${targetKey}_${JSON.stringify(bets)}_${JSON.stringify(captureInputs)}`;
     captureLastSignatureRef.current = signature;
     if (captureStableTimerRef.current) window.clearTimeout(captureStableTimerRef.current);
 
@@ -4651,6 +4700,7 @@ export default function App() {
           batchCaptureVersion: BATCH_CAPTURE_VERSION,
           betsSignature: signature,
           bets,
+          captureInputs,
         }, window.location.origin);
       }
     }, 2500);
@@ -4661,7 +4711,8 @@ export default function App() {
         captureStableTimerRef.current = null;
       }
     };
-  }, [aiEval, venue, raceDate, raceNo, captureAiMode, captureAiTarget, captureLoadedKey, autoLoading, raceWinds, raceWindsLoading]);
+  }, [aiEval, venue, raceDate, raceNo, captureAiMode, captureAiTarget, captureLoadedKey, autoLoading, raceWinds, raceWindsLoading,
+      result, reviewMode, courses, kimari, racerStats, nigeSim, odds, dbRacerStatus, nigeStatus]);
 
 
   const loadVenueAiLedger = async ({ quiet = false } = {}) => {
@@ -4765,6 +4816,10 @@ export default function App() {
             batchSourceKey: expectedKey,
             batchSourceRace: targetRace,
             batchBetsSignature: String(event.data?.betsSignature || ""),
+            captureInputs: event.data?.captureInputs || null,
+            captureReviewMode: !!event.data?.captureInputs?.reviewMode,
+            capturePreRaceSnapshot: !!event.data?.captureInputs?.preRaceSnapshot,
+            preRaceCapturedAt: String(event.data?.captureInputs?.preRaceCapturedAt || ""),
           }];
         });
 

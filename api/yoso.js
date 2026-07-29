@@ -191,17 +191,39 @@ async function saveReviewSnapshot(payload, { finalized = false } = {}) {
     const raceDate = ymdToDate(yyyymmdd(payload.date));
     const placeNo = JCD[payload.venue] ? Number(JCD[payload.venue]) : null;
     if (!raceDate || !placeNo) return { ok: false, skipped: true, reason: "場・日付不正" };
+
+    // 締切後の確定データで事前予想用データを上書きしない。
+    // final=false の取得を「締切前スナップショット」として更新し、final=true では凍結して保持する。
+    const existingRows = await supabaseCacheRequest(
+      `race_review_snapshots?race_date=eq.${encodeURIComponent(raceDate)}&place_no=eq.${placeNo}&race_no=eq.${Number(payload.race)}&select=snapshot,is_final,captured_at,updated_at&limit=1`
+    ).catch(() => []);
+    const existing = Array.isArray(existingRows) ? existingRows[0] : null;
+    const existingSnapshot = existing?.snapshot || null;
+    const previousPreRace = existingSnapshot?.preRaceSnapshot
+      || (existingSnapshot && !existing?.is_final ? existingSnapshot : null);
+    const preRaceSnapshot = finalized ? previousPreRace : {
+      ...payload,
+      preRaceFrozen: true,
+      preRaceCapturedAt: payload.fetchedAt || new Date().toISOString(),
+    };
+
     const nowIso = new Date().toISOString();
+    const storedSnapshot = {
+      ...payload,
+      preRaceSnapshot: preRaceSnapshot || null,
+      preRaceAvailable: !!preRaceSnapshot,
+      preRaceCapturedAt: preRaceSnapshot?.preRaceCapturedAt || preRaceSnapshot?.fetchedAt || "",
+    };
     const body = [{
       race_date: raceDate,
       place_no: placeNo,
       race_no: Number(payload.race),
       venue: payload.venue,
-      snapshot: payload,
+      snapshot: storedSnapshot,
       odds: payload.odds && Object.keys(payload.odds).length >= 10 ? payload.odds : null,
       odds_count: Number(payload.oddsCount || Object.keys(payload.odds || {}).length || 0),
       is_final: !!finalized,
-      captured_at: nowIso,
+      captured_at: finalized ? (existing?.captured_at || nowIso) : nowIso,
       finalized_at: finalized ? nowIso : null,
       updated_at: nowIso,
     }];
@@ -210,7 +232,7 @@ async function saveReviewSnapshot(payload, { finalized = false } = {}) {
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify(body),
     });
-    return { ok: true, finalized: !!finalized };
+    return { ok: true, finalized: !!finalized, preRaceAvailable: !!preRaceSnapshot };
   } catch (e) {
     console.warn("review snapshot write skipped:", e?.message || e);
     return { ok: false, error: e?.message || String(e) };
@@ -245,104 +267,6 @@ async function readReviewSnapshot({ venue, raceNo, ymd }) {
   }
 }
 
-
-async function readConfirmedResultsForDay(ymd, venue = "") {
-  if (!ENABLE_PERSISTENT_CACHE) {
-    return {
-      date: yyyymmdd(ymd),
-      confirmed: [],
-      confirmedKeys: [],
-      confirmedByVenue: {},
-      count: 0,
-    };
-  }
-
-  const targetYmd = yyyymmdd(ymd);
-  const raceDate = ymdToDate(targetYmd);
-  if (!raceDate) throw new Error("日付が不正です");
-
-  const filters = [
-    `race_date=eq.${encodeURIComponent(raceDate)}`,
-    "select=place_no,race_no,boat,rank",
-    "order=place_no.asc,race_no.asc,rank.asc",
-  ];
-
-  if (venue) {
-    if (!JCD[venue]) throw new Error(`${venue}は結果取得対象外です`);
-    filters.splice(1, 0, `place_no=eq.${Number(JCD[venue])}`);
-  }
-
-  const rows = await supabaseCacheRequest(`race_results?${filters.join("&")}`);
-  const grouped = new Map();
-
-  for (const row of Array.isArray(rows) ? rows : []) {
-    const placeNo = Number(row?.place_no);
-    const raceNo = Number(row?.race_no);
-    const boat = Number(row?.boat);
-    const rank = Number(row?.rank);
-
-    if (!(placeNo >= 1 && placeNo <= 24)) continue;
-    if (!(raceNo >= 1 && raceNo <= 12)) continue;
-    if (!(boat >= 1 && boat <= 6)) continue;
-    if (!(rank >= 1 && rank <= 6)) continue;
-
-    const key = `${placeNo}:${raceNo}`;
-    if (!grouped.has(key)) grouped.set(key, []);
-    grouped.get(key).push({ boat, rank });
-  }
-
-  const venueByPlaceNo = Object.fromEntries(
-    Object.entries(JCD).map(([name, code]) => [Number(code), name])
-  );
-
-  const confirmed = [];
-  const confirmedByVenue = {};
-
-  for (const [key, raceRows] of grouped.entries()) {
-    const [placeNoText, raceNoText] = key.split(":");
-    const placeNo = Number(placeNoText);
-    const raceNo = Number(raceNoText);
-
-    const top3 = raceRows
-      .filter((r) => r.rank >= 1 && r.rank <= 3)
-      .sort((a, b) => a.rank - b.rank);
-
-    const uniqueRanks = new Set(top3.map((r) => r.rank));
-    const uniqueBoats = new Set(top3.map((r) => r.boat));
-
-    // 1〜3着が3件揃ったレースだけ確定済みとする。
-    if (top3.length < 3 || uniqueRanks.size < 3 || uniqueBoats.size < 3) continue;
-
-    const venueName = venueByPlaceNo[placeNo] || "";
-    if (!venueName) continue;
-
-    const result = top3.slice(0, 3).map((r) => r.boat).join("-");
-    const item = {
-      venue: venueName,
-      placeNo,
-      race: raceNo,
-      result,
-      key: `${venueName}:${raceNo}`,
-    };
-
-    confirmed.push(item);
-    if (!confirmedByVenue[venueName]) confirmedByVenue[venueName] = [];
-    confirmedByVenue[venueName].push(raceNo);
-  }
-
-  confirmed.sort((a, b) => a.placeNo - b.placeNo || a.race - b.race);
-  for (const races of Object.values(confirmedByVenue)) races.sort((a, b) => a - b);
-
-  return {
-    date: targetYmd,
-    confirmed,
-    confirmedKeys: confirmed.map((r) => r.key),
-    confirmedByVenue,
-    count: confirmed.length,
-  };
-}
-
-
 async function readReviewSnapshotsForDay(ymd, venue = "") {
   if (!ENABLE_PERSISTENT_CACHE) return [];
   const raceDate = ymdToDate(yyyymmdd(ymd));
@@ -371,6 +295,39 @@ async function readReviewSnapshotsForDay(ymd, venue = "") {
       servedAt: new Date().toISOString(),
     },
   }));
+}
+
+async function readPreRaceSnapshotsForDay(ymd, venue = "") {
+  if (!ENABLE_PERSISTENT_CACHE) return [];
+  const raceDate = ymdToDate(yyyymmdd(ymd));
+  if (!raceDate) return [];
+  const filters = [
+    `race_date=eq.${encodeURIComponent(raceDate)}`,
+    "select=venue,race_no,snapshot,is_final,finalized_at,updated_at",
+    "order=venue.asc,race_no.asc",
+  ];
+  if (venue && JCD[venue]) filters.splice(1, 0, `place_no=eq.${Number(JCD[venue])}`);
+  const rows = await supabaseCacheRequest(`race_review_snapshots?${filters.join("&")}`);
+  return (Array.isArray(rows) ? rows : []).flatMap((row) => {
+    const pre = row?.snapshot?.preRaceSnapshot || (!row?.is_final ? row?.snapshot : null);
+    if (!pre) return [];
+    return [{
+      venue: row.venue,
+      race: Number(row.race_no),
+      snapshot: {
+        ...pre,
+        preRaceSnapshot: true,
+        preRaceFrozen: true,
+        reviewSnapshot: true,
+        reviewFinalized: false,
+        reviewCapturedAt: pre.preRaceCapturedAt || pre.fetchedAt || row.updated_at || "",
+        cached: true,
+        stale: false,
+        cacheStatus: "pre-race-frozen",
+        servedAt: new Date().toISOString(),
+      },
+    }];
+  });
 }
 
 
@@ -468,20 +425,10 @@ async function readRaceSettlement({ venue, raceNo, ymd }) {
   // これにより高配当の端数（例: 168,620円）や、締切前オッズとの差をそのまま反映できる。
   const officialPayout = await fetchOfficialTrifectaPayout({ venue, raceNo: race, ymd, expectedResult: result });
   if (officialPayout?.payoutPer100 > 0) {
-    const officialResult = String(officialPayout?.result || "").replace(/[^1-6-]/g, "");
-    const parts = officialResult.split("-");
-    const officialResultValid = /^([1-6])-([1-6])-([1-6])$/.test(officialResult)
-      && new Set(parts).size === 3;
-    // 公式結果ページから解析した出目を精算の最終正とする。
-    // DB側の着順と食い違う場合に、DB出目と公式払戻だけを誤って組み合わせない。
-    const verifiedResult = officialResultValid ? officialResult : result;
     return {
       completed: true,
       settlementReady: true,
-      result: verifiedResult,
-      verifiedResult,
-      cachedResult: result,
-      resultMismatch: officialResultValid && officialResult !== result,
+      result,
       payoutOdds: officialPayout.payoutPer100 / 100,
       payoutPer100: officialPayout.payoutPer100,
       oddsSource: officialPayout.source,
@@ -596,8 +543,9 @@ async function buildVenueAiLedger({ venue, ymd, honmeiPoints = 6, taikouPoints =
         s.hit += 1;
         if (Number.isFinite(payoutPer100) && payoutPer100 > 0) {
           s.ret += payoutPer100;
+        } else if (Number.isFinite(decimalOdds) && decimalOdds > 0) {
+          s.ret += Math.round(decimalOdds * 100);
         }
-        // 公式払戻金が未取得のレースは未精算のままにし、保存オッズでは代替しない。
       }
     }
     details.push({
@@ -606,7 +554,7 @@ async function buildVenueAiLedger({ venue, ymd, honmeiPoints = 6, taikouPoints =
       predictionSaved: true,
       odds: Number.isFinite(decimalOdds) ? decimalOdds : null,
       payoutPer100: Number.isFinite(payoutPer100) ? payoutPer100 : null,
-      payoutSource: officialPayout?.source || "official_payout_pending",
+      payoutSource: officialPayout?.source || (Number.isFinite(decimalOdds) ? "odds_fallback" : ""),
     });
   }
 
@@ -617,9 +565,7 @@ async function buildVenueAiLedger({ venue, ymd, honmeiPoints = 6, taikouPoints =
     venue,
     pointLimits,
     finalizedRaces: details.length,
-    predictedRaces: predByRace.size,
-    predictedRaceNos: [...predByRace.keys()].sort((a, b) => a - b),
-    settledPredictedRaces: details.filter((d) => d.predictionSaved).length,
+    predictedRaces: details.filter((d) => d.predictionSaved).length,
     missingPredictions,
     patterns: VENUE_LEDGER_PATTERNS,
     stats,
@@ -713,127 +659,6 @@ async function supabaseCacheRequest(path, options = {}) {
   } catch (error) {
     throw new Error(`Supabase response JSON parse ${res.status}: ${String(body).slice(0, 240)}`);
   }
-}
-
-async function requestHasValidSupabaseUser(req) {
-  const raw = req.headers?.authorization || req.headers?.Authorization || "";
-  const token = String(raw).replace(/^Bearer\s+/i, "").trim();
-  if (!token || !SUPABASE_REST_URL) return false;
-  try {
-    const res = await fetch(`${SUPABASE_REST_URL}/auth/v1/user`, {
-      headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${token}` },
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-function manualWindCacheKey(raceDate, venue, raceNo) {
-  return `manual_wind:${raceDate}:${venue}:${Number(raceNo)}`;
-}
-
-async function readManualWinds({ venue, ymd }) {
-  const raceDate = ymdToDate(yyyymmdd(ymd));
-  if (!raceDate || !venue) return {};
-  const rows = await supabaseCacheRequest(
-    `yoso_cache?cache_type=eq.manual_wind&race_date=eq.${encodeURIComponent(raceDate)}&venue=eq.${encodeURIComponent(venue)}&select=race_no,payload&order=race_no.asc`
-  );
-  const winds = {};
-  for (const row of Array.isArray(rows) ? rows : []) {
-    const rn = Number(row?.race_no);
-    const value = String(row?.payload?.wind || "");
-    if (rn >= 1 && rn <= 12 && value) winds[rn] = value;
-  }
-  return winds;
-}
-
-async function saveManualWind({ venue, ymd, raceNo, wind }) {
-  const raceDate = ymdToDate(yyyymmdd(ymd));
-  if (!raceDate || !venue || !raceNo) throw new Error("日付・開催場・レースが不正です");
-  const now = new Date();
-  const key = manualWindCacheKey(raceDate, venue, raceNo);
-  if (!wind) {
-    await supabaseCacheRequest(`yoso_cache?cache_key=eq.${encodeURIComponent(key)}`, { method: "DELETE" });
-    return { ok: true, deleted: true };
-  }
-  const body = [{
-    cache_key: key,
-    cache_type: "manual_wind",
-    race_date: raceDate,
-    venue,
-    race_no: Number(raceNo),
-    payload: { wind, source: "manual", updatedAt: now.toISOString() },
-    expires_at: new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000).toISOString(),
-    stale_expires_at: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString(),
-    updated_at: now.toISOString(),
-  }];
-  await supabaseCacheRequest("yoso_cache?on_conflict=cache_key", {
-    method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: JSON.stringify(body),
-  });
-  return { ok: true };
-}
-
-function normalizeCaptureRunnerName(value) {
-  return String(value || "")
-    .trim()
-    .replace(/[^a-zA-Z0-9._-]/g, "-")
-    .replace(/-+/g, "-")
-    .slice(0, 64);
-}
-
-function captureRunnerHeartbeatKey(runner) {
-  return `capture_runner:${normalizeCaptureRunnerName(runner)}`;
-}
-
-async function saveCaptureRunnerHeartbeat({ runner, state, runId = "", startedAt = "", finishedAt = "", summary = null, error = "" }) {
-  if (!ENABLE_PERSISTENT_CACHE) throw new Error("Supabase永続キャッシュが未設定です");
-  const safeRunner = normalizeCaptureRunnerName(runner);
-  const allowedStates = new Set(["running", "success", "failed", "skipped"]);
-  const safeState = allowedStates.has(String(state || "")) ? String(state) : "running";
-  if (!safeRunner) throw new Error("runner を指定してください");
-  const now = new Date();
-  const payload = {
-    runner: safeRunner,
-    state: safeState,
-    runId: String(runId || "").slice(0, 160),
-    startedAt: String(startedAt || "").slice(0, 40),
-    finishedAt: String(finishedAt || "").slice(0, 40),
-    summary: summary && typeof summary === "object" ? summary : null,
-    error: String(error || "").slice(0, 1000),
-    updatedAt: now.toISOString(),
-  };
-  const body = [{
-    cache_key: captureRunnerHeartbeatKey(safeRunner),
-    cache_type: "capture_runner",
-    race_date: null,
-    venue: null,
-    race_no: null,
-    payload,
-    expires_at: new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-    stale_expires_at: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString(),
-    updated_at: now.toISOString(),
-  }];
-  await supabaseCacheRequest("yoso_cache?on_conflict=cache_key", {
-    method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: JSON.stringify(body),
-  });
-  return payload;
-}
-
-async function readCaptureRunnerHeartbeat(runner) {
-  if (!ENABLE_PERSISTENT_CACHE) throw new Error("Supabase永続キャッシュが未設定です");
-  const safeRunner = normalizeCaptureRunnerName(runner);
-  if (!safeRunner) throw new Error("runner を指定してください");
-  const rows = await supabaseCacheRequest(
-    `yoso_cache?cache_key=eq.${encodeURIComponent(captureRunnerHeartbeatKey(safeRunner))}&select=payload,updated_at&limit=1`
-  );
-  const row = Array.isArray(rows) ? rows[0] : null;
-  if (!row?.payload) return null;
-  return { ...row.payload, updatedAt: row.payload.updatedAt || row.updated_at || "" };
 }
 
 async function readPersistentCache(key) {
@@ -1391,17 +1216,17 @@ function pickDisplayValues(nums) {
     // BOATCASTの一部場では「まわり足」が11秒台になるため、15秒まで許容する。
     if (inRange(cleaned[i], 40, 70) && inRange(cleaned[i + 1], -1, 3.5) && inRange(cleaned[i + 2], 5.5, 7.8) && inRange(cleaned[i + 3], 30, 45) && inRange(cleaned[i + 4], 4, 15)) {
       const t = Number(cleaned[i + 1]);
-      return { weight: cleaned[i], tilt: (t <= 0.5 ? Number(t).toFixed(1) : ""), tenji: cleaned[i + 2], isshu: cleaned[i + 3], mawari: cleaned[i + 4], chokusen: inRange(cleaned[i + 5], 4, 15) ? cleaned[i + 5] : "" };
+      return { weight: cleaned[i], tilt: (t >= -0.5 && t <= 3.0 ? Number(t).toFixed(1) : ""), tenji: cleaned[i + 2], isshu: cleaned[i + 3], mawari: cleaned[i + 4], chokusen: inRange(cleaned[i + 5], 4, 15) ? cleaned[i + 5] : "" };
     }
     // 調整が体重とチルトの間にある場合: 体重, 調整, チルト, 展示, 一周, まわり足 [, 直線]
     if (inRange(cleaned[i], 40, 70) && inRange(cleaned[i + 1], 0, 5) && inRange(cleaned[i + 2], -1, 3.5) && inRange(cleaned[i + 3], 5.5, 7.8) && inRange(cleaned[i + 4], 30, 45) && inRange(cleaned[i + 5], 4, 15)) {
       const t = Number(cleaned[i + 2]);
-      return { weight: cleaned[i], adjust_weight: cleaned[i + 1], tilt: (t <= 0.5 ? Number(t).toFixed(1) : ""), tenji: cleaned[i + 3], isshu: cleaned[i + 4], mawari: cleaned[i + 5], chokusen: inRange(cleaned[i + 6], 4, 15) ? cleaned[i + 6] : "" };
+      return { weight: cleaned[i], adjust_weight: cleaned[i + 1], tilt: (t >= -0.5 && t <= 3.0 ? Number(t).toFixed(1) : ""), tenji: cleaned[i + 3], isshu: cleaned[i + 4], mawari: cleaned[i + 5], chokusen: inRange(cleaned[i + 6], 4, 15) ? cleaned[i + 6] : "" };
     }
     // 調整が展示と一周の間にある場合: 体重, チルト, 展示, 調整, 一周, まわり足 [, 直線]
     if (inRange(cleaned[i], 40, 70) && inRange(cleaned[i + 1], -1, 3.5) && inRange(cleaned[i + 2], 5.5, 7.8) && inRange(cleaned[i + 3], 0, 5) && inRange(cleaned[i + 4], 30, 45) && inRange(cleaned[i + 5], 4, 15)) {
       const t = Number(cleaned[i + 1]);
-      return { weight: cleaned[i], tilt: (t <= 0.5 ? Number(t).toFixed(1) : ""), tenji: cleaned[i + 2], adjust_weight: cleaned[i + 3], isshu: cleaned[i + 4], mawari: cleaned[i + 5], chokusen: inRange(cleaned[i + 6], 4, 15) ? cleaned[i + 6] : "" };
+      return { weight: cleaned[i], tilt: (t >= -0.5 && t <= 3.0 ? Number(t).toFixed(1) : ""), tenji: cleaned[i + 2], adjust_weight: cleaned[i + 3], isshu: cleaned[i + 4], mawari: cleaned[i + 5], chokusen: inRange(cleaned[i + 6], 4, 15) ? cleaned[i + 6] : "" };
     }
   }
   return null;
@@ -2411,10 +2236,9 @@ function sanitizeParsedTilt(row) {
   if (raw === "") { r.tilt = ""; return r; }
   const v = Number(raw.replace(/^\+/, ""));
   if (!Number.isFinite(v)) { r.tilt = ""; return r; }
-  // 調整体重の誤反映が最も多い 1.0 / 1.5 / 2.0 などは、符号付き取得でない限り消す。
-  // API内部では符号は正規化で落ちるため、+1.0を厳密に拾えない場面より、誤警戒を出さない方を優先する。
-  if (v > 0.5) { r.tilt = ""; return r; }
-  if (v < -1 || v > 3) { r.tilt = ""; return r; }
+  // チルトは公式表示の全範囲（-0.5〜+3.0）を保持する。
+  // +1.0〜+3.0も正規化後は符号が落ちるため、値だけで削除しない。
+  if (v < -0.5 || v > 3.0) { r.tilt = ""; return r; }
   r.tilt = v.toFixed(1);
   return r;
 }
@@ -3926,93 +3750,6 @@ export default async function handler(req, res) {
       return;
     }
 
-    if (action === "manual_winds") {
-      res.setHeader("Cache-Control", "no-store");
-      if (!venue) {
-        res.status(400).json({ ok: false, error: "venue を指定してください" });
-        return;
-      }
-      const winds = await readManualWinds({ venue, ymd });
-      res.status(200).json({ ok: true, action: "manual_winds", date: ymd, venue, winds, fetchedAt: new Date().toISOString() });
-      return;
-    }
-
-    if (action === "capture_runner_status") {
-      res.setHeader("Cache-Control", "no-store");
-      if (!captureAuthorized(req)) {
-        res.status(401).json({ ok: false, error: "Unauthorized capture request" });
-        return;
-      }
-      const runner = normalizeCaptureRunnerName(req.query?.runner);
-      if (!runner) {
-        res.status(400).json({ ok: false, error: "runner を指定してください" });
-        return;
-      }
-      const heartbeat = await readCaptureRunnerHeartbeat(runner);
-      res.status(200).json({
-        ok: true,
-        action: "capture_runner_status",
-        runner,
-        found: !!heartbeat,
-        heartbeat,
-        fetchedAt: new Date().toISOString(),
-      });
-      return;
-    }
-
-    if (action === "capture_runner_heartbeat") {
-      res.setHeader("Cache-Control", "no-store");
-      if (String(req.method || "GET").toUpperCase() !== "POST") {
-        res.status(405).json({ ok: false, error: "POST only" });
-        return;
-      }
-      if (!captureAuthorized(req)) {
-        res.status(401).json({ ok: false, error: "Unauthorized capture request" });
-        return;
-      }
-      let body = req.body;
-      if (typeof body === "string") {
-        try { body = JSON.parse(body || "{}"); } catch { body = {}; }
-      }
-      const heartbeat = await saveCaptureRunnerHeartbeat({
-        runner: body?.runner,
-        state: body?.state,
-        runId: body?.runId,
-        startedAt: body?.startedAt,
-        finishedAt: body?.finishedAt,
-        summary: body?.summary,
-        error: body?.error,
-      });
-      res.status(200).json({ ok: true, action: "capture_runner_heartbeat", heartbeat });
-      return;
-    }
-
-    if (action === "save_manual_wind") {
-      res.setHeader("Cache-Control", "no-store");
-      if (String(req.method || "GET").toUpperCase() !== "POST") {
-        res.status(405).json({ ok: false, error: "POST only" });
-        return;
-      }
-      if (!(await requestHasValidSupabaseUser(req))) {
-        res.status(401).json({ ok: false, error: "ログインの確認に失敗しました" });
-        return;
-      }
-      let body = req.body;
-      if (typeof body === "string") body = JSON.parse(body || "{}");
-      const bodyVenue = String(body?.venue || "");
-      const bodyDate = String(body?.date || "");
-      const bodyRace = Number(body?.race);
-      const bodyWind = String(body?.wind || "");
-      const allowedWinds = new Set(["無風","向かい風1m","向かい風2m","向かい風3m","向かい風4m","向かい風5m以上","追い風1m","追い風2m","追い風3m","追い風4m","追い風5m以上","左横風1m","左横風2m","左横風3m以上","右横風1m","右横風2m","右横風3m以上"]);
-      if (!bodyVenue || !JCD[bodyVenue] || bodyRace < 1 || bodyRace > 12 || (bodyWind && !allowedWinds.has(bodyWind))) {
-        res.status(400).json({ ok: false, error: "風設定の内容が不正です" });
-        return;
-      }
-      const saved = await saveManualWind({ venue: bodyVenue, ymd: bodyDate, raceNo: bodyRace, wind: bodyWind });
-      res.status(200).json({ ok: true, action: "save_manual_wind", ...saved, venue: bodyVenue, date: bodyDate, race: bodyRace, wind: bodyWind });
-      return;
-    }
-
     if (action === "review_day") {
       res.setHeader("Cache-Control", "private, max-age=30");
       const items = await readReviewSnapshotsForDay(ymd, venue);
@@ -4020,22 +3757,10 @@ export default async function handler(req, res) {
       return;
     }
 
-    if (action === "confirmed_results") {
-      res.setHeader("Cache-Control", "no-store");
-      if (!captureAuthorized(req)) {
-        res.status(401).json({ ok: false, error: "Unauthorized capture request" });
-        return;
-      }
-
-      const payload = await readConfirmedResultsForDay(ymd, venue);
-      res.status(200).json({
-        ok: true,
-        action: "confirmed_results",
-        appVersion: "v132-confirmed-results",
-        venue: venue || "",
-        ...payload,
-        fetchedAt: new Date().toISOString(),
-      });
+    if (action === "prerace_day") {
+      res.setHeader("Cache-Control", "private, max-age=30");
+      const items = await readPreRaceSnapshotsForDay(ymd, venue);
+      res.status(200).json({ ok: true, action: "prerace_day", appVersion: "v132", date: ymd, venue: venue || "", count: items.length, items, fetchedAt: new Date().toISOString() });
       return;
     }
 
