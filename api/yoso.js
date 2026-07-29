@@ -73,6 +73,72 @@ function parseFLCount(flText, letter) {
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 1;
 }
 
+
+async function requestHasValidSupabaseUser(req) {
+  const raw = req.headers?.authorization || req.headers?.Authorization || "";
+  const token = String(raw).replace(/^Bearer\s+/i, "").trim();
+  if (!token || !SUPABASE_REST_URL) return false;
+  try {
+    const response = await fetch(`${SUPABASE_REST_URL}/auth/v1/user`, {
+      headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${token}` },
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+function manualWindCacheKey(raceDate, venue, raceNo) {
+  return `manual_wind:${raceDate}:${venue}:${Number(raceNo)}`;
+}
+
+async function readManualWinds({ venue, ymd }) {
+  const raceDate = ymdToDate(yyyymmdd(ymd));
+  if (!raceDate || !venue) return {};
+  const rows = await supabaseCacheRequest(
+    `yoso_cache?cache_type=eq.manual_wind&race_date=eq.${encodeURIComponent(raceDate)}&venue=eq.${encodeURIComponent(venue)}&select=race_no,payload,updated_at&order=race_no.asc`
+  );
+  const winds = {};
+  const updatedAt = {};
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const rn = Number(row?.race_no);
+    const value = String(row?.payload?.wind || "");
+    if (rn >= 1 && rn <= 12 && value) {
+      winds[rn] = value;
+      updatedAt[rn] = String(row?.payload?.updatedAt || row?.updated_at || "");
+    }
+  }
+  return { winds, updatedAt };
+}
+
+async function saveManualWind({ venue, ymd, raceNo, wind }) {
+  const raceDate = ymdToDate(yyyymmdd(ymd));
+  if (!raceDate || !venue || !raceNo) throw new Error("日付・開催場・レースが不正です");
+  const now = new Date();
+  const key = manualWindCacheKey(raceDate, venue, raceNo);
+  if (!wind) {
+    await supabaseCacheRequest(`yoso_cache?cache_key=eq.${encodeURIComponent(key)}`, { method: "DELETE" });
+    return { ok: true, deleted: true, updatedAt: now.toISOString() };
+  }
+  const body = [{
+    cache_key: key,
+    cache_type: "manual_wind",
+    race_date: raceDate,
+    venue,
+    race_no: Number(raceNo),
+    payload: { wind, source: "shared_manual", updatedAt: now.toISOString() },
+    expires_at: new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000).toISOString(),
+    stale_expires_at: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    updated_at: now.toISOString(),
+  }];
+  await supabaseCacheRequest("yoso_cache?on_conflict=cache_key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify(body),
+  });
+  return { ok: true, updatedAt: now.toISOString() };
+}
+
 function preRaceRowsFromRacers({ venue, raceNo, ymd, racers, source = "BOATCAST" }) {
   const raceDate = ymdToDate(ymd);
   const placeNo = PLACE_NO_BY_VENUE[venue];
@@ -3761,6 +3827,52 @@ export default async function handler(req, res) {
         anaPoints: req.query?.anaPoints,
       });
       res.status(200).json(payload);
+      return;
+    }
+
+
+    if (action === "manual_winds") {
+      res.setHeader("Cache-Control", "no-store");
+      if (!venue) {
+        res.status(400).json({ ok: false, error: "venue を指定してください" });
+        return;
+      }
+      const shared = await readManualWinds({ venue, ymd });
+      res.status(200).json({
+        ok: true,
+        action: "manual_winds",
+        date: ymd,
+        venue,
+        winds: shared.winds,
+        updatedAt: shared.updatedAt,
+        fetchedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (action === "save_manual_wind") {
+      res.setHeader("Cache-Control", "no-store");
+      if (String(req.method || "GET").toUpperCase() !== "POST") {
+        res.status(405).json({ ok: false, error: "POST only" });
+        return;
+      }
+      if (!(await requestHasValidSupabaseUser(req))) {
+        res.status(401).json({ ok: false, error: "ログインの確認に失敗しました" });
+        return;
+      }
+      let body = req.body;
+      if (typeof body === "string") body = JSON.parse(body || "{}");
+      const bodyVenue = String(body?.venue || "");
+      const bodyDate = String(body?.date || "");
+      const bodyRace = Number(body?.race);
+      const bodyWind = String(body?.wind || "");
+      const allowedWinds = new Set(["無風","向かい風1m","向かい風2m","向かい風3m","向かい風4m","向かい風5m以上","追い風1m","追い風2m","追い風3m","追い風4m","追い風5m以上","左横風1m","左横風2m","左横風3m以上","右横風1m","右横風2m","右横風3m以上"]);
+      if (!bodyVenue || !JCD[bodyVenue] || bodyRace < 1 || bodyRace > 12 || (bodyWind && !allowedWinds.has(bodyWind))) {
+        res.status(400).json({ ok: false, error: "風設定の内容が不正です" });
+        return;
+      }
+      const saved = await saveManualWind({ venue: bodyVenue, ymd: bodyDate, raceNo: bodyRace, wind: bodyWind });
+      res.status(200).json({ ok: true, action: "save_manual_wind", ...saved, venue: bodyVenue, date: bodyDate, race: bodyRace, wind: bodyWind });
       return;
     }
 
