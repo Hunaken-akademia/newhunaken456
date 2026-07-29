@@ -201,11 +201,18 @@ async function saveReviewSnapshot(payload, { finalized = false } = {}) {
     const existingSnapshot = existing?.snapshot || null;
     const previousPreRace = existingSnapshot?.preRaceSnapshot
       || (existingSnapshot && !existing?.is_final ? existingSnapshot : null);
-    const preRaceSnapshot = finalized ? previousPreRace : {
-      ...payload,
-      preRaceFrozen: true,
-      preRaceCapturedAt: payload.fetchedAt || new Date().toISOString(),
-    };
+    // 締切前スナップショットは、6艇分の展示データが揃った取得だけを採用する。
+    // 空データや取得途中のレスポンスで、すでに保存済みの正常なスナップショットを上書きしない。
+    const preRaceRows = Array.isArray(payload?.rows) ? payload.rows : [];
+    const hasCompletePreRaceRows = preRaceRows.length >= 6;
+    const preRaceSnapshot = finalized
+      ? previousPreRace
+      : (hasCompletePreRaceRows ? {
+          ...payload,
+          preRaceFrozen: true,
+          preRaceCapturedAt: payload.fetchedAt || new Date().toISOString(),
+          preRaceRowCount: preRaceRows.length,
+        } : previousPreRace);
 
     const nowIso = new Date().toISOString();
     const storedSnapshot = {
@@ -232,7 +239,14 @@ async function saveReviewSnapshot(payload, { finalized = false } = {}) {
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify(body),
     });
-    return { ok: true, finalized: !!finalized, preRaceAvailable: !!preRaceSnapshot };
+    return {
+      ok: true,
+      finalized: !!finalized,
+      preRaceAvailable: !!preRaceSnapshot,
+      preRaceUpdated: !finalized && hasCompletePreRaceRows,
+      preRaceRowCount: Number(preRaceSnapshot?.preRaceRowCount || preRaceSnapshot?.rows?.length || 0),
+      preRaceCapturedAt: preRaceSnapshot?.preRaceCapturedAt || preRaceSnapshot?.fetchedAt || "",
+    };
   } catch (e) {
     console.warn("review snapshot write skipped:", e?.message || e);
     return { ok: false, error: e?.message || String(e) };
@@ -3896,10 +3910,20 @@ export default async function handler(req, res) {
         res.status(400).json({ ok: false, error: "取得対象のvenueを指定してください" });
         return;
       }
-      const finalized = String(req.query?.final || "") === "1" || String(req.query?.final || "").toLowerCase() === "true";
+      const requestedFinalized = String(req.query?.final || "") === "1" || String(req.query?.final || "").toLowerCase() === "true";
+      // final=0 の誤呼び出しが締切後に来ても、確定後データで締切前スナップショットを上書きしない。
+      const actuallyClosed = await isRequestedRaceClosed(venue, raceNo, ymd).catch(() => false);
+      const finalized = requestedFinalized || actuallyClosed;
       const live = await buildFullYosoPayload(venue, raceNo, ymd);
       const reviewSaved = await saveReviewSnapshot(live, { finalized });
-      res.status(200).json({ ...live, action: "capture", reviewSaved, finalized });
+      res.status(200).json({
+        ...live,
+        action: "capture",
+        reviewSaved,
+        finalized,
+        requestedFinalized,
+        actuallyClosed,
+      });
       return;
     }
 
