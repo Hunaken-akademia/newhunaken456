@@ -4590,7 +4590,33 @@ export default function App() {
     const scenarioRanksForHead = (headBoat) => {
       const kind = kindOfHead(headBoat);
       const tpl = templateForScenario(headBoat, kind);
-      const sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
+      let sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
+
+      // 4コースまくりでは、追走候補の5Cと6Cを直接比較する。
+      // 基本順位の間に1号艇がいるため、隣接比較だけでは6Cが5Cを3項目で
+      // 上回っていても昇格できないケースがあった。5C対6Cで2勝以上なら
+      // 両者の位置を直接入れ替え、6Cを5Cより上位へ昇格させる。
+      if (tpl.course === 4 && kind === "まくり") {
+        const boat5 = boatByCourse[5];
+        const boat6 = boatByCourse[6];
+        const i5 = sec.order.indexOf(boat5);
+        const i6 = sec.order.indexOf(boat6);
+        const cmp65 = boat5 && boat6 ? metricWins(boat6, boat5) : { count: 0, won: [] };
+        if (i5 >= 0 && i6 >= 0 && i6 > i5 && cmp65.count >= 2) {
+          const nextOrder = [...sec.order];
+          [nextOrder[i5], nextOrder[i6]] = [nextOrder[i6], nextOrder[i5]];
+          const promoted = nextOrder.filter((boat, idx) => idx < tpl.second.indexOf(boat));
+          sec = {
+            ...sec,
+            order: nextOrder,
+            promoted: [...new Set([...(sec.promoted || []), ...promoted, boat6])],
+            reasons: [...new Set([
+              ...(sec.reasons || []),
+              `${boat6}号艇が${cmp65.won.join("・")}で${boat5}号艇を上回り昇格`,
+            ])],
+          };
+        }
+      }
       const blockedSecondSet = new Set(tpl.blockedSecond || []);
       const resistanceSecond = applyResistanceToSecond(sec.order, headBoat, kind, blockedSecondSet);
       const third = rankByTwoOfThree(tpl.third, []);
@@ -4601,9 +4627,14 @@ export default function App() {
       const blockedSet = new Set(tpl.blockedSecond || []);
       const thirdAllowed = new Set();
       for (const boat of blockedSet) {
-        const baseIdx = tpl.third.indexOf(boat);
-        const benchmark = tpl.third.slice(0, Math.max(1, baseIdx)).find((b) => !blockedSet.has(b));
-        if (benchmark && metricWins(boat, benchmark).count >= 2) thirdAllowed.add(boat);
+        // 叩かれる艇の3着復活は厳格にする。基本上位の非ブロック艇のうち
+        // 上位3艇と比較し、少なくとも2艇に対して3項目中2勝以上した場合だけ許可。
+        const benchmarks = tpl.third
+          .filter((b) => b !== boat && !blockedSet.has(b))
+          .slice(0, 3);
+        const winsAgainst = benchmarks.filter((b) => metricWins(boat, b).count >= 2);
+        const required = Math.min(2, benchmarks.length);
+        if (required > 0 && winsAgainst.length >= required) thirdAllowed.add(boat);
       }
       const thirdRankBase = [
         ...third.order.filter((b) => !blockedSet.has(b) || thirdAllowed.has(b)),
@@ -4624,8 +4655,8 @@ export default function App() {
         thirdPromoted: third.promoted,
         // 説明文では2着順位の実移動だけを「昇格」と表記する。
         // 3着内の並び替えは買い目へ反映するが、基本筋の艇を誤って昇格扱いしない。
-        reasons: [...sec.reasons, ...resistanceSecond.notes, ...blockedNotes, ...resistanceThird.notes],
-        resistanceNotes: [...resistanceSecond.notes, ...resistanceThird.notes],
+        reasons: [...new Set([...(sec.reasons || []), ...resistanceSecond.notes, ...blockedNotes, ...resistanceThird.notes])],
+        resistanceNotes: [...new Set([...resistanceSecond.notes, ...resistanceThird.notes])],
       };
     };
 
@@ -4803,15 +4834,44 @@ export default function App() {
       const key = `${head}:${kind}`;
       if (!scenarioCache.has(key)) {
         const tpl = templateForScenario(head, kind);
-        const sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
+        let sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
+
+      // 4コースまくりでは、追走候補の5Cと6Cを直接比較する。
+      // 基本順位の間に1号艇がいるため、隣接比較だけでは6Cが5Cを3項目で
+      // 上回っていても昇格できないケースがあった。5C対6Cで2勝以上なら
+      // 両者の位置を直接入れ替え、6Cを5Cより上位へ昇格させる。
+      if (tpl.course === 4 && kind === "まくり") {
+        const boat5 = boatByCourse[5];
+        const boat6 = boatByCourse[6];
+        const i5 = sec.order.indexOf(boat5);
+        const i6 = sec.order.indexOf(boat6);
+        const cmp65 = boat5 && boat6 ? metricWins(boat6, boat5) : { count: 0, won: [] };
+        if (i5 >= 0 && i6 >= 0 && i6 > i5 && cmp65.count >= 2) {
+          const nextOrder = [...sec.order];
+          [nextOrder[i5], nextOrder[i6]] = [nextOrder[i6], nextOrder[i5]];
+          const promoted = nextOrder.filter((boat, idx) => idx < tpl.second.indexOf(boat));
+          sec = {
+            ...sec,
+            order: nextOrder,
+            promoted: [...new Set([...(sec.promoted || []), ...promoted, boat6])],
+            reasons: [...new Set([
+              ...(sec.reasons || []),
+              `${boat6}号艇が${cmp65.won.join("・")}で${boat5}号艇を上回り昇格`,
+            ])],
+          };
+        }
+      }
         const blockedSet = new Set(tpl.blockedSecond || []);
         const resistanceSecond = applyResistanceToSecond(sec.order, head, tpl.kind, blockedSet);
         const third = rankByTwoOfThree(tpl.third, []);
         const thirdAllowed = new Set();
         for (const boat of blockedSet) {
-          const baseIdx = tpl.third.indexOf(boat);
-          const benchmark = tpl.third.slice(0, Math.max(1, baseIdx)).find((b) => !blockedSet.has(b));
-          if (benchmark && metricWins(boat, benchmark).count >= 2) thirdAllowed.add(boat);
+          const benchmarks = tpl.third
+            .filter((b) => b !== boat && !blockedSet.has(b))
+            .slice(0, 3);
+          const winsAgainst = benchmarks.filter((b) => metricWins(boat, b).count >= 2);
+          const required = Math.min(2, benchmarks.length);
+          if (required > 0 && winsAgainst.length >= required) thirdAllowed.add(boat);
         }
         const thirdRankBase = [
           ...third.order.filter((b) => !blockedSet.has(b) || thirdAllowed.has(b)),
@@ -4822,8 +4882,8 @@ export default function App() {
         scenarioCache.set(key, {
           ...tpl, secondRank: resistanceSecond.order, thirdRank, thirdAllowed: [...thirdAllowed],
           secondPromoted: [...new Set([...(sec.promoted || []), ...(resistanceSecond.promoted || [])])], thirdPromoted: third.promoted,
-          reasons: [...sec.reasons, ...resistanceSecond.notes, ...resistanceThird.notes],
-          resistanceNotes: [...resistanceSecond.notes, ...resistanceThird.notes],
+          reasons: [...new Set([...(sec.reasons || []), ...resistanceSecond.notes, ...resistanceThird.notes])],
+          resistanceNotes: [...new Set([...resistanceSecond.notes, ...resistanceThird.notes])],
         });
       }
       return scenarioCache.get(key);
