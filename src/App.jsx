@@ -557,6 +557,38 @@ async function fetchRaceResultsForRacers(regnos, days = 365) {
 }
 
 
+async function fetchRacerResistance(regno, days = 365) {
+  if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
+  const to = todayIso();
+  const from = daysAgoIso(days);
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/racer_resistance_split`, {
+    method: "POST",
+    headers: publicSupabaseHeaders(true),
+    body: JSON.stringify({ p_regno: Number(regno), p_from: from, p_to: to }),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`racer_resistance_split ${res.status}${txt ? `: ${txt.slice(0, 160)}` : ""}`);
+  }
+  const rows = await res.json();
+  return Array.isArray(rows) ? (rows[0] || null) : rows;
+}
+
+async function fetchResistanceBaseline(days = 365) {
+  if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/resistance_baseline_split`, {
+    method: "POST",
+    headers: publicSupabaseHeaders(true),
+    body: JSON.stringify({ p_from: daysAgoIso(days), p_to: todayIso() }),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`resistance_baseline_split ${res.status}${txt ? `: ${txt.slice(0, 160)}` : ""}`);
+  }
+  const rows = await res.json();
+  return Array.isArray(rows) ? (rows[0] || null) : rows;
+}
+
 async function fetchRaceResultsForVenue(placeNo, days = 365) {
   if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
   if (!placeNo) return [];
@@ -2204,6 +2236,7 @@ export default function App() {
     setDbRacerStatus("DB選手成績：未取得");
     setOdds(null);
     setKimari(null); setNigeSim(null); setDbNigeRows([]); setNigeStatus("逃げシミュ：未取得"); setRacerStats(null); setStTable(null); setStMeta(null);
+    setResistanceByBoat({}); setResistanceBaseline(null); setResistanceStatus("攻められ耐性：未取得");
     setResultDigits({ first: "", second: "", third: "" });
     setAutoMsg("");
     setSaveMsg("");
@@ -2221,6 +2254,9 @@ export default function App() {
   const RACER_CATS = CORE_CATEGORY_PERIOD_LABELS;
   const [racerStats, setRacerStats] = useState(null);
   const [racerCat, setRacerCat] = useState("直近6ヶ月");
+  const [resistanceByBoat, setResistanceByBoat] = useState({});
+  const [resistanceBaseline, setResistanceBaseline] = useState(null);
+  const [resistanceStatus, setResistanceStatus] = useState("攻められ耐性：未取得");
   // 期間比較（買い目の被りを見る）
   const [cmpA, setCmpA] = useState("直近6ヶ月");
   const [cmpB, setCmpB] = useState("直近3ヶ月");
@@ -3677,6 +3713,45 @@ export default function App() {
     const stats = buildRacerCourseStatsFromDb(dbRacerRows, racerProfiles, courses, venue);
     setRacerStats(stats);
   }, [dbRacerRows, racerProfiles, courses, venue]);
+
+  useEffect(() => {
+    let alive = true;
+    const pairs = [1, 2, 3, 4, 5, 6]
+      .map((boat) => ({ boat, regno: Number(racerProfiles?.[boat]?.regNo || 0) }))
+      .filter((x) => x.regno);
+
+    if (!pairs.length) {
+      setResistanceByBoat({});
+      setResistanceBaseline(null);
+      setResistanceStatus("攻められ耐性：選手未取得");
+      return () => { alive = false; };
+    }
+    if (!CORRECTION_TABLE_ENABLED) {
+      setResistanceStatus("攻められ耐性：ENVなし");
+      return () => { alive = false; };
+    }
+
+    setResistanceStatus("攻められ耐性：読込中");
+    Promise.all([
+      fetchResistanceBaseline(365),
+      ...pairs.map(async ({ boat, regno }) => ({ boat, row: await fetchRacerResistance(regno, 365) })),
+    ]).then(([baseline, ...items]) => {
+      if (!alive) return;
+      const next = {};
+      for (const item of items) next[item.boat] = item.row;
+      setResistanceBaseline(baseline || null);
+      setResistanceByBoat(next);
+      setResistanceStatus(`攻められ耐性：読込済 ${items.length}艇`);
+    }).catch((e) => {
+      console.error("racer resistance load error", e);
+      if (!alive) return;
+      setResistanceByBoat({});
+      setResistanceBaseline(null);
+      setResistanceStatus(`攻められ耐性：失敗 ${String(e?.message || e).slice(0, 70)}`);
+    });
+
+    return () => { alive = false; };
+  }, [JSON.stringify([1,2,3,4,5,6].map((b) => racerProfiles?.[b]?.regNo || ""))]);
 
   useEffect(() => {
     if (!dbRacerRows.length || !Object.keys(racerProfiles || {}).length) return;
@@ -6052,6 +6127,7 @@ export default function App() {
   const systemErrors = [
     correctionStatus && /失敗|failed|error|エラー/i.test(correctionStatus) ? `補正: ${correctionStatus}` : null,
     dbRacerStatus && /失敗|ENVなし|エラー|error/i.test(dbRacerStatus) ? dbRacerStatus : null,
+    resistanceStatus && /失敗|ENVなし|エラー|error/i.test(resistanceStatus) ? resistanceStatus : null,
     nigeStatus && /失敗|ENVなし|エラー|error/i.test(nigeStatus) ? nigeStatus : null,
     autoMsg && /エラー|不足|失敗|failed|error/i.test(autoMsg) ? autoMsg : null,
   ].filter(Boolean);
@@ -6822,6 +6898,60 @@ export default function App() {
                   )}
                 </div>
               )}
+
+              {/* 攻められ耐性（直近1年・表示のみ。買い目ロジックには未反映） */}
+              {resistanceByBoat?.[b] && (() => {
+                const rr = resistanceByBoat[b];
+                const base = resistanceBaseline || {};
+                const defs = [
+                  { label: "まくり", n: "makuri_n", avg: "makuri_avg_rank", hold: "makuri_hold3", baseAvg: "makuri_avg_rank" },
+                  { label: "まくり差し", n: "makurizashi_n", avg: "makurizashi_avg_rank", hold: "makurizashi_hold3", baseAvg: "makurizashi_avg_rank" },
+                  { label: "差し", n: "sashi_n", avg: "sashi_avg_rank", hold: "sashi_hold3", baseAvg: "sashi_avg_rank" },
+                ];
+                const rowColor = (avgKey, baseKey, nKey) => {
+                  const n = Number(rr?.[nKey] || 0);
+                  if (n < 8) return "#7d91a8";
+                  const avg = Number(rr?.[avgKey]);
+                  const bAvg = Number(base?.[baseKey]);
+                  if (!Number.isFinite(avg) || !Number.isFinite(bAvg)) return "#dce8f4";
+                  if (avg <= bAvg - 0.3) return "#5dd39e";
+                  if (avg >= bAvg + 0.3) return "#ff8d86";
+                  return "#dce8f4";
+                };
+                return (
+                  <div style={{
+                    gridColumn: "1 / -1", borderTop: "1px solid #1d3149", paddingTop: 7, marginTop: 2,
+                    fontSize: 11, color: "#9db5cc",
+                  }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", marginBottom: 5 }}>
+                      <span style={{ background: "#0e1b2c", borderRadius: 5, padding: "3px 7px", fontWeight: 800, color: "#7da3c8" }}>
+                        攻められ耐性（直近1年）
+                      </span>
+                      <span style={{ color: "#607f9d" }}>※表示のみ</span>
+                    </div>
+                    <div style={{ display: "grid", gap: 3 }}>
+                      {defs.map((d) => {
+                        const n = Number(rr?.[d.n] || 0);
+                        const avg = Number(rr?.[d.avg]);
+                        const hold = Number(rr?.[d.hold]);
+                        const bAvg = Number(base?.[d.baseAvg]);
+                        const enough = n >= 8;
+                        return (
+                          <div key={d.label} style={{ color: rowColor(d.avg, d.baseAvg, d.n), lineHeight: 1.55 }}>
+                            <b style={{ display: "inline-block", minWidth: 62 }}>{d.label}</b>
+                            {!enough ? `${n}回 / データ不足` : (
+                              <>
+                                {n}回 / 平均<b>{safeFixed(avg, 2)}</b>着 / 3着内<b>{safeFixed(hold, 1)}</b>%
+                                {Number.isFinite(bAvg) ? <span style={{ color: "#7d91a8" }}>（基準{safeFixed(bAvg, 2)}着）</span> : null}
+                              </>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
             );
           })}

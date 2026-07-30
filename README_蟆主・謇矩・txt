@@ -1,0 +1,37 @@
+WAKE 攻められ耐性（修正分のみ・SQL修正版）
+
+【入っている修正ファイル】
+1. src/App.jsx
+2. sql/add_racer_resistance_split.sql
+3. package.json
+
+【反映手順】
+1. 既存プロジェクトを必ずバックアップする
+2. Supabase SQL Editorで sql/add_racer_resistance_split.sql を全文実行する
+3. ZIP内の src/App.jsx を既存の src/App.jsx に上書きする
+4. ZIP内の package.json を既存の package.json に上書きする
+5. プロジェクト直下で npm install を実行する
+6. npm run build を実行する
+7. 動作確認後にデプロイする
+
+【SQLについて】
+・旧SQLは FILTER の位置が誤っていたため使用しない
+・このZIP内のSQLへ差し替えて、全文を再実行する
+・旧SQLがエラーで止まっただけなら、削除処理は不要
+・create or replace function のため、同名関数が存在しても安全に置き換わる
+
+【実装内容】
+・まくり被害耐性
+・まくり差し被害耐性
+・差し被害耐性
+・対象回数、平均着順、3着内率を表示
+・母数8回未満は「データ不足」
+・全体基準より平均着順が0.3以上良い場合は緑、0.3以上悪い場合は赤
+・現時点ではAI評価および買い目ロジックには未反映
+
+【ロールバック】
+・バックアップした src/App.jsx と package.json に戻す
+・DB関数も消す場合はSupabase SQL Editorで以下を実行する
+
+drop function if exists public.racer_resistance_split(integer, date, date);
+drop function if exists public.resistance_baseline_split(date, date);
