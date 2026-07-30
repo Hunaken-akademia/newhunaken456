@@ -4408,7 +4408,7 @@ export default function App() {
 
     // 攻められ耐性は「現在と同じ進入コース × 攻め艇のコース × 決まり手」で照合する。
     // 母数3件以上だけを使い、3項目2勝ルールを壊さないよう3着順位の補助に限定する。
-    const resistanceMatch = (victimBoat, attackBoat, kind, minN = 3) => {
+    const resistanceMatch = (victimBoat, attackBoat, kind, minN = 3, targetPosition = 3) => {
       const victimCourse = Number(courseByBoat[victimBoat]);
       const attackCourse = Number(courseByBoat[attackBoat]);
       if (!victimCourse || !attackCourse || attackCourse <= victimCourse || victimCourse === 6) return null;
@@ -4419,13 +4419,16 @@ export default function App() {
       const baseRows = resistanceBaseline?.["1y"]?.[victimCourse] || [];
       const base = baseRows.find((r) => Number(r?.attack_course) === attackCourse && String(r?.kimarite || "") === String(kind || ""));
       const avg = Number(row?.avg_rank);
-      const hold = Number(row?.hold3);
       const baseAvg = Number(base?.avg_rank);
-      const baseHold = Number(base?.hold3);
+      const rateKey = Number(targetPosition) === 2 ? "rate2" : "rate3";
+      const rate = Number(row?.[rateKey]);
+      const baseRate = Number(base?.[rateKey]);
       let level = 0;
-      if ((Number.isFinite(baseAvg) && avg <= baseAvg - 0.30) || (Number.isFinite(baseHold) && hold >= baseHold + 10)) level = 1;
-      if ((Number.isFinite(baseAvg) && avg >= baseAvg + 0.30) || (Number.isFinite(baseHold) && hold <= baseHold - 10)) level = -1;
-      return { n, avg, hold, baseAvg, baseHold, level, attackCourse, victimCourse };
+      // 2着補正は2着率、3着補正は3着率を同条件基準と直接比較する。
+      // 平均着順は表示用に残すが、順位補正の判定には混ぜない。
+      if (Number.isFinite(baseRate) && Number.isFinite(rate) && rate >= baseRate + 10) level = 1;
+      if (Number.isFinite(baseRate) && Number.isFinite(rate) && rate <= baseRate - 10) level = -1;
+      return { n, avg, baseAvg, rate, baseRate, rateKey, level, attackCourse, victimCourse };
     };
 
     const applyResistanceToThird = (order, headBoat, kind, blockedSet = new Set(), allowedSet = new Set()) => {
@@ -4436,14 +4439,14 @@ export default function App() {
       for (let i = 0; i < arr.length; i++) {
         const boat = arr[i];
         if (blockedSet.has(boat) && !allowedSet.has(boat)) continue;
-        const m = resistanceMatch(boat, headBoat, kind);
+        const m = resistanceMatch(boat, headBoat, kind, 3, 3);
         if (!m || m.level === 0) continue;
         if (m.level > 0 && i > 0) {
           [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
-          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}耐性が高く3着順位を1段昇格`);
+          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}時の3着率${m.rate.toFixed(1)}%（基準${m.baseRate.toFixed(1)}%）で3着順位を1段昇格`);
         } else if (m.level < 0 && i < arr.length - 1) {
           [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
-          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}耐性が低く3着順位を1段降格`);
+          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}時の3着率${m.rate.toFixed(1)}%（基準${m.baseRate.toFixed(1)}%）で3着順位を1段降格`);
         }
       }
       return { order: arr, notes };
@@ -4458,17 +4461,17 @@ export default function App() {
       for (let i = 0; i < arr.length; i++) {
         const boat = arr[i];
         if (blockedSet.has(boat)) continue;
-        const m = resistanceMatch(boat, headBoat, kind, 6);
+        const m = resistanceMatch(boat, headBoat, kind, 6, 2);
         if (!m || m.level === 0) continue;
         if (m.level > 0 && i > 0) {
           const upper = arr[i - 1];
           if (!blockedSet.has(upper) && metricWins(boat, upper).count >= 1) {
             [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
-            notes.push(`${boat}号艇は対${m.attackCourse}C${kind}耐性（${m.n}走）が高く2着順位を1段昇格`);
+            notes.push(`${boat}号艇は対${m.attackCourse}C${kind}時の2着率${m.rate.toFixed(1)}%（${m.n}走・基準${m.baseRate.toFixed(1)}%）で2着順位を1段昇格`);
           }
         } else if (m.level < 0 && i < arr.length - 1) {
           [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
-          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}耐性（${m.n}走）が低く2着順位を1段降格`);
+          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}時の2着率${m.rate.toFixed(1)}%（${m.n}走・基準${m.baseRate.toFixed(1)}%）で2着順位を1段降格`);
         }
       }
       const promoted = arr.filter((boat, idx) => idx < original.indexOf(boat));
@@ -4774,6 +4777,26 @@ export default function App() {
           push(s2, x);
         }
         return out.slice(0, Math.min(cap, 6));
+      }
+
+      // 4コースまくりは、5Cと6Cの直接比較結果を4点時にもそのまま反映する。
+      // 6Cが5Cに2勝以上なら、先頭4点は 4-6-1 / 4-6-5 / 4-1-6 / 4-1-5。
+      // 5Cが上なら、4-5-1 / 4-5-6 / 4-1-5 / 4-1-6 の順にする。
+      if (sc.kind === "まくり" && Number(sc.course) === 4) {
+        const c1 = boatByCourse[1];
+        const c5 = boatByCourse[5];
+        const c6 = boatByCourse[6];
+        const i5 = (sc.secondRank || []).indexOf(c5);
+        const i6 = (sc.secondRank || []).indexOf(c6);
+        const outerTop = i6 >= 0 && i5 >= 0 && i6 < i5 ? c6 : c5;
+        const outerOther = outerTop === c6 ? c5 : c6;
+        push(outerTop, c1);
+        push(outerTop, outerOther);
+        push(c1, outerTop);
+        push(c1, outerOther);
+        push(outerOther, c1);
+        push(outerOther, outerTop);
+        return out.slice(0, cap);
       }
 
       // まくりは基本筋を残しつつ、実際に2勝して順位が上がった艇だけ2着へ追加。
@@ -7516,16 +7539,18 @@ export default function App() {
                 const summarize = (rows, kind) => {
                   const target = (rows || []).filter((r) => String(r?.kimarite || "") === kind);
                   const n = target.reduce((sum, r) => sum + Number(r?.n || 0), 0);
-                  if (!n) return { n: 0, avg: null, hold: null };
+                  if (!n) return { n: 0, avg: null, rate2: null, rate3: null };
+                  const weighted = (key) => target.reduce((sum, r) => sum + Number(r?.[key] || 0) * Number(r?.n || 0), 0) / n;
                   const avg = target.reduce((sum, r) => sum + Number(r?.avg_rank || 0) * Number(r?.n || 0), 0) / n;
-                  const hold = target.reduce((sum, r) => sum + Number(r?.hold3 || 0) * Number(r?.n || 0), 0) / n;
-                  return { n, avg, hold };
+                  return { n, avg, rate2: weighted("rate2"), rate3: weighted("rate3") };
                 };
                 const summaryColor = (summary, baseline) => {
                   if (summary.n < 3) return "#7d91a8";
-                  if (!Number.isFinite(summary.avg) || !Number.isFinite(baseline.avg)) return "#dce8f4";
-                  if (summary.avg <= baseline.avg - 0.3) return "#5dd39e";
-                  if (summary.avg >= baseline.avg + 0.3) return "#ff8d86";
+                  const own = Number(summary.rate2 || 0) + Number(summary.rate3 || 0);
+                  const base = Number(baseline.rate2 || 0) + Number(baseline.rate3 || 0);
+                  if (!Number.isFinite(own) || !Number.isFinite(base)) return "#dce8f4";
+                  if (own >= base + 10) return "#5dd39e";
+                  if (own <= base - 10) return "#ff8d86";
                   return "#dce8f4";
                 };
                 return (
@@ -7537,7 +7562,7 @@ export default function App() {
                       <span style={{ background: "#0e1b2c", borderRadius: 5, padding: "3px 7px", fontWeight: 800, color: "#7da3c8" }}>
                         攻められ耐性（{myCourse}コース時）
                       </span>
-                      <span style={{ color: "#607f9d" }}>※3着順位の補助に使用</span>
+                      <span style={{ color: "#607f9d" }}>※2着率は2着補正、3着率は3着補正に使用</span>
                     </div>
                     {myCourse === 6 ? (
                       <div style={{ color: "#7d91a8", padding: "5px 2px" }}>
@@ -7565,8 +7590,8 @@ export default function App() {
                                         <b style={{ display: "inline-block", minWidth: 62 }}>{d.label}</b>
                                         {summary.n < 3 ? `${summary.n}回 / データ不足` : (
                                           <>
-                                            {summary.n}回 / 平均<b>{safeFixed(summary.avg, 2)}</b>着 / 3着内<b>{safeFixed(summary.hold, 1)}</b>%
-                                            {Number.isFinite(baseline.avg) ? <span style={{ color: "#7d91a8" }}>（同条件基準{safeFixed(baseline.avg, 2)}着）</span> : null}
+                                            {summary.n}回 / 平均<b>{safeFixed(summary.avg, 2)}</b>着 / 2着<b>{safeFixed(summary.rate2, 1)}</b>% / 3着<b>{safeFixed(summary.rate3, 1)}</b>%
+                                            {Number.isFinite(baseline.rate2) ? <span style={{ color: "#7d91a8" }}>（基準 2着{safeFixed(baseline.rate2, 1)}%・3着{safeFixed(baseline.rate3, 1)}%）</span> : null}
                                           </>
                                         )}
                                       </div>
@@ -7575,7 +7600,7 @@ export default function App() {
                                           const n = Number(r?.n || 0);
                                           return (
                                             <div key={`${d.key}-${r.attack_course}`}>
-                                              {Number(r.attack_course)}Cから：{n}回 / 平均{safeFixed(r.avg_rank, 2)}着 / 3着内{safeFixed(r.hold3, 1)}%
+                                              {Number(r.attack_course)}Cから：{n}回 / 平均{safeFixed(r.avg_rank, 2)}着 / 2着{safeFixed(r.rate2, 1)}% / 3着{safeFixed(r.rate3, 1)}%
                                               {n < 3 ? "（参考）" : ""}
                                             </div>
                                           );
