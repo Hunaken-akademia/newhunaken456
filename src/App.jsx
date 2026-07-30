@@ -557,36 +557,47 @@ async function fetchRaceResultsForRacers(regnos, days = 365) {
 }
 
 
-async function fetchRacerResistance(regno, days = 365) {
+async function fetchRacerResistanceByCourse(regno, myCourse, days = 365) {
   if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
-  const to = todayIso();
-  const from = daysAgoIso(days);
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/racer_resistance_split`, {
+  const course = Number(myCourse);
+  if (!Number.isInteger(course) || course < 1 || course > 5) return [];
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/racer_resistance_by_course`, {
     method: "POST",
     headers: publicSupabaseHeaders(true),
-    body: JSON.stringify({ p_regno: Number(regno), p_from: from, p_to: to }),
+    body: JSON.stringify({
+      p_regno: Number(regno),
+      p_my_course: course,
+      p_from: daysAgoIso(days),
+      p_to: todayIso(),
+    }),
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    throw new Error(`racer_resistance_split ${res.status}${txt ? `: ${txt.slice(0, 160)}` : ""}`);
+    throw new Error(`racer_resistance_by_course ${res.status}${txt ? `: ${txt.slice(0, 160)}` : ""}`);
   }
   const rows = await res.json();
-  return Array.isArray(rows) ? (rows[0] || null) : rows;
+  return Array.isArray(rows) ? rows : [];
 }
 
-async function fetchResistanceBaseline(days = 365) {
+async function fetchResistanceBaselineByCourse(myCourse, days = 365) {
   if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/resistance_baseline_split`, {
+  const course = Number(myCourse);
+  if (!Number.isInteger(course) || course < 1 || course > 5) return [];
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/resistance_baseline_by_course`, {
     method: "POST",
     headers: publicSupabaseHeaders(true),
-    body: JSON.stringify({ p_from: daysAgoIso(days), p_to: todayIso() }),
+    body: JSON.stringify({
+      p_my_course: course,
+      p_from: daysAgoIso(days),
+      p_to: todayIso(),
+    }),
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    throw new Error(`resistance_baseline_split ${res.status}${txt ? `: ${txt.slice(0, 160)}` : ""}`);
+    throw new Error(`resistance_baseline_by_course ${res.status}${txt ? `: ${txt.slice(0, 160)}` : ""}`);
   }
   const rows = await res.json();
-  return Array.isArray(rows) ? (rows[0] || null) : rows;
+  return Array.isArray(rows) ? rows : [];
 }
 
 async function fetchRaceResultsForVenue(placeNo, days = 365) {
@@ -2236,7 +2247,7 @@ export default function App() {
     setDbRacerStatus("DB選手成績：未取得");
     setOdds(null);
     setKimari(null); setNigeSim(null); setDbNigeRows([]); setNigeStatus("逃げシミュ：未取得"); setRacerStats(null); setStTable(null); setStMeta(null);
-    setResistanceByBoat({}); setResistanceBaseline(null); setResistanceStatus("攻められ耐性：未取得");
+    setResistanceByBoat({}); setResistanceBaseline({}); setResistanceStatus("攻められ耐性：未取得");
     setResultDigits({ first: "", second: "", third: "" });
     setAutoMsg("");
     setSaveMsg("");
@@ -2255,7 +2266,7 @@ export default function App() {
   const [racerStats, setRacerStats] = useState(null);
   const [racerCat, setRacerCat] = useState("直近6ヶ月");
   const [resistanceByBoat, setResistanceByBoat] = useState({});
-  const [resistanceBaseline, setResistanceBaseline] = useState(null);
+  const [resistanceBaseline, setResistanceBaseline] = useState({});
   const [resistanceStatus, setResistanceStatus] = useState("攻められ耐性：未取得");
   // 期間比較（買い目の被りを見る）
   const [cmpA, setCmpA] = useState("直近6ヶ月");
@@ -3717,12 +3728,16 @@ export default function App() {
   useEffect(() => {
     let alive = true;
     const pairs = [1, 2, 3, 4, 5, 6]
-      .map((boat) => ({ boat, regno: Number(racerProfiles?.[boat]?.regNo || 0) }))
+      .map((boat) => ({
+        boat,
+        regno: Number(racerProfiles?.[boat]?.regNo || 0),
+        course: Number(courses?.[boat] || boat),
+      }))
       .filter((x) => x.regno);
 
     if (!pairs.length) {
       setResistanceByBoat({});
-      setResistanceBaseline(null);
+      setResistanceBaseline({});
       setResistanceStatus("攻められ耐性：選手未取得");
       return () => { alive = false; };
     }
@@ -3732,26 +3747,49 @@ export default function App() {
     }
 
     setResistanceStatus("攻められ耐性：読込中");
-    Promise.all([
-      fetchResistanceBaseline(365),
-      ...pairs.map(async ({ boat, regno }) => ({ boat, row: await fetchRacerResistance(regno, 365) })),
-    ]).then(([baseline, ...items]) => {
+    const periods = [
+      { key: "3m", label: "直近3か月", days: 90 },
+      { key: "6m", label: "直近6か月", days: 180 },
+    ];
+    const targetCourses = [...new Set(pairs.map((x) => x.course).filter((c) => c >= 1 && c <= 5))];
+
+    Promise.all(periods.map(async (period) => {
+      const baselineEntries = await Promise.all(
+        targetCourses.map(async (course) => [course, await fetchResistanceBaselineByCourse(course, period.days)])
+      );
+      const items = await Promise.all(pairs.map(async ({ boat, regno, course }) => ({
+        boat,
+        course,
+        rows: course === 6 ? [] : await fetchRacerResistanceByCourse(regno, course, period.days),
+      })));
+      return { ...period, baselines: Object.fromEntries(baselineEntries), items };
+    })).then((results) => {
       if (!alive) return;
-      const next = {};
-      for (const item of items) next[item.boat] = item.row;
-      setResistanceBaseline(baseline || null);
-      setResistanceByBoat(next);
-      setResistanceStatus(`攻められ耐性：読込済 ${items.length}艇`);
+      const nextByBoat = {};
+      const nextBaseline = {};
+      for (const result of results) {
+        nextBaseline[result.key] = result.baselines || {};
+        for (const item of result.items) {
+          if (!nextByBoat[item.boat]) nextByBoat[item.boat] = {};
+          nextByBoat[item.boat][result.key] = { course: item.course, rows: item.rows || [] };
+        }
+      }
+      setResistanceBaseline(nextBaseline);
+      setResistanceByBoat(nextByBoat);
+      setResistanceStatus(`攻められ耐性：読込済 ${pairs.length}艇（進入別・攻めコース別）`);
     }).catch((e) => {
       console.error("racer resistance load error", e);
       if (!alive) return;
       setResistanceByBoat({});
-      setResistanceBaseline(null);
+      setResistanceBaseline({});
       setResistanceStatus(`攻められ耐性：失敗 ${String(e?.message || e).slice(0, 70)}`);
     });
 
     return () => { alive = false; };
-  }, [JSON.stringify([1,2,3,4,5,6].map((b) => racerProfiles?.[b]?.regNo || ""))]);
+  }, [
+    JSON.stringify([1,2,3,4,5,6].map((b) => racerProfiles?.[b]?.regNo || "")),
+    JSON.stringify([1,2,3,4,5,6].map((b) => courses?.[b] || b)),
+  ]);
 
   useEffect(() => {
     if (!dbRacerRows.length || !Object.keys(racerProfiles || {}).length) return;
@@ -6899,23 +6937,31 @@ export default function App() {
                 </div>
               )}
 
-              {/* 攻められ耐性（直近1年・表示のみ。買い目ロジックには未反映） */}
+              {/* 攻められ耐性（現在の進入コース限定・攻めコース別） */}
               {resistanceByBoat?.[b] && (() => {
-                const rr = resistanceByBoat[b];
-                const base = resistanceBaseline || {};
-                const defs = [
-                  { label: "まくり", n: "makuri_n", avg: "makuri_avg_rank", hold: "makuri_hold3", baseAvg: "makuri_avg_rank" },
-                  { label: "まくり差し", n: "makurizashi_n", avg: "makurizashi_avg_rank", hold: "makurizashi_hold3", baseAvg: "makurizashi_avg_rank" },
-                  { label: "差し", n: "sashi_n", avg: "sashi_avg_rank", hold: "sashi_hold3", baseAvg: "sashi_avg_rank" },
+                const myCourse = Number(courses?.[b] || b);
+                const periods = [
+                  { key: "3m", label: "直近3か月" },
+                  { key: "6m", label: "直近6か月" },
                 ];
-                const rowColor = (avgKey, baseKey, nKey) => {
-                  const n = Number(rr?.[nKey] || 0);
-                  if (n < 8) return "#7d91a8";
-                  const avg = Number(rr?.[avgKey]);
-                  const bAvg = Number(base?.[baseKey]);
-                  if (!Number.isFinite(avg) || !Number.isFinite(bAvg)) return "#dce8f4";
-                  if (avg <= bAvg - 0.3) return "#5dd39e";
-                  if (avg >= bAvg + 0.3) return "#ff8d86";
+                const defs = [
+                  { key: "まくり", label: "まくり" },
+                  { key: "まくり差し", label: "まくり差し" },
+                  { key: "差し", label: "差し" },
+                ];
+                const summarize = (rows, kind) => {
+                  const target = (rows || []).filter((r) => String(r?.kimarite || "") === kind);
+                  const n = target.reduce((sum, r) => sum + Number(r?.n || 0), 0);
+                  if (!n) return { n: 0, avg: null, hold: null };
+                  const avg = target.reduce((sum, r) => sum + Number(r?.avg_rank || 0) * Number(r?.n || 0), 0) / n;
+                  const hold = target.reduce((sum, r) => sum + Number(r?.hold3 || 0) * Number(r?.n || 0), 0) / n;
+                  return { n, avg, hold };
+                };
+                const summaryColor = (summary, baseline) => {
+                  if (summary.n < 8) return "#7d91a8";
+                  if (!Number.isFinite(summary.avg) || !Number.isFinite(baseline.avg)) return "#dce8f4";
+                  if (summary.avg <= baseline.avg - 0.3) return "#5dd39e";
+                  if (summary.avg >= baseline.avg + 0.3) return "#ff8d86";
                   return "#dce8f4";
                 };
                 return (
@@ -6923,32 +6969,63 @@ export default function App() {
                     gridColumn: "1 / -1", borderTop: "1px solid #1d3149", paddingTop: 7, marginTop: 2,
                     fontSize: 11, color: "#9db5cc",
                   }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", marginBottom: 5 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", marginBottom: 6 }}>
                       <span style={{ background: "#0e1b2c", borderRadius: 5, padding: "3px 7px", fontWeight: 800, color: "#7da3c8" }}>
-                        攻められ耐性（直近1年）
+                        攻められ耐性（{myCourse}コース時）
                       </span>
                       <span style={{ color: "#607f9d" }}>※表示のみ</span>
                     </div>
-                    <div style={{ display: "grid", gap: 3 }}>
-                      {defs.map((d) => {
-                        const n = Number(rr?.[d.n] || 0);
-                        const avg = Number(rr?.[d.avg]);
-                        const hold = Number(rr?.[d.hold]);
-                        const bAvg = Number(base?.[d.baseAvg]);
-                        const enough = n >= 8;
-                        return (
-                          <div key={d.label} style={{ color: rowColor(d.avg, d.baseAvg, d.n), lineHeight: 1.55 }}>
-                            <b style={{ display: "inline-block", minWidth: 62 }}>{d.label}</b>
-                            {!enough ? `${n}回 / データ不足` : (
-                              <>
-                                {n}回 / 平均<b>{safeFixed(avg, 2)}</b>着 / 3着内<b>{safeFixed(hold, 1)}</b>%
-                                {Number.isFinite(bAvg) ? <span style={{ color: "#7d91a8" }}>（基準{safeFixed(bAvg, 2)}着）</span> : null}
-                              </>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
+                    {myCourse === 6 ? (
+                      <div style={{ color: "#7d91a8", padding: "5px 2px" }}>
+                        6コースは外側に攻め艇がいないため対象外
+                      </div>
+                    ) : (
+                      <div style={{ display: "grid", gap: 8 }}>
+                        {periods.map((period) => {
+                          const periodData = resistanceByBoat?.[b]?.[period.key] || {};
+                          const rows = periodData?.rows || [];
+                          const baseRows = resistanceBaseline?.[period.key]?.[myCourse] || [];
+                          return (
+                            <div key={period.key} style={{ background: "rgba(14,27,44,.55)", borderRadius: 7, padding: "6px 8px" }}>
+                              <div style={{ fontWeight: 900, color: "#8fb4d8", marginBottom: 4 }}>{period.label}</div>
+                              <div style={{ display: "grid", gap: 6 }}>
+                                {defs.map((d) => {
+                                  const summary = summarize(rows, d.key);
+                                  const baseline = summarize(baseRows, d.key);
+                                  const details = (rows || [])
+                                    .filter((r) => String(r?.kimarite || "") === d.key && Number(r?.n || 0) > 0)
+                                    .sort((a, z) => Number(a.attack_course) - Number(z.attack_course));
+                                  return (
+                                    <div key={d.key} style={{ borderTop: "1px solid rgba(44,71,98,.55)", paddingTop: 4 }}>
+                                      <div style={{ color: summaryColor(summary, baseline), lineHeight: 1.55 }}>
+                                        <b style={{ display: "inline-block", minWidth: 62 }}>{d.label}</b>
+                                        {summary.n < 8 ? `${summary.n}回 / データ不足` : (
+                                          <>
+                                            {summary.n}回 / 平均<b>{safeFixed(summary.avg, 2)}</b>着 / 3着内<b>{safeFixed(summary.hold, 1)}</b>%
+                                            {Number.isFinite(baseline.avg) ? <span style={{ color: "#7d91a8" }}>（同条件基準{safeFixed(baseline.avg, 2)}着）</span> : null}
+                                          </>
+                                        )}
+                                      </div>
+                                      <div style={{ marginLeft: 62, marginTop: 2, display: "grid", gap: 1, color: "#7890a8", fontSize: 10 }}>
+                                        {details.length ? details.map((r) => {
+                                          const n = Number(r?.n || 0);
+                                          return (
+                                            <div key={`${d.key}-${r.attack_course}`}>
+                                              {Number(r.attack_course)}Cから：{n}回 / 平均{safeFixed(r.avg_rank, 2)}着 / 3着内{safeFixed(r.hold3, 1)}%
+                                              {n < 8 ? "（参考）" : ""}
+                                            </div>
+                                          );
+                                        }) : <div>攻めコース別の該当なし</div>}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 );
               })()}
