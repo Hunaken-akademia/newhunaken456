@@ -4406,6 +4406,49 @@ export default function App() {
       .map((c) => boatByCourse[c])
       .filter((b, i, a) => b && b !== headBoat && a.indexOf(b) === i);
 
+    // 攻められ耐性は「現在と同じ進入コース × 攻め艇のコース × 決まり手」で照合する。
+    // 母数3件以上だけを使い、3項目2勝ルールを壊さないよう3着順位の補助に限定する。
+    const resistanceMatch = (victimBoat, attackBoat, kind) => {
+      const victimCourse = Number(courseByBoat[victimBoat]);
+      const attackCourse = Number(courseByBoat[attackBoat]);
+      if (!victimCourse || !attackCourse || attackCourse <= victimCourse || victimCourse === 6) return null;
+      const rows = resistanceByBoat?.[victimBoat]?.["1y"]?.rows || [];
+      const row = rows.find((r) => Number(r?.attack_course) === attackCourse && String(r?.kimarite || "") === String(kind || ""));
+      const n = Number(row?.n || 0);
+      if (n < 3) return null;
+      const baseRows = resistanceBaseline?.["1y"]?.[victimCourse] || [];
+      const base = baseRows.find((r) => Number(r?.attack_course) === attackCourse && String(r?.kimarite || "") === String(kind || ""));
+      const avg = Number(row?.avg_rank);
+      const hold = Number(row?.hold3);
+      const baseAvg = Number(base?.avg_rank);
+      const baseHold = Number(base?.hold3);
+      let level = 0;
+      if ((Number.isFinite(baseAvg) && avg <= baseAvg - 0.30) || (Number.isFinite(baseHold) && hold >= baseHold + 10)) level = 1;
+      if ((Number.isFinite(baseAvg) && avg >= baseAvg + 0.30) || (Number.isFinite(baseHold) && hold <= baseHold - 10)) level = -1;
+      return { n, avg, hold, baseAvg, baseHold, level, attackCourse, victimCourse };
+    };
+
+    const applyResistanceToThird = (order, headBoat, kind, blockedSet = new Set(), allowedSet = new Set()) => {
+      const arr = [...(order || [])];
+      const notes = [];
+      // 良好耐性は最大1段だけ昇格、低耐性は最大1段だけ降格。
+      // 叩かれる艇は既存の復活条件を満たした場合だけ対象にする。
+      for (let i = 0; i < arr.length; i++) {
+        const boat = arr[i];
+        if (blockedSet.has(boat) && !allowedSet.has(boat)) continue;
+        const m = resistanceMatch(boat, headBoat, kind);
+        if (!m || m.level === 0) continue;
+        if (m.level > 0 && i > 0) {
+          [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
+          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}耐性が高く3着順位を1段昇格`);
+        } else if (m.level < 0 && i < arr.length - 1) {
+          [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
+          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}耐性が低く3着順位を1段降格`);
+        }
+      }
+      return { order: arr, notes };
+    };
+
     const templateForScenario = (headBoat, rawKind) => {
       const c = Number(courseByBoat[headBoat] || headBoat);
       let kind = String(rawKind || "").trim();
@@ -4534,10 +4577,12 @@ export default function App() {
         const benchmark = tpl.third.slice(0, Math.max(1, baseIdx)).find((b) => !blockedSet.has(b));
         if (benchmark && metricWins(boat, benchmark).count >= 2) thirdAllowed.add(boat);
       }
-      const thirdRank = [
+      const thirdRankBase = [
         ...third.order.filter((b) => !blockedSet.has(b) || thirdAllowed.has(b)),
         ...third.order.filter((b) => blockedSet.has(b) && !thirdAllowed.has(b)),
       ];
+      const resistanceThird = applyResistanceToThird(thirdRankBase, headBoat, kind, blockedSet, thirdAllowed);
+      const thirdRank = resistanceThird.order;
       const blockedNotes = [...blockedSet]
         .filter((b) => !thirdAllowed.has(b))
         .map((b) => `${b}号艇は叩かれる想定のため3着上位から降格`);
@@ -4551,7 +4596,7 @@ export default function App() {
         thirdPromoted: third.promoted,
         // 説明文では2着順位の実移動だけを「昇格」と表記する。
         // 3着内の並び替えは買い目へ反映するが、基本筋の艇を誤って昇格扱いしない。
-        reasons: [...sec.reasons, ...blockedNotes],
+        reasons: [...sec.reasons, ...blockedNotes, ...resistanceThird.notes],
       };
     };
 
@@ -4641,6 +4686,36 @@ export default function App() {
         return out.slice(0, cap);
       }
 
+      // 3コースまくり差しは3-12中心。外艇は3着でも2勝昇格または耐性補正時だけ追加する。
+      if (sc.kind === "まくり差し" && Number(sc.course) === 3) {
+        const c1 = boatByCourse[1], c2 = boatByCourse[2];
+        const extraThird = safeThird(uniq(promotedThird))
+          .filter((b) => ![c1, c2].includes(b));
+        push(c1, c2);
+        push(c2, c1);
+        for (const x of extraThird.slice(0, 1)) {
+          push(c1, x);
+          push(c2, x);
+        }
+        return out.slice(0, Math.min(cap, 4));
+      }
+
+      // 5・6コースまくりは2着基本筋を固定し、総流しにしない。
+      // 5Cは5-16、6Cは6-15を軸に、3着は評価上位2艇まで。
+      if (sc.kind === "まくり" && [5, 6].includes(Number(sc.course))) {
+        const s1 = baseSecond[0], s2 = baseSecond[1];
+        const thirdPool = safeThird(uniq([...(sc.thirdRank || []), ...promotedThird]))
+          .filter((b) => b !== s1 && b !== s2)
+          .slice(0, 2);
+        push(s1, s2);
+        push(s2, s1);
+        for (const x of thirdPool) {
+          push(s1, x);
+          push(s2, x);
+        }
+        return out.slice(0, Math.min(cap, 6));
+      }
+
       // まくりは基本筋を残しつつ、実際に2勝して順位が上がった艇だけ2着へ追加。
       // 3Cまくりで5が昇格した場合は、先頭4点を 3-1-4 / 3-1-5 / 3-5-1 / 3-5-4 にする。
       if (sc.kind === "まくり") {
@@ -4708,14 +4783,16 @@ export default function App() {
           const benchmark = tpl.third.slice(0, Math.max(1, baseIdx)).find((b) => !blockedSet.has(b));
           if (benchmark && metricWins(boat, benchmark).count >= 2) thirdAllowed.add(boat);
         }
-        const thirdRank = [
+        const thirdRankBase = [
           ...third.order.filter((b) => !blockedSet.has(b) || thirdAllowed.has(b)),
           ...third.order.filter((b) => blockedSet.has(b) && !thirdAllowed.has(b)),
         ];
+        const resistanceThird = applyResistanceToThird(thirdRankBase, head, tpl.kind, blockedSet, thirdAllowed);
+        const thirdRank = resistanceThird.order;
         scenarioCache.set(key, {
           ...tpl, secondRank: sec.order, thirdRank, thirdAllowed: [...thirdAllowed],
           secondPromoted: sec.promoted, thirdPromoted: third.promoted,
-          reasons: [...sec.reasons],
+          reasons: [...sec.reasons, ...resistanceThird.notes],
         });
       }
       return scenarioCache.get(key);
@@ -5236,19 +5313,10 @@ export default function App() {
 
       scenarios = top.map((c) => {
         const head = c.boat;
-        // 相手：気配上位＋（1号艇は軸として絡める）
-        const partners = order.filter((b) => b !== head);
-        let tickets = [];
-        if (c.type === "逃げ") {
-          // 1-相手-相手（気配上位で流す）
-          const s2 = partners.slice(0, 3), s3 = partners.slice(0, 4);
-          tickets = buildTicketsPure([1], s2, s3, 8);
-        } else {
-          // 外の決まり手：頭-（1号艇/気配上位）-（気配上位）
-          const inner = [1, ...partners.filter((b) => b !== 1)].filter(Boolean);
-          const s2 = inner.slice(0, 3), s3 = inner.slice(0, 4);
-          tickets = buildTicketsPure([head], s2, s3, 8);
-        }
+        // シナリオ表示も本線〜展リハと同じ専用テンプレートを使う。
+        // これにより、3まくりの2号艇除外、3まくり差しの3-12中心、5まくりの5-16固定が揃う。
+        const displayScenario = scenarioForKind(head, c.type);
+        let tickets = scenarioTicketCandidates(head, displayScenario, 8, "balanced");
         const label = c.type === "逃げ" ? `逃げ（1号艇）`
           : `${c.type}（${head}号艇）`;
         // 説明文は「決まり手率（場の平均）」と「リハーサル出現率（今日の隊形）」を併記する。
@@ -5381,7 +5449,7 @@ export default function App() {
     () => (result ? evaluateRows(result.rows) : null),
     // slit（進入・平均ST）と固定シードのキーも展開リハーサル経由で評価に効くため依存に含める
     [result, sts, fHold, fSts, motors, tilts, wind, racerCat, kimari, kimariPeriod, nigeSim, odds,
-      slit, courses, raceDate, venue, raceNo]
+      slit, courses, raceDate, venue, raceNo, resistanceByBoat, resistanceBaseline]
   );
 
   // 通常画面に実際に表示されたAI買い目を、正式な舟券履歴とは別の下書きとして保存する。
@@ -7337,7 +7405,7 @@ export default function App() {
                       <span style={{ background: "#0e1b2c", borderRadius: 5, padding: "3px 7px", fontWeight: 800, color: "#7da3c8" }}>
                         攻められ耐性（{myCourse}コース時）
                       </span>
-                      <span style={{ color: "#607f9d" }}>※表示のみ</span>
+                      <span style={{ color: "#607f9d" }}>※3着順位の補助に使用</span>
                     </div>
                     {myCourse === 6 ? (
                       <div style={{ color: "#7d91a8", padding: "5px 2px" }}>
