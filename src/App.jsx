@@ -4376,6 +4376,143 @@ export default function App() {
     const rehPct = rehearsal?.pctOf || null;    // {"まくり(4)": 27.6, ...}
     const rehBoatPct = rehearsal?.boatPct || null; // {4: 36.3, ...}
 
+
+    // ── 決まり手別シナリオエンジン Ver.1 ──
+    // 競艇の基本筋を土台に、モーター・平均ST・コース別選手成績の
+    // 3項目中2項目以上で上回る艇だけを昇格させる。
+    // 展開上つぶされる艇は2着へ昇格させず、3着だけ復活を許可する。
+    const boatByCourse = {};
+    const courseByBoat = {};
+    ranked.forEach((r) => {
+      const c = Number(r.course || courses?.[r.boat] || r.boat);
+      if (c >= 1 && c <= 6) { boatByCourse[c] = r.boat; courseByBoat[r.boat] = c; }
+    });
+    for (let c = 1; c <= 6; c++) {
+      if (!boatByCourse[c]) boatByCourse[c] = c;
+      if (!courseByBoat[c]) courseByBoat[c] = c;
+    }
+
+    const scenarioMetric = (boat, key) => {
+      const r = ranked.find((x) => x.boat === boat);
+      return Number(r?.points?.[key] ?? 0);
+    };
+    const metricWins = (a, b) => {
+      const keys = ["モーター", "ST", "成績"];
+      const won = keys.filter((k) => scenarioMetric(a, k) > scenarioMetric(b, k));
+      const lost = keys.filter((k) => scenarioMetric(a, k) < scenarioMetric(b, k));
+      return { won, lost, count: won.length };
+    };
+    const coursesToBoats = (list, headBoat) => (list || [])
+      .map((c) => boatByCourse[c])
+      .filter((b, i, a) => b && b !== headBoat && a.indexOf(b) === i);
+
+    const templateForScenario = (headBoat, rawKind) => {
+      const c = Number(courseByBoat[headBoat] || headBoat);
+      let kind = String(rawKind || "").trim();
+      if (c === 1) kind = "逃げ";
+      // 2コースに「まくり差し」は存在しないため、誤って選ばれた場合はまくり扱い。
+      if (c === 2 && kind === "まくり差し") kind = "まくり";
+
+      let second = [1,2,3,4,5,6].filter((x) => x !== c);
+      let third = [...second];
+      let blockedSecond = [];
+      let followers = [];
+      let note = "気配順";
+
+      if (kind === "逃げ") {
+        // 逃げはDBの逃がし2着率・3着率を基本順位にする。
+        const outerCourses = [2,3,4,5,6];
+        const valueAt = (arr, course) => {
+          const boat = boatByCourse[course];
+          const v = arr?.[boat - 2];
+          return Number.isFinite(Number(v)) ? Number(v) : -1;
+        };
+        second = [...outerCourses].sort((a,b) => valueAt(nigeSim?.second, b) - valueAt(nigeSim?.second, a));
+        third = [...outerCourses].sort((a,b) => valueAt(nigeSim?.third, b) - valueAt(nigeSim?.third, a));
+        note = "逃がし2着率・3着率を基礎";
+      } else if (c === 2 && kind === "差し") {
+        second = [1,3,4,5,6]; third = [3,1,4,5,6]; note = "2差しは1・3残りが基本";
+      } else if (c === 2 && kind === "まくり") {
+        second = [3,4,5,6,1]; third = [4,3,1,5,6]; blockedSecond = [1]; followers = [3,4,5,6]; note = "2まくりは3・4追走が基本";
+      } else if (c === 3 && kind === "まくり") {
+        second = [1,4,5,6,2]; third = [4,1,2,5,6]; blockedSecond = [2]; followers = [4,5,6]; note = "3まくりは3-14が基本";
+      } else if (c === 3 && kind === "まくり差し") {
+        second = [1,2,4,5,6]; third = [2,1,4,5,6]; followers = [1,2]; note = "3まくり差しは3-12が基本";
+      } else if (c === 4 && kind === "差し") {
+        second = [3,1,2,5,6]; third = [1,3,2,5,6]; followers = [3,1]; note = "3攻めから4差しなら4-3を許可";
+      } else if (c === 4 && kind === "まくり") {
+        second = [5,1,6,2,3]; third = [1,5,6,3,2]; blockedSecond = [3]; followers = [5,6,1]; note = "4まくりは4-15、気配次第で4-6";
+      } else if (c === 4 && kind === "まくり差し") {
+        second = [1,2,3,5,6]; third = [2,1,3,5,6]; followers = [1,2,3]; note = "4まくり差しは4-12、外の5は追走しにくい";
+      } else if (c === 5 && kind === "まくり") {
+        second = [1,6,4,3,2]; third = [6,1,4,3,2]; blockedSecond = [2,3,4]; followers = [1,6]; note = "5まくりは5-16が基本";
+      } else if (c === 5 && kind === "まくり差し") {
+        second = [1,2,3,4,6]; third = [2,1,3,4,6]; followers = [1,2,3,4]; note = "5より内でまくられず残る艇を優先";
+      } else if (c === 6 && kind === "まくり") {
+        second = [1,5,4,3,2]; third = [5,1,4,3,2]; blockedSecond = [2,3,4]; followers = [1,5]; note = "6まくりは6-15が基本";
+      } else if (c === 6 && kind === "まくり差し") {
+        second = [1,5,4,3,2]; third = [5,1,4,3,2]; followers = [1,5]; note = "5の攻めを利用する6-15が基本";
+      }
+      return {
+        kind, course: c,
+        second: coursesToBoats(second, headBoat),
+        third: coursesToBoats(third, headBoat),
+        blockedSecond: coursesToBoats(blockedSecond, headBoat),
+        followers: coursesToBoats(followers, headBoat),
+        note,
+      };
+    };
+
+    const rankByTwoOfThree = (base, blocked = []) => {
+      const arr = [...base];
+      const blockedSet = new Set(blocked || []);
+      const moved = [];
+      // 後位艇が直前艇に2項目以上勝つ場合だけ、1段ずつ昇格する。
+      for (let pass = 0; pass < arr.length; pass++) {
+        let changed = false;
+        for (let i = 1; i < arr.length; i++) {
+          const challenger = arr[i], upper = arr[i - 1];
+          if (blockedSet.has(challenger)) continue;
+          const cmp = metricWins(challenger, upper);
+          if (cmp.count >= 2) {
+            arr[i - 1] = challenger; arr[i] = upper;
+            moved.push(`${challenger}号艇が${cmp.won.join("・")}で${upper}号艇を上回り昇格`);
+            changed = true;
+          }
+        }
+        if (!changed) break;
+      }
+      return { order: arr, reasons: [...new Set(moved)] };
+    };
+
+    const kindOfHead = (headBoat) => {
+      if (Number(courseByBoat[headBoat]) === 1) return "逃げ";
+      const candidates = [];
+      if (rehPct) {
+        Object.entries(rehPct).forEach(([key, pct]) => {
+          const m = /^(.+)\((\d)\)$/.exec(key);
+          if (m && Number(m[2]) === headBoat && m[1] !== "抜き") candidates.push({ kind: m[1], v: Number(pct) || 0, src: "展リハ" });
+        });
+      }
+      if (km) {
+        const idx = headBoat - 2;
+        [["まくり", km.makuri?.[idx]], ["まくり差し", km.makurizashi?.[idx]], ["差し", km.sashi?.[idx]]]
+          .forEach(([kind, v]) => { if (v != null) candidates.push({ kind, v: Number(v) || 0, src: "決まり手率" }); });
+      }
+      candidates.sort((a,b) => b.v - a.v);
+      let kind = candidates[0]?.kind || "まくり";
+      if (Number(courseByBoat[headBoat]) === 2 && kind === "まくり差し") kind = "まくり";
+      return kind;
+    };
+
+    const scenarioRanksForHead = (headBoat) => {
+      const kind = kindOfHead(headBoat);
+      const tpl = templateForScenario(headBoat, kind);
+      const sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
+      const third = rankByTwoOfThree(tpl.third, []);
+      return { ...tpl, secondRank: sec.order, thirdRank: third.order, reasons: [...sec.reasons, ...third.reasons] };
+    };
+
     // ── 展開連動: 決まり手から「1号艇を脅かす濃い攻め手艇」を抽出 ──
     //   シナリオ（展開予想）と同じ決まり手データを使い、まくり/差し/まくり差しが濃い艇を特定。
     //   これを対抗・穴の頭候補に格上げして、展開を買い目の頭構成に反映する。
@@ -4424,92 +4561,63 @@ export default function App() {
       scenarioHeads.splice(3); // 頭は最大3艇まで
     }
 
-    // 対抗（確率モデル駆動）: 頭候補は現行どおり1着率2位＋展開濃厚艇。
-    //   各頭の20通りをprobMapの確率降順で採用し、本線と被る目は除外する。
+    // 対抗：決まり手別シナリオエンジンで2・3着を組み立てる。
+    // 頭候補は1着率2位＋展開濃厚艇。本線との重複は除外する。
     const honSet = new Set(honmei.tickets);
     const taikouTickets = [];
     const pushUnique = (t) => {
       if (!t) return;
       if (!taikouTickets.includes(t) && !honSet.has(t)) taikouTickets.push(t);
     };
-    const a1 = r1[0], a2 = r1[1];      // 1着率1位・2位
-    const axis = r3[0];                // 3連対率1位（フォールバック用の軸）
-    const partners2 = [...new Set([...r3.slice(0, 4), ...stRank.slice(0, 3), ...order.slice(0, 4)])].filter(Boolean);
+    const a1 = r1[0], a2 = r1[1];
     const taikouHeads = [...new Set([a2, ...scenarioHeads].filter(Boolean))];
     const hasUsableProbMap = probMap && Object.values(probMap).some((p) => Number.isFinite(Number(p)) && Number(p) > 0);
-    let taikouFlowNote = scenarioHeads.length > 0
-      ? `／展開濃厚艇${scenarioHeads.join("・")}号を頭に反映`
-      : "";
+    const engineDetails = [];
+    const TK_MAX = 12;
 
-    if (hasUsableProbMap && taikouHeads.length > 0) {
-      // 旧実装は先頭の頭候補が12点すべてを埋めてしまい、展開濃厚艇が頭の目が
-      // 1点も残らないことがあった（＝リハーサルで濃い艇が買い目に出てこない原因）。
-      // 頭候補ごとに枠を割り当ててから、余りを埋める方式に変更する。
-      const TK_MAX = 12;
-      const lists = taikouHeads.map((head) => {
-        const others = [1, 2, 3, 4, 5, 6].filter((b) => b !== head);
-        return sortByProb(buildTickets([head], others, others, 20));
-      });
-      const quota = Math.max(3, Math.floor(TK_MAX / lists.length));
-      lists.forEach((list) => {
-        let n = 0;
-        for (const t of list) {
-          if (n >= quota || taikouTickets.length >= TK_MAX) break;
-          const before = taikouTickets.length;
-          pushUnique(t);
-          if (taikouTickets.length > before) n += 1;
-        }
-      });
-      // 余りは先頭の頭候補（＝1着率2位 or 最有力の展開濃厚艇）から順に埋める
-      for (const list of lists) {
-        for (const t of list) {
-          if (taikouTickets.length >= TK_MAX) break;
-          pushUnique(t);
-        }
+    for (const head of taikouHeads) {
+      if (taikouTickets.length >= TK_MAX) break;
+      const sc = scenarioRanksForHead(head);
+      const candidates = buildTickets([head], sc.secondRank.slice(0, 4), sc.thirdRank.slice(0, 5), 20);
+      const rankedCandidates = hasUsableProbMap ? sortByProb(candidates) : candidates;
+      const quota = Math.max(3, Math.floor(TK_MAX / Math.max(1, taikouHeads.length)));
+      let added = 0;
+      for (const t of rankedCandidates) {
+        if (added >= quota || taikouTickets.length >= TK_MAX) break;
+        const before = taikouTickets.length;
+        pushUnique(t);
+        if (taikouTickets.length > before) added++;
+      }
+      engineDetails.push({ head, ...sc });
+    }
+
+    // 頭ごとの枠で12点に届かない場合は、同じシナリオ順位を保ったまま補完。
+    for (const d of engineDetails) {
+      if (taikouTickets.length >= TK_MAX) break;
+      const more = buildTickets([d.head], d.secondRank, d.thirdRank, 20);
+      for (const t of (hasUsableProbMap ? sortByProb(more) : more)) {
+        pushUnique(t);
         if (taikouTickets.length >= TK_MAX) break;
       }
     }
-
-    // probMapが空・全0、または確率候補だけで埋まらない場合は現行ヒューリスティックで補完する。
-    if (taikouTickets.length < 12) {
-      if (scenarioHeads.length > 0) {
-        for (const h of scenarioHeads) {
-          const others = partners2.filter((b) => b !== h);
-          for (const c of others) { if (c !== 1) pushUnique(`${h}-1-${c}`); if (taikouTickets.length >= 6) break; }
-          for (const b of others) { if (b !== 1) pushUnique(`${h}-${b}-1`); if (taikouTickets.length >= 6) break; }
-          if (taikouTickets.length >= 6) break;
-        }
-      }
-      if (a2 && taikouTickets.length < 12) {
-        const head = a2;
-        if (axis && axis !== head) {
-          for (const c of partners2) { if (c !== head && c !== axis) pushUnique(`${head}-${axis}-${c}`); if (taikouTickets.length >= 12) break; }
-          for (const b of partners2) { if (b !== head && b !== axis) pushUnique(`${head}-${b}-${axis}`); if (taikouTickets.length >= 12) break; }
-        }
-        if (taikouTickets.length < 12) {
-          for (const b of partners2) {
-            if (b === head) continue;
-            for (const c of partners2) { if (c !== head && c !== b) pushUnique(`${head}-${b}-${c}`); if (taikouTickets.length >= 12) break; }
-            if (taikouTickets.length >= 12) break;
-          }
-        }
-      }
-      if (taikouTickets.length < 12 && a1 && a2) {
-        for (const c of partners2) { if (c !== a1 && c !== a2) pushUnique(`${a2}-${a1}-${c}`); if (taikouTickets.length >= 12) break; }
-      }
-      if (taikouTickets.length < 12) {
-        const top4 = order.slice(0, 4);
-        const more = buildTickets(top4.slice(0, 2), top4, top4, 12);
-        for (const t of more) { pushUnique(t); if (taikouTickets.length >= 12) break; }
+    // シナリオ頭が取れない場合だけ旧順位で安全に補完。
+    if (taikouTickets.length < 4 && a2) {
+      const others = order.filter((b) => b !== a2);
+      for (const t of buildTickets([a2], others, others, 12)) {
+        pushUnique(t);
+        if (taikouTickets.length >= 4) break;
       }
     }
 
+    const detailText = engineDetails.slice(0, 2).map((d) => {
+      const move = d.reasons.length ? `／${d.reasons.slice(0, 2).join("、")}` : "";
+      return `${d.head}号艇${d.kind}：2着${d.secondRank.slice(0,3).join("・")}、3着${d.thirdRank.slice(0,4).join("・")}（${d.note}）${move}`;
+    }).join("／");
     const taikou = {
       label: "対抗",
-      desc: hasUsableProbMap
-        ? `1着率2位＋展開濃厚艇を頭候補／推定確率上位・本線重複除外${taikouFlowNote}`
-        : `確率未取得のため従来ロジックで補完／本線重複除外${taikouFlowNote}`,
+      desc: `決まり手別の基本筋＋モーター・平均ST・コース別成績の2勝ルール${detailText ? `／${detailText}` : ""}`,
       tickets: taikouTickets,
+      scenarioEngine: engineDetails,
     };
 
     // 穴: オッズ取得時は120通り全体からEV基準で選定。
@@ -4642,7 +4750,7 @@ export default function App() {
       return { odds: 1 / inv, covered: vals.length, total: tickets.length };
     };
 
-    // ── 展開リハ（展開リハーサル発の「拾えていない買い目」） ──
+    // ── 展開リハ（展リハ発の「拾えていない買い目」） ──
     //
     //   本線・対抗・穴はいずれも「どの艇が強いか」の総合評価から組む。
     //   そのため、展開リハーサル（今日のST・進入・評価で1000回試走した結果）で
@@ -4716,13 +4824,13 @@ export default function App() {
         const gapStr = gaps
           .map((g) => `${g.boat}号艇（総合1着率${round1(g.reh)}%・本線・対抗で頭なし）`)
           .join("、");
-        desc = `展開リハ1000回試走での総合1着率が3位以内・8%以上で、本線・対抗に頭がない艇＝${gapStr}${hasOdds ? "／その艇頭からEV1.0以上を優先" : "／その艇頭を推定確率順"}`;
+        desc = `展リハ1000回試走での総合1着率が3位以内・8%以上で、本線・対抗に頭がない艇＝${gapStr}${hasOdds ? "／その艇頭からEV1.0以上を優先" : "／その艇頭を推定確率順"}`;
       } else if (rehBoatPct) {
-        desc = "展開リハ1000回試走で総合1着率3位以内・8%以上の艇は、本線または対抗で頭として拾えています";
+        desc = "展リハ1000回試走で総合1着率3位以内・8%以上の艇は、本線または対抗で頭として拾えています";
       } else {
-        desc = "全艇の平均STを入力すると、展開リハーサル発の買い目が出ます";
+        desc = "全艇の平均STを入力すると、展リハ発の買い目が出ます";
       }
-      fukuhei = { label: "展開リハ", desc, tickets, gaps };
+      fukuhei = { label: "展リハ", desc, tickets, gaps };
     }
 
     // 合成オッズは展開リハにも付ける（0点のときは null になる）
@@ -4949,15 +5057,15 @@ export default function App() {
       // 配分の目安（本線・対抗・穴・展開リハ）
       //   展開リハは展開リハーサルの抜け拾いなので、荒れ寄りのときに厚くする。
       let dist;
-      if (lean === "honmei") dist = { 本線: 0.5, 対抗: 0.3, 穴: 0.2, 展開リハ: 0 };
-      else if (lean === "ana") dist = { 本線: 0.2, 対抗: 0.25, 穴: 0.3, 展開リハ: 0.25 };
-      else dist = { 本線: 0.35, 対抗: 0.3, 穴: 0.25, 展開リハ: 0.1 };
+      if (lean === "honmei") dist = { 本線: 0.5, 対抗: 0.3, 穴: 0.2, 展リハ: 0 };
+      else if (lean === "ana") dist = { 本線: 0.2, 対抗: 0.25, 穴: 0.3, 展リハ: 0.25 };
+      else dist = { 本線: 0.35, 対抗: 0.3, 穴: 0.25, 展リハ: 0.1 };
       const alloc = {};
-      for (const k of ["本線", "対抗", "穴", "展開リハ"]) alloc[k] = Math.round(total * dist[k]);
+      for (const k of ["本線", "対抗", "穴", "展リハ"]) alloc[k] = Math.round(total * dist[k]);
       // 展開リハカードが出ないレース（＝リハーサルの抜けが無い）では、その配分を穴に寄せる。
-      if (!bets.some((b) => b.label === "展開リハ")) {
-        alloc["穴"] += alloc["展開リハ"];
-        alloc["展開リハ"] = 0;
+      if (!bets.some((b) => b.label === "展リハ")) {
+        alloc["穴"] += alloc["展リハ"];
+        alloc["展リハ"] = 0;
       }
 
       const leanLabel = lean === "honmei" ? "本命寄り（手堅く絞る）" : lean === "ana" ? "荒れ寄り（穴を厚く）" : "バランス";
@@ -5217,10 +5325,10 @@ export default function App() {
           "本線": Math.max(0, Number(betLimits?.["本線"] ?? 0)),
           "対抗": Math.max(0, Number(betLimits?.["対抗"] ?? 0)),
           "穴": Math.max(0, Number(betLimits?.["穴"] ?? 0)),
-          "展開リハ": Math.max(0, Number(betLimits?.["展開リハ"] ?? 0)),
+          "展リハ": Math.max(0, Number(betLimits?.["展リハ"] ?? 0)),
         };
         const now = Date.now();
-        const recs = ["本線", "対抗", "穴", "展開リハ"].flatMap((label, index) => {
+        const recs = ["本線", "対抗", "穴", "展リハ"].flatMap((label, index) => {
           const source = sourceBets.find((b) => String(b?.label) === label);
           const limit = limits[label];
           const tickets = Array.isArray(source?.tickets)
@@ -5258,7 +5366,7 @@ export default function App() {
         if (recs.length) {
           await persistBets((prev) => {
             // このレースの旧一括記録は、本線・対抗・穴をまとめて完全置換する。
-            const batchLabels = new Set(["本線", "対抗", "穴", "展開リハ", "伏兵"]);
+            const batchLabels = new Set(["本線", "対抗", "穴", "展リハ", "展開リハ", "伏兵"]);
             const kept = prev.filter((r) => !(
               r?.batchRecorded
               && r?.date === targetDate
@@ -5527,7 +5635,7 @@ export default function App() {
   // ── 的中率の集計（結果が入っているレコードが対象） ──
   const hitStats = useMemo(() => {
     const judged = statFilter.recs.filter((r) => r.result && r.bets && r.bets.length);
-    const labels = ["本線", "対抗", "穴", "展開リハ"];
+    const labels = ["本線", "対抗", "穴", "展リハ"];
     const per = Object.fromEntries(labels.map((l) => [l, { hit: 0, total: 0 }]));
     let comboHit = 0;
     for (const r of judged) {
@@ -5594,9 +5702,9 @@ export default function App() {
       { key: "h_a", name: "本線＋穴", parts: ["本線", "穴"] },
       { key: "t_a", name: "対抗＋穴", parts: ["対抗", "穴"] },
       { key: "h_t_a", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
-      { key: "fuku", name: "展開リハ", parts: ["展開リハ"] },
-      { key: "h_f", name: "本線＋展開リハ", parts: ["本線", "展開リハ"] },
-      { key: "h_t_f", name: "本線＋対抗＋展開リハ", parts: ["本線", "対抗", "展開リハ"] },
+      { key: "fuku", name: "展リハ", parts: ["展リハ"] },
+      { key: "h_f", name: "本線＋展開リハ", parts: ["本線", "展リハ"] },
+      { key: "h_t_f", name: "本線＋対抗＋展開リハ", parts: ["本線", "対抗", "展リハ"] },
     ];
     const stats = {};
     for (const p of patterns) stats[p.key] = { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
@@ -5724,7 +5832,7 @@ export default function App() {
     //   solid = 堅いカード優先（本線→対抗→穴→展開リハ→シナリオ）
     //   ana = 穴寄り優先（展開リハ→穴→対抗→本線→シナリオ）
     const solidRank = (part) => {
-      const map = { "本線": 0, "対抗": 1, "穴": 2, "展開リハ": 3 };
+      const map = { "本線": 0, "対抗": 1, "穴": 2, "展リハ": 3 };
       if (part in map) return map[part];
       return 5; // シナリオは後ろ
     };
@@ -5800,7 +5908,7 @@ export default function App() {
       return;
     }
 
-    const labels = ["本線", "対抗", "穴", "展開リハ"];
+    const labels = ["本線", "対抗", "穴", "展リハ"];
     const lines = labels.flatMap((label, index) => {
       const source = aiEval.bets.find((b) => String(b?.label || "") === label);
       const max = Array.isArray(source?.tickets) ? source.tickets.length : 0;
@@ -5919,9 +6027,9 @@ export default function App() {
       "本線": Math.max(0, Number(betLimits?.["本線"] ?? 0)),
       "対抗": Math.max(0, Number(betLimits?.["対抗"] ?? 0)),
       "穴": Math.max(0, Number(betLimits?.["穴"] ?? 0)),
-      "展開リハ": Math.max(0, Number(betLimits?.["展開リハ"] ?? 0)),
+      "展リハ": Math.max(0, Number(betLimits?.["展リハ"] ?? 0)),
     };
-    if (!limits["本線"] && !limits["対抗"] && !limits["穴"] && !limits["展開リハ"]) {
+    if (!limits["本線"] && !limits["対抗"] && !limits["穴"] && !limits["展リハ"]) {
       setBatchBetStatus("本線・対抗・穴・展開リハの点数を1つ以上設定してください");
       return;
     }
@@ -5946,12 +6054,12 @@ export default function App() {
       b?.batchRecorded
       && b?.date === raceDate
       && b?.venue === venue
-      && ["本線", "対抗", "穴", "展開リハ", "伏兵"].includes(String(b?.label || ""))
+      && ["本線", "対抗", "穴", "展リハ", "展開リハ", "伏兵"].includes(String(b?.label || ""))
     )));
 
     setBatchBetProgress({ done: 0, total: targets.length, saved: 0, skipped: 0 });
     setBatchBetStatus(
-      `旧一括記録を削除して再作成中（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}・展開リハ${limits["展開リハ"]}／1点100円）`
+      `旧一括記録を削除して再作成中（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}・展開リハ${limits["展リハ"]}／1点100円）`
     );
     predictionSaveRef.current = "";
     setAiCaptureQueue(targets);
@@ -6086,7 +6194,7 @@ export default function App() {
   // 実際に記録したAI買い目を、単体・組み合わせ・開催場別で同じ判定関数に通す。
   const aiBetStats = useMemo(() => {
     // 超穴は廃止済みだが、過去に記録した履歴を集計から落とさないためラベルは残す。
-    const labels = ["本線", "対抗", "穴", "展開リハ", "伏兵", "超穴"];
+    const labels = ["本線", "対抗", "穴", "展リハ", "伏兵", "超穴"];
     const source = reliableStatBets
       .filter((b) => labels.includes(String(b?.label || "")));
     const byLabel = Object.fromEntries(
@@ -6097,7 +6205,7 @@ export default function App() {
       { name: "本線", labels: ["本線"] },
       { name: "対抗", labels: ["対抗"] },
       { name: "穴", labels: ["穴"] },
-      { name: "展開リハ", labels: ["展開リハ", "伏兵"] },
+      { name: "展リハ", labels: ["展リハ", "展開リハ", "伏兵"] },
       { name: "超穴（廃止）", labels: ["超穴"] },
       { name: "本線+対抗", labels: ["本線", "対抗"] },
       { name: "本線+穴", labels: ["本線", "穴"] },
@@ -7969,7 +8077,7 @@ export default function App() {
                         </div>
                         <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>
                           配分の目安：
-                          {["本線", "対抗", "穴", "展開リハ"].filter((k) => aiEval.recommend.alloc[k] > 0).map((k, i, arr) => (
+                          {["本線", "対抗", "穴", "展リハ"].filter((k) => aiEval.recommend.alloc[k] > 0).map((k, i, arr) => (
                             <span key={k}>{k} {aiEval.recommend.alloc[k]}点{i < arr.length - 1 ? " ／ " : ""}</span>
                           ))}
                         </div>
@@ -8022,7 +8130,7 @@ export default function App() {
                       {aiEval.bets.map((bet) => {
                         const color = bet.label === "本線" ? "#3d7ab8"
                           : bet.label === "対抗" ? "#5a9e2e"
-                          : bet.label === "展開リハ" ? "#9c5ec7" : "#b8893d";
+                          : bet.label === "展リハ" ? "#9c5ec7" : "#b8893d";
                         // 期間「被りのみ」モード: 本線〜展開リハを共通買い目だけに絞る
                         let baseTickets = bet.tickets;
                         if (cmpMode === "overlap" && periodCompare) {
@@ -8075,7 +8183,7 @@ export default function App() {
                                 )}
                               </span>
                             </div>
-                            {bet.label === "展開リハ" && Array.isArray(bet.gaps) && bet.gaps.length > 0 && (
+                            {bet.label === "展リハ" && Array.isArray(bet.gaps) && bet.gaps.length > 0 && (
                               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
                                 {bet.gaps.map((g) => (
                                   <span key={g.boat} style={{
@@ -8090,7 +8198,7 @@ export default function App() {
                                 ))}
                               </div>
                             )}
-                            {bet.label === "展開リハ" && (
+                            {bet.label === "展リハ" && (
                               <div style={{ fontSize: 10, color: "#8ea1b5", lineHeight: 1.6, marginBottom: 8 }}>
                                 ※総合1着率＝展開リハーサル1000回で、決まり手を問わずその艇が1着になった割合です。
                               </div>
@@ -8137,11 +8245,11 @@ export default function App() {
                           対象（最大4つまで選択）{cmpMode === "overlap" ? "・被り買い目から" : ""}
                         </div>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
-                          {["本線", "対抗", "穴", "展開リハ"]
+                          {["本線", "対抗", "穴", "展リハ"]
                             .filter((p) => aiEval.bets.some((b) => b.label === p))
                             .map((p) => {
                             const sel = pickerParts.includes(p);
-                            const c = p === "本線" ? "#3d7ab8" : p === "対抗" ? "#5a9e2e" : p === "展開リハ" ? "#9c5ec7" : "#b8893d";
+                            const c = p === "本線" ? "#3d7ab8" : p === "対抗" ? "#5a9e2e" : p === "展リハ" ? "#9c5ec7" : "#b8893d";
                             return (
                               <button
                                 key={p}
@@ -8422,10 +8530,10 @@ export default function App() {
                 的中率（結果入力済み {hitStats.judged} レース）
               </div>
               <div style={{ display: "grid", gap: 6 }}>
-                {["本線", "対抗", "穴", "展開リハ"].map((l) => {
+                {["本線", "対抗", "穴", "展リハ"].map((l) => {
                   const s = hitStats.per[l];
                   const rate = s.total ? (s.hit / s.total * 100).toFixed(1) : "—";
-                  const color = l === "本線" ? "#3d7ab8" : l === "対抗" ? "#5a9e2e" : l === "展開リハ" ? "#9c5ec7" : "#b8893d";
+                  const color = l === "本線" ? "#3d7ab8" : l === "対抗" ? "#5a9e2e" : l === "展リハ" ? "#9c5ec7" : "#b8893d";
                   return (
                     <div key={l} style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <span style={{
@@ -8527,7 +8635,7 @@ export default function App() {
                             const maxP = b.tickets.length;
                             if (!maxP) return null;
                             const cur = (r.betLimits && r.betLimits[b.label] != null) ? Math.min(r.betLimits[b.label], maxP) : maxP;
-                            const c = b.label === "本線" ? "#3d7ab8" : b.label === "対抗" ? "#5a9e2e" : b.label === "展開リハ" ? "#9c5ec7" : "#b8893d";
+                            const c = b.label === "本線" ? "#3d7ab8" : b.label === "対抗" ? "#5a9e2e" : b.label === "展リハ" ? "#9c5ec7" : "#b8893d";
                             return (
                               <span key={b.label} style={{ display: "flex", alignItems: "center", gap: 3 }}>
                                 <span style={{ color: c, fontWeight: 700 }}>{b.label}</span>
