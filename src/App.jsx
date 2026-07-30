@@ -4356,7 +4356,7 @@ export default function App() {
         }
       }
     }
-    const honmei = {
+    let honmei = {
       label: "本線",
       desc: "1着率1位を1着固定／2・3着は推定確率上位",
       tickets: honTickets,
@@ -4453,10 +4453,14 @@ export default function App() {
       } else if (c === 6 && kind === "まくり差し") {
         second = [1,5,4,3,2]; third = [5,1,4,3,2]; followers = [1,5]; note = "5の攻めを利用する6-15が基本";
       }
+      const secondBoats = coursesToBoats(second, headBoat);
+      const thirdBoats = coursesToBoats(third, headBoat);
       return {
         kind, course: c,
-        second: coursesToBoats(second, headBoat),
-        third: coursesToBoats(third, headBoat),
+        second: secondBoats,
+        third: thirdBoats,
+        baseSecond: [...secondBoats],
+        baseThird: [...thirdBoats],
         blockedSecond: coursesToBoats(blockedSecond, headBoat),
         followers: coursesToBoats(followers, headBoat),
         note,
@@ -4544,7 +4548,9 @@ export default function App() {
         thirdRank,
         secondPromoted: sec.promoted,
         thirdPromoted: third.promoted,
-        reasons: [...sec.reasons, ...third.reasons, ...blockedNotes],
+        // 説明文では2着順位の実移動だけを「昇格」と表記する。
+        // 3着内の並び替えは買い目へ反映するが、基本筋の艇を誤って昇格扱いしない。
+        reasons: [...sec.reasons, ...blockedNotes],
       };
     };
 
@@ -4596,6 +4602,84 @@ export default function App() {
       scenarioHeads.splice(3); // 頭は最大3艇まで
     }
 
+    const hasUsableProbMap = probMap && Object.values(probMap).some((p) => Number.isFinite(Number(p)) && Number(p) > 0);
+
+    // シナリオ順位を使った買い目候補生成。
+    // 昇格艇を入れても、元の基本筋（特に追走艇）が全消しにならないよう
+    // baseSecond / baseThird の上位艇をアンカーとして必ず候補へ残す。
+    const scenarioTicketCandidates = (head, sc, cap = 24, mode = "balanced") => {
+      const out = [];
+      const push = (second, third) => {
+        if (!second || !third || second === head || third === head || second === third) return;
+        const t = `${head}-${second}-${third}`;
+        if (!out.includes(t)) out.push(t);
+      };
+      const baseSecondTop = (sc.baseSecond || sc.secondRank || []).slice(0, 2);
+      const baseThirdTop = (sc.baseThird || sc.thirdRank || []).slice(0, 3);
+      const dynamicSecond = (sc.secondRank || []).slice(0, mode === "solid" ? 2 : 3);
+      const dynamicThird = (sc.thirdRank || []).slice(0, mode === "solid" ? 3 : 4);
+
+      // 基本筋の核を先に確保。3まくりなら 3-1-4 / 3-4-1 が候補から消えない。
+      for (const second of baseSecondTop) {
+        for (const third of baseThirdTop) push(second, third);
+      }
+      // 2勝ルールで昇格した艇と基本筋を組み合わせる。
+      for (const second of dynamicSecond) {
+        const thirds = [...new Set([...dynamicThird, ...baseThirdTop])];
+        for (const third of thirds) push(second, third);
+      }
+      // 基本2着艇に昇格した3着候補も組み合わせる。
+      for (const second of baseSecondTop) {
+        for (const third of dynamicThird) push(second, third);
+      }
+      return out.slice(0, cap);
+    };
+
+    const scenarioCache = new Map();
+    const getScenario = (head) => {
+      if (!scenarioCache.has(head)) scenarioCache.set(head, scenarioRanksForHead(head));
+      return scenarioCache.get(head);
+    };
+
+    const ticketScenarioFit = (ticket) => {
+      const [head, second, third] = String(ticket || "").split("-").map(Number);
+      if (![head, second, third].every(Number.isFinite)) return -999;
+      const sc = getScenario(head);
+      const blocked = new Set(sc.blockedSecond || []);
+      if (blocked.has(second)) return -999;
+      const sIdx = sc.secondRank.indexOf(second);
+      const tIdx = sc.thirdRank.indexOf(third);
+      if (sIdx < 0 || tIdx < 0) return -999;
+      let fit = 12 - sIdx * 2 - tIdx;
+      if ((sc.baseSecond || []).slice(0,2).includes(second)) fit += 3;
+      if ((sc.baseThird || []).slice(0,3).includes(third)) fit += 2;
+      if ((sc.secondPromoted || []).includes(second)) fit += 2;
+      return fit;
+    };
+
+    // 本線も主シナリオへ接続。頭は従来どおり1着率1位で固定し、
+    // 2・3着だけを決まり手別の基本筋＋2勝ルールで組み直す。
+    if (honHead) {
+      const honSc = getScenario(honHead);
+      const honScenarioCandidates = scenarioTicketCandidates(honHead, honSc, 24, "solid");
+      const honSorted = hasUsableProbMap
+        ? [...honScenarioCandidates].sort((a,b) => {
+            const pd = probOf(b) - probOf(a);
+            if (Math.abs(pd) > 1e-12) return pd;
+            return ticketScenarioFit(b) - ticketScenarioFit(a);
+          })
+        : [...honScenarioCandidates].sort((a,b) => ticketScenarioFit(b) - ticketScenarioFit(a));
+      const nextHon = honSorted.slice(0, HON_TARGET);
+      if (nextHon.length >= HON_MIN) {
+        honmei = {
+          label: "本線",
+          desc: `1着率1位を1着固定／${honSc.kind}の基本筋＋2勝ルールで2・3着選定`,
+          tickets: nextHon,
+          scenarioEngine: [honSc],
+        };
+      }
+    }
+
     // 対抗：決まり手別シナリオエンジンで2・3着を組み立てる。
     // 頭候補は1着率2位＋展開濃厚艇。本線との重複は除外する。
     const honSet = new Set(honmei.tickets);
@@ -4606,26 +4690,19 @@ export default function App() {
     };
     const a1 = r1[0], a2 = r1[1];
     const taikouHeads = [...new Set([a2, ...scenarioHeads].filter(Boolean))];
-    const hasUsableProbMap = probMap && Object.values(probMap).some((p) => Number.isFinite(Number(p)) && Number(p) > 0);
     const engineDetails = [];
     const TK_MAX = 12;
 
     for (const head of taikouHeads) {
       if (taikouTickets.length >= TK_MAX) break;
-      const sc = scenarioRanksForHead(head);
+      const sc = getScenario(head);
       const quota = Math.max(3, Math.floor(TK_MAX / Math.max(1, taikouHeads.length)));
       let added = 0;
 
       // シナリオ筋を先に確保する。
       // 2着へ昇格した艇には、3着基本上位を複数組み合わせて
       // 「昇格艇の1点だけ」にならないようにする。
-      const priority = [];
-      const primarySeconds = sc.secondRank.slice(0, 2);
-      for (const second of primarySeconds) {
-        const thirdLimit = sc.secondPromoted?.includes(second) ? 3 : 2;
-        const thirds = sc.thirdRank.filter((b) => b !== second).slice(0, thirdLimit);
-        for (const third of thirds) priority.push(`${head}-${second}-${third}`);
-      }
+      const priority = scenarioTicketCandidates(head, sc, 12, "balanced");
       for (const t of priority) {
         if (added >= quota || taikouTickets.length >= TK_MAX) break;
         const before = taikouTickets.length;
@@ -4663,8 +4740,8 @@ export default function App() {
     }
 
     const detailText = engineDetails.slice(0, 2).map((d) => {
-      const move = d.reasons.length ? `／${d.reasons.slice(0, 2).join("、")}` : "";
-      return `${d.head}号艇${d.kind}：2着${d.secondRank.slice(0,3).join("・")}、3着${d.thirdRank.slice(0,4).join("・")}（${d.note}）${move}`;
+      const move = d.reasons.length ? `／${d.reasons.slice(0, 1).join("、")}` : "";
+      return `${d.head}号艇${d.kind}：2着${d.secondRank.slice(0,3).join("・")}、3着${d.thirdRank.slice(0,3).join("・")}（${d.note}）${move}`;
     }).join("／");
     const taikou = {
       label: "対抗",
@@ -4737,10 +4814,16 @@ export default function App() {
       const excluded = new Set([...honmei.tickets, ...taikou.tickets]);
       const hasOdds = odds && Object.values(odds).some((o) => Number.isFinite(Number(o)) && Number(o) > 0);
       const evCandidates = hasOdds
-        ? sortByEv(all120.filter((t) => {
+        ? all120.filter((t) => {
             const o = Number(odds?.[t]);
-            return !excluded.has(t) && Number.isFinite(o) && o >= 20 && probOf(t) * o >= 1.0;
-          }))
+            return !excluded.has(t)
+              && ticketScenarioFit(t) >= 6
+              && Number.isFinite(o) && o >= 20 && probOf(t) * o >= 1.0;
+          }).sort((a,b) => {
+            const evDiff = (probOf(b) * Number(odds?.[b] || 0)) - (probOf(a) * Number(odds?.[a] || 0));
+            if (Math.abs(evDiff) > 1e-12) return evDiff;
+            return ticketScenarioFit(b) - ticketScenarioFit(a);
+          })
         : [];
 
       let tickets = evCandidates.slice(0, 12);
@@ -4754,7 +4837,9 @@ export default function App() {
       } else {
         // 従来の妙味艇ロジックへフォールバックし、カードが空になるのを防ぐ。
         const legacy = [];
-        const pushU = (t) => { if (t && !legacy.includes(t) && !excluded.has(t)) legacy.push(t); };
+        const pushU = (t) => {
+          if (t && ticketScenarioFit(t) >= 5 && !legacy.includes(t) && !excluded.has(t)) legacy.push(t);
+        };
         if (meritBoats.length > 0) {
           const fillers = [...new Set([...order.slice(0, 3), ...meritBoats])];
           for (const m of meritBoats) {
@@ -4791,7 +4876,7 @@ export default function App() {
           : `EV条件該当なしのため評価2・3位頭の中穴へフォールバック`;
       }
 
-      ana = { label: "穴", desc, tickets };
+      ana = { label: "穴", desc: `シナリオ整合性を満たす買い目から選定／${desc}`, tickets };
     }
 
     // 合成オッズ（オッズ貼り付け時）= 1 ÷ Σ(1/各点オッズ)
@@ -4805,7 +4890,7 @@ export default function App() {
 
     // ── 展開リハ（展リハ発の「拾えていない買い目」） ──
     //
-    //   本線・対抗・穴はいずれも「どの艇が強いか」の総合評価から組む。
+    //   本線・対抗・穴もシナリオ整合性を使うが、展リハはリハーサルで拾えた別頭を専用テンプレートで補完する。
     //   そのため、展開リハーサル（今日のST・進入・評価で1000回試走した結果）で
     //   頭に来やすい艇でも、総合評価が低いと3カードのどこにも頭として現れないことがある。
     //   （例: リハーサルで頭率19%の4号艇が、本線〜穴で1点も頭になっていない）
@@ -4855,8 +4940,9 @@ export default function App() {
       if (gaps.length > 0) {
         const per = gaps.length >= 2 ? 6 : FUKU_MAX;
         for (const g of gaps) {
-          const others = [1, 2, 3, 4, 5, 6].filter((b) => b !== g.boat);
-          const cand = buildTickets([g.boat], others, others, 20).filter((t) => !coveredSet.has(t));
+          const sc = getScenario(g.boat);
+          const cand = scenarioTicketCandidates(g.boat, sc, 24, "balanced")
+            .filter((t) => !coveredSet.has(t) && ticketScenarioFit(t) >= 5);
           // オッズがあるときは「EV1.0以上」に絞ってから確率上位を採る。
           //   単純なEV降順だと最も人気の無い目ばかりになり、拾いの意味が薄れるため。
           const evOk = hasOdds
