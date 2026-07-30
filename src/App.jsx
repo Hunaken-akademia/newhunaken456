@@ -4539,6 +4539,80 @@ export default function App() {
       };
     };
 
+    // まくり差しの「壁ST後手」を評価する。
+    // 攻め艇の直内艇が0.03以上遅い、または全艇でST下位2艇なら壁が弱いとみなす。
+    const makurizashiWallState = (headBoat) => {
+      const attackCourse = Number(courseByBoat[headBoat]);
+      if (!slit || attackCourse < 3 || attackCourse > 5) return null;
+      const wallBoat = boatByCourse[attackCourse - 1];
+      const headSt = Number(slit.find((x) => Number(x.boat) === Number(headBoat))?.st);
+      const wallSt = Number(slit.find((x) => Number(x.boat) === Number(wallBoat))?.st);
+      if (!Number.isFinite(headSt) || !Number.isFinite(wallSt)) return null;
+      const stSlowOrder = [...slit]
+        .filter((x) => Number.isFinite(Number(x.st)))
+        .sort((a, b) => Number(b.st) - Number(a.st))
+        .map((x) => Number(x.boat));
+      const delta = wallSt - headSt;
+      const late = delta >= 0.03 || stSlowOrder.slice(0, 2).includes(Number(wallBoat));
+      return { attackCourse, wallBoat, headSt, wallSt, delta, late };
+    };
+
+    // まくり差しは基本の内残り筋を守り、直内艇のSTが遅い時だけ外艇を拾う。
+    // ・外艇の3着追加: 壁ST後手＋壁艇に3指標中2勝、または総合評価3位以内
+    // ・外艇の2着昇格: 壁ST後手＋総合評価2位以内＋内の上位候補2艇に2勝
+    const applyMakurizashiWallPolicy = (tpl, secondOrder, thirdOrder) => {
+      if (tpl.kind !== "まくり差し") {
+        return { secondOrder: [...secondOrder], thirdOrder: [...thirdOrder], secondExceptional: [], thirdPromoted: [], notes: [] };
+      }
+      const wall = makurizashiWallState(boatByCourse[tpl.course]);
+      if (!wall?.late) {
+        return { secondOrder: [...secondOrder], thirdOrder: [...thirdOrder], secondExceptional: [], thirdPromoted: [], notes: [] };
+      }
+
+      const sec = [...secondOrder];
+      const third = [...thirdOrder];
+      const secondExceptional = [];
+      const thirdPromoted = [];
+      const notes = [];
+      const overallRankOf = (boat) => {
+        const idx = ranked.findIndex((r) => Number(r.boat) === Number(boat));
+        return idx >= 0 ? idx + 1 : 99;
+      };
+      const outerCourses = [];
+      for (let c = tpl.course + 1; c <= Math.min(6, tpl.course + 2); c++) outerCourses.push(c);
+      const outerBoats = outerCourses.map((c) => boatByCourse[c]).filter(Boolean);
+      const innerBenchmarks = sec
+        .filter((b) => Number(courseByBoat[b]) < Number(tpl.course))
+        .slice(0, 3);
+
+      for (const boat of outerBoats) {
+        const wallWins = metricWins(boat, wall.wallBoat);
+        const rank = overallRankOf(boat);
+        const keepThird = wallWins.count >= 2 || rank <= 3;
+        if (keepThird) {
+          const i = third.indexOf(boat);
+          if (i >= 0) third.splice(i, 1);
+          const insertAt = Math.min(2 + thirdPromoted.length, third.length);
+          third.splice(insertAt, 0, boat);
+          thirdPromoted.push(boat);
+          notes.push(`${wall.wallBoat}号艇のST後手（${wall.wallSt.toFixed(2)}／攻め艇${wall.headSt.toFixed(2)}）で外の${boat}号艇が展開を拾い、3着候補へ昇格`);
+        }
+
+        const beaten = innerBenchmarks.filter((b) => metricWins(boat, b).count >= 2);
+        const exceptional = rank <= 2 && beaten.length >= Math.min(2, innerBenchmarks.length) && innerBenchmarks.length > 0;
+        if (exceptional) {
+          const i = sec.indexOf(boat);
+          if (i >= 0) sec.splice(i, 1);
+          const beatenIdx = beaten.map((b) => sec.indexOf(b)).filter((i) => i >= 0);
+          const insertAt = beatenIdx.length ? Math.min(...beatenIdx) : Math.min(1, sec.length);
+          sec.splice(insertAt, 0, boat);
+          secondExceptional.push(boat);
+          notes.push(`${boat}号艇は壁ST後手に加え総合評価上位・3項目で内艇を上回るため2着へ例外昇格`);
+        }
+      }
+      return { secondOrder: sec, thirdOrder: third, secondExceptional, thirdPromoted, notes };
+    };
+
     const rankByTwoOfThree = (base, blocked = []) => {
       const original = [...base];
       const arr = [...base];
@@ -4568,6 +4642,74 @@ export default function App() {
         return `${boat}号艇が${detail.won.join("・")}で${detail.upper}号艇を上回り昇格`;
       });
       return { order: arr, reasons, promoted };
+    };
+
+    // まくりで叩かれる内艇は「一律除外」ではなく、当日の強さで扱いを変える。
+    // ・低評価: 2着/3着とも除外
+    // ・中評価: 3着だけ残す
+    // ・突出: 3項目中2勝以上＋総合評価上位なら2着へ例外昇格
+    const applyCrushedBoatPolicy = (tpl, secResult, thirdResult) => {
+      const blocked = [...new Set(tpl.blockedSecond || [])];
+      const secondOrder = [...(secResult.order || [])];
+      const thirdBase = [...(thirdResult.order || [])];
+      const secondExceptional = [];
+      const thirdAllowed = [];
+      const thirdExcluded = [];
+      const notes = [];
+
+      const overallRankOf = (boat) => {
+        const idx = ranked.findIndex((r) => r.boat === boat);
+        return idx >= 0 ? idx + 1 : 99;
+      };
+      const overallScoreOf = (boat) => Number(ranked.find((r) => r.boat === boat)?.score || 0);
+
+      for (const boat of blocked) {
+        const benchmarks = secondOrder.filter((b) => b !== boat && !blocked.includes(b)).slice(0, 3);
+        const beaten = benchmarks.filter((b) => metricWins(boat, b).count >= 2);
+        const rank = overallRankOf(boat);
+        const score = overallScoreOf(boat);
+        const benchmarkScores = benchmarks.map(overallScoreOf).filter(Number.isFinite);
+        const avgBenchmark = benchmarkScores.length
+          ? benchmarkScores.reduce((a, b) => a + b, 0) / benchmarkScores.length
+          : 0;
+
+        // 3着は「基本流し」。ただし総合評価下位かつ内訳でも勝てない艇だけ切る。
+        const keepThird = rank <= 4 || beaten.length >= 1 || score >= avgBenchmark - 3;
+        if (keepThird) {
+          thirdAllowed.push(boat);
+          notes.push(`${boat}号艇は叩かれる想定だが評価が残るため3着候補に維持`);
+        } else {
+          thirdExcluded.push(boat);
+          notes.push(`${boat}号艇は叩かれる想定かつ総合評価・内訳とも低く3着候補から除外`);
+        }
+
+        // 2着への例外昇格は厳格。総合評価2位以内かつ上位候補2艇以上に2勝。
+        const exceptional = rank <= 2 && beaten.length >= Math.min(2, benchmarks.length);
+        if (exceptional && benchmarks.length) {
+          const current = secondOrder.indexOf(boat);
+          if (current >= 0) secondOrder.splice(current, 1);
+          const beatenIdx = beaten
+            .map((b) => secondOrder.indexOf(b))
+            .filter((i) => i >= 0);
+          const insertAt = beatenIdx.length ? Math.min(...beatenIdx) : Math.min(1, secondOrder.length);
+          secondOrder.splice(insertAt, 0, boat);
+          secondExceptional.push(boat);
+          notes.push(`${boat}号艇は叩かれる想定だが総合評価上位かつ3項目で突出し2着へ例外昇格`);
+        }
+      }
+
+      const thirdOrder = [
+        ...thirdBase.filter((b) => !thirdExcluded.includes(b)),
+        ...thirdBase.filter((b) => thirdExcluded.includes(b)),
+      ];
+      return {
+        secondOrder,
+        thirdOrder,
+        secondExceptional,
+        thirdAllowed,
+        thirdExcluded,
+        notes,
+      };
     };
 
     const kindOfHead = (headBoat) => {
@@ -4620,45 +4762,53 @@ export default function App() {
           };
         }
       }
-      const blockedSecondSet = new Set(tpl.blockedSecond || []);
-      const resistanceSecond = applyResistanceToSecond(sec.order, headBoat, kind, blockedSecondSet);
       const third = rankByTwoOfThree(tpl.third, []);
-
-      // まくりで直内から叩かれる艇は、2着では原則ブロック。
-      // 3着は「モーター・平均ST・コース別成績」のうち2項目以上で、
-      // 基本上位の非ブロック艇を上回った場合だけ上位候補へ復活させる。
-      const blockedSet = new Set(tpl.blockedSecond || []);
-      const thirdAllowed = new Set();
-      for (const boat of blockedSet) {
-        // 叩かれる艇の3着復活は厳格にする。基本上位の非ブロック艇のうち
-        // 上位3艇と比較し、少なくとも2艇に対して3項目中2勝以上した場合だけ許可。
-        const benchmarks = tpl.third
-          .filter((b) => b !== boat && !blockedSet.has(b))
-          .slice(0, 3);
-        const winsAgainst = benchmarks.filter((b) => metricWins(boat, b).count >= 2);
-        const required = Math.min(2, benchmarks.length);
-        if (required > 0 && winsAgainst.length >= required) thirdAllowed.add(boat);
-      }
-      const thirdRankBase = [
-        ...third.order.filter((b) => !blockedSet.has(b) || thirdAllowed.has(b)),
-        ...third.order.filter((b) => blockedSet.has(b) && !thirdAllowed.has(b)),
-      ];
-      const resistanceThird = applyResistanceToThird(thirdRankBase, headBoat, kind, blockedSet, thirdAllowed);
-      const thirdRank = resistanceThird.order;
-      const blockedNotes = [...blockedSet]
-        .filter((b) => !thirdAllowed.has(b))
-        .map((b) => `${b}号艇は叩かれる想定のため3着上位から降格`);
+      const crushed = applyCrushedBoatPolicy(tpl, sec, third);
+      const wallPolicy = applyMakurizashiWallPolicy(tpl, crushed.secondOrder, crushed.thirdOrder);
+      const allSecondExceptional = [...new Set([
+        ...(crushed.secondExceptional || []),
+        ...(wallPolicy.secondExceptional || []),
+      ])];
+      const effectiveBlockedSet = new Set(
+        (tpl.blockedSecond || []).filter((b) => !allSecondExceptional.includes(b))
+      );
+      const resistanceSecond = applyResistanceToSecond(
+        wallPolicy.secondOrder,
+        headBoat,
+        kind,
+        effectiveBlockedSet
+      );
+      const thirdAllowed = new Set(crushed.thirdAllowed || []);
+      const resistanceThird = applyResistanceToThird(
+        wallPolicy.thirdOrder,
+        headBoat,
+        kind,
+        new Set(tpl.blockedSecond || []),
+        thirdAllowed
+      );
+      const thirdRank = resistanceThird.order
+        .filter((b) => !(crushed.thirdExcluded || []).includes(b));
 
       return {
         ...tpl,
         secondRank: resistanceSecond.order,
         thirdRank,
         thirdAllowed: [...thirdAllowed],
-        secondPromoted: [...new Set([...(sec.promoted || []), ...(resistanceSecond.promoted || [])])],
-        thirdPromoted: third.promoted,
-        // 説明文では2着順位の実移動だけを「昇格」と表記する。
-        // 3着内の並び替えは買い目へ反映するが、基本筋の艇を誤って昇格扱いしない。
-        reasons: [...new Set([...(sec.reasons || []), ...resistanceSecond.notes, ...blockedNotes, ...resistanceThird.notes])],
+        thirdExcluded: [...(crushed.thirdExcluded || [])],
+        secondExceptional: allSecondExceptional,
+        secondPromoted: [...new Set([
+          ...(sec.promoted || []),
+          ...(resistanceSecond.promoted || []),
+          ...allSecondExceptional,
+        ])],
+        thirdPromoted: [...new Set([...(third.promoted || []), ...(wallPolicy.thirdPromoted || [])])],
+        reasons: [...new Set([
+          ...(sec.reasons || []),
+          ...(crushed.notes || []),
+          ...(wallPolicy.notes || []),
+          ...resistanceSecond.notes,
+          ...resistanceThird.notes,
+        ])],
         resistanceNotes: [...new Set([...resistanceSecond.notes, ...resistanceThird.notes])],
       };
     };
@@ -4720,7 +4870,7 @@ export default function App() {
       const out = [];
       const push = (second, third) => {
         if (!second || !third || second === head || third === head || second === third) return;
-        if ((sc.blockedSecond || []).includes(second)) return;
+        if ((sc.blockedSecond || []).includes(second) && !(sc.secondExceptional || []).includes(second)) return;
         const t = `${head}-${second}-${third}`;
         if (!out.includes(t)) out.push(t);
       };
@@ -4729,38 +4879,36 @@ export default function App() {
       const baseThird = uniq(sc.baseThird || sc.thirdRank || []);
       const promotedSecond = uniq(sc.secondPromoted || []);
       const promotedThird = uniq(sc.thirdPromoted || []);
-      const blocked = new Set(sc.blockedSecond || []);
+      const exceptionalSecond = new Set(sc.secondExceptional || []);
+      const blocked = new Set((sc.blockedSecond || []).filter((b) => !exceptionalSecond.has(b)));
       const thirdAllowed = new Set(sc.thirdAllowed || []);
-      const safeThird = (xs) => uniq(xs).filter((b) => !blocked.has(b) || thirdAllowed.has(b));
+      const thirdExcluded = new Set(sc.thirdExcluded || []);
+      const safeThird = (xs) => uniq(xs).filter(
+        (b) => !thirdExcluded.has(b) && (!blocked.has(b) || thirdAllowed.has(b))
+      );
 
-      // まくり差しは「内を突く展開」なので、外の追走艇を2着へ広げない。
-      // 3Cなら1・2、4Cなら1・2、5Cなら残った内艇、6Cなら1・5を中心にする。
+      // まくり差しは基本の内残り筋を軸にする。
+      // ただし直内艇のSTが遅い場合は、壁の外側が展開を拾って3着へ入り、
+      // 総合評価と3指標が突出した艇だけ2着へ例外昇格する。
       if (sc.kind === "まくり差し") {
         const innerBase = baseSecond.filter((b) => Number(courseByBoat[b]) < Number(sc.course));
-        const secondCore = uniq((innerBase.length ? innerBase : baseSecond).slice(0, 2));
+        const exceptionalOuter = uniq(sc.secondExceptional || [])
+          .filter((b) => Number(courseByBoat[b]) > Number(sc.course));
+        const secondCore = uniq([
+          ...(innerBase.length ? innerBase.slice(0, 2) : baseSecond.slice(0, 2)),
+          ...exceptionalOuter,
+        ]);
+        const promotedOuterThird = uniq(sc.thirdPromoted || [])
+          .filter((b) => Number(courseByBoat[b]) > Number(sc.course));
         const thirdCore = safeThird([
           ...baseThird.slice(0, 2),
-          ...promotedThird.filter((b) => Number(courseByBoat[b]) < Number(sc.course)),
-          ...baseThird.slice(2, 4),
+          ...promotedOuterThird,
+          ...(sc.thirdRank || []).slice(0, 5),
         ]);
         for (const second of secondCore) {
           for (const third of thirdCore) push(second, third);
         }
         return out.slice(0, cap);
-      }
-
-      // 3コースまくり差しは3-12中心。外艇は3着でも2勝昇格または耐性補正時だけ追加する。
-      if (sc.kind === "まくり差し" && Number(sc.course) === 3) {
-        const c1 = boatByCourse[1], c2 = boatByCourse[2];
-        const extraThird = safeThird(uniq(promotedThird))
-          .filter((b) => ![c1, c2].includes(b));
-        push(c1, c2);
-        push(c2, c1);
-        for (const x of extraThird.slice(0, 1)) {
-          push(c1, x);
-          push(c2, x);
-        }
-        return out.slice(0, Math.min(cap, 4));
       }
 
       // 5・6コースまくりは2着基本筋を固定し、総流しにしない。
@@ -4779,9 +4927,8 @@ export default function App() {
         return out.slice(0, Math.min(cap, 6));
       }
 
-      // 4コースまくりは、5Cと6Cの直接比較結果を4点時にもそのまま反映する。
-      // 6Cが5Cに2勝以上なら、先頭4点は 4-6-1 / 4-6-5 / 4-1-6 / 4-1-5。
-      // 5Cが上なら、4-5-1 / 4-5-6 / 4-1-5 / 4-1-6 の順にする。
+      // 4コースまくりは2着順位を優先し、3着は評価で残った艇へ広く流す。
+      // 叩かれる2・3Cは低評価なら切り、中評価なら3着、突出時のみ2着へ例外昇格。
       if (sc.kind === "まくり" && Number(sc.course) === 4) {
         const c1 = boatByCourse[1];
         const c5 = boatByCourse[5];
@@ -4790,12 +4937,19 @@ export default function App() {
         const i6 = (sc.secondRank || []).indexOf(c6);
         const outerTop = i6 >= 0 && i5 >= 0 && i6 < i5 ? c6 : c5;
         const outerOther = outerTop === c6 ? c5 : c6;
-        push(outerTop, c1);
-        push(outerTop, outerOther);
-        push(c1, outerTop);
-        push(c1, outerOther);
-        push(outerOther, c1);
-        push(outerOther, outerTop);
+        const secondCore = uniq([
+          ...(sc.secondRank || []),
+          outerTop,
+          c1,
+          outerOther,
+          ...(sc.secondExceptional || []),
+        ]).filter((b) => b && !blocked.has(b));
+        const thirdPool = safeThird(sc.thirdRank || []);
+
+        // 少点数では最上位2着候補から3着へ流し、点数増加で次の2着候補へ広げる。
+        for (const second of secondCore) {
+          for (const third of thirdPool) push(second, third);
+        }
         return out.slice(0, cap);
       }
 
@@ -4884,28 +5038,46 @@ export default function App() {
           };
         }
       }
-        const blockedSet = new Set(tpl.blockedSecond || []);
-        const resistanceSecond = applyResistanceToSecond(sec.order, head, tpl.kind, blockedSet);
         const third = rankByTwoOfThree(tpl.third, []);
-        const thirdAllowed = new Set();
-        for (const boat of blockedSet) {
-          const benchmarks = tpl.third
-            .filter((b) => b !== boat && !blockedSet.has(b))
-            .slice(0, 3);
-          const winsAgainst = benchmarks.filter((b) => metricWins(boat, b).count >= 2);
-          const required = Math.min(2, benchmarks.length);
-          if (required > 0 && winsAgainst.length >= required) thirdAllowed.add(boat);
-        }
-        const thirdRankBase = [
-          ...third.order.filter((b) => !blockedSet.has(b) || thirdAllowed.has(b)),
-          ...third.order.filter((b) => blockedSet.has(b) && !thirdAllowed.has(b)),
-        ];
-        const resistanceThird = applyResistanceToThird(thirdRankBase, head, tpl.kind, blockedSet, thirdAllowed);
-        const thirdRank = resistanceThird.order;
+        const crushed = applyCrushedBoatPolicy(tpl, sec, third);
+        const effectiveBlockedSet = new Set(
+          (tpl.blockedSecond || []).filter((b) => !crushed.secondExceptional.includes(b))
+        );
+        const resistanceSecond = applyResistanceToSecond(
+          crushed.secondOrder,
+          head,
+          tpl.kind,
+          effectiveBlockedSet
+        );
+        const thirdAllowed = new Set(crushed.thirdAllowed || []);
+        const resistanceThird = applyResistanceToThird(
+          crushed.thirdOrder,
+          head,
+          tpl.kind,
+          new Set(tpl.blockedSecond || []),
+          thirdAllowed
+        );
+        const thirdRank = resistanceThird.order
+          .filter((b) => !(crushed.thirdExcluded || []).includes(b));
         scenarioCache.set(key, {
-          ...tpl, secondRank: resistanceSecond.order, thirdRank, thirdAllowed: [...thirdAllowed],
-          secondPromoted: [...new Set([...(sec.promoted || []), ...(resistanceSecond.promoted || [])])], thirdPromoted: third.promoted,
-          reasons: [...new Set([...(sec.reasons || []), ...resistanceSecond.notes, ...resistanceThird.notes])],
+          ...tpl,
+          secondRank: resistanceSecond.order,
+          thirdRank,
+          thirdAllowed: [...thirdAllowed],
+          thirdExcluded: [...(crushed.thirdExcluded || [])],
+          secondExceptional: [...(crushed.secondExceptional || [])],
+          secondPromoted: [...new Set([
+            ...(sec.promoted || []),
+            ...(resistanceSecond.promoted || []),
+            ...(crushed.secondExceptional || []),
+          ])],
+          thirdPromoted: third.promoted,
+          reasons: [...new Set([
+            ...(sec.reasons || []),
+            ...(crushed.notes || []),
+            ...resistanceSecond.notes,
+            ...resistanceThird.notes,
+          ])],
           resistanceNotes: [...new Set([...resistanceSecond.notes, ...resistanceThird.notes])],
         });
       }
@@ -4928,7 +5100,9 @@ export default function App() {
       const [head, second, third] = String(ticket || "").split("-").map(Number);
       if (![head, second, third].every(Number.isFinite)) return -999;
       const sc = getScenario(head);
-      const blocked = new Set(sc.blockedSecond || []);
+      const blocked = new Set(
+        (sc.blockedSecond || []).filter((b) => !(sc.secondExceptional || []).includes(b))
+      );
       if (blocked.has(second)) return -999;
       const sIdx = sc.secondRank.indexOf(second);
       const tIdx = sc.thirdRank.indexOf(third);
@@ -5450,7 +5624,37 @@ export default function App() {
       }
       top.sort((a, b) => b.score - a.score);
 
-      scenarios = top.map((c) => {
+      // シナリオ信頼度（的中確率ではなく、展開の根拠がどれだけ揃っているかの目安）
+      // ・ブレンドスコア：場の決まり手傾向＋当日の展開リハ
+      // ・上位シナリオとの差：候補同士の抜け具合
+      // ・一致度：決まり手傾向と展開リハが同じ方向を向いているか
+      // 以上を0〜95点に収め、星1〜5へ変換する。
+      const scenarioConfidence = (c, index) => {
+        const nextScore = top[index + 1]?.score ?? c.score;
+        const gap = Math.max(0, c.score - nextScore);
+        const hasPrior = Number(c.prior) > 0;
+        const hasReh = c.reh != null && Number(c.reh) > 0;
+        const agreement = hasPrior && hasReh
+          ? Math.max(0, 10 - Math.abs(Number(c.prior) - Number(c.reh)) * 0.25)
+          : 0;
+        const dualSourceBonus = hasPrior && hasReh ? 8 : 0;
+        const singleSourcePenalty = hasPrior && hasReh ? 0 : 6;
+        const raw = 28
+          + Number(c.score || 0) * 0.62
+          + gap * 0.28
+          + agreement
+          + dualSourceBonus
+          - singleSourcePenalty;
+        const value = Math.max(20, Math.min(95, Math.round(raw)));
+        const stars = value >= 82 ? 5
+          : value >= 67 ? 4
+          : value >= 52 ? 3
+          : value >= 37 ? 2
+          : 1;
+        return { value, stars };
+      };
+
+      scenarios = top.map((c, scenarioIndex) => {
         const head = c.boat;
         // シナリオ表示も本線〜展リハと同じ専用テンプレートを使う。
         // これにより、3まくりの2号艇除外、3まくり差しの3-12中心、5まくりの5-16固定が揃う。
@@ -5487,11 +5691,14 @@ export default function App() {
             ? `1号艇の${rateTxt}。1号艇先マイから気配上位へ`
             : `${head}号艇の${rateTxt}。外から${c.type}が決まる展開`;
         }
+        const confidence = scenarioConfidence(c, scenarioIndex);
         return {
           type: c.type, boat: head, rate: c.rate,
           reh: c.reh != null ? round1(c.reh) : null,   // 展開リハーサル出現率(%)
           prior: round1(c.prior),                       // 決まり手率ベースのシェア(%)
           blend: round1(c.score),                       // ブレンド後スコア
+          confidence: confidence.value,
+          confidenceStars: confidence.stars,
           label,
           desc,
           tickets,
@@ -8517,6 +8724,15 @@ export default function App() {
                                           fontVariantNumeric: "tabular-nums",
                                         }}>リハ {safeFixed(sc.reh, 1)}%</span>
                                       )}
+                                      {Number.isFinite(Number(sc.confidence)) && (
+                                        <span style={{
+                                          fontSize: 11, fontWeight: 900, color: sc.confidence >= 67 ? "#5dd39e" : sc.confidence >= 52 ? "#f5c518" : "#9db5cc",
+                                          background: "#14263a", borderRadius: 6, padding: "2px 8px",
+                                          fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap",
+                                        }}>
+                                          信頼度 {"★".repeat(sc.confidenceStars || 1)}{"☆".repeat(Math.max(0, 5 - (sc.confidenceStars || 1)))} {sc.confidence}
+                                        </span>
+                                      )}
                                     </span>
                                   </div>
                                   <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>{sc.desc}</div>
@@ -8544,7 +8760,7 @@ export default function App() {
                             })}
                             <div style={{ fontSize: 10, color: "#5e7a92", lineHeight: 1.6 }}>
                               ※ 「◯◯率」＝その場の決まり手率（平均的な傾向）、「リハ」＝展開リハーサルの出現率（今日の隊形での試走結果）。
-                              この2つをブレンドして可能性の高い展開を抽出しています。リハーサル最上位の展開は必ず1枠採用されます。買い目はその展開での目安です。
+                              「信頼度」は的中確率ではなく、両者の一致度・ブレンドスコア・次点との差から算出した展開根拠の強さです。リハーサル最上位の展開は必ず1枠採用されます。買い目はその展開での目安です。
                             </div>
                           </div>
                         ) : (
