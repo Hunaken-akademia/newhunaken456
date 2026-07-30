@@ -4408,14 +4408,14 @@ export default function App() {
 
     // 攻められ耐性は「現在と同じ進入コース × 攻め艇のコース × 決まり手」で照合する。
     // 母数3件以上だけを使い、3項目2勝ルールを壊さないよう3着順位の補助に限定する。
-    const resistanceMatch = (victimBoat, attackBoat, kind) => {
+    const resistanceMatch = (victimBoat, attackBoat, kind, minN = 3) => {
       const victimCourse = Number(courseByBoat[victimBoat]);
       const attackCourse = Number(courseByBoat[attackBoat]);
       if (!victimCourse || !attackCourse || attackCourse <= victimCourse || victimCourse === 6) return null;
       const rows = resistanceByBoat?.[victimBoat]?.["1y"]?.rows || [];
       const row = rows.find((r) => Number(r?.attack_course) === attackCourse && String(r?.kimarite || "") === String(kind || ""));
       const n = Number(row?.n || 0);
-      if (n < 3) return null;
+      if (n < minN) return null;
       const baseRows = resistanceBaseline?.["1y"]?.[victimCourse] || [];
       const base = baseRows.find((r) => Number(r?.attack_course) === attackCourse && String(r?.kimarite || "") === String(kind || ""));
       const avg = Number(row?.avg_rank);
@@ -4447,6 +4447,32 @@ export default function App() {
         }
       }
       return { order: arr, notes };
+    };
+
+    // 2着耐性は3着より厳しく扱う。母数6件以上かつ、隣の艇に3指標のうち
+    // 少なくとも1項目で勝っている場合だけ最大1段動かす。展開NG艇は対象外。
+    const applyResistanceToSecond = (order, headBoat, kind, blockedSet = new Set()) => {
+      const original = [...(order || [])];
+      const arr = [...original];
+      const notes = [];
+      for (let i = 0; i < arr.length; i++) {
+        const boat = arr[i];
+        if (blockedSet.has(boat)) continue;
+        const m = resistanceMatch(boat, headBoat, kind, 6);
+        if (!m || m.level === 0) continue;
+        if (m.level > 0 && i > 0) {
+          const upper = arr[i - 1];
+          if (!blockedSet.has(upper) && metricWins(boat, upper).count >= 1) {
+            [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
+            notes.push(`${boat}号艇は対${m.attackCourse}C${kind}耐性（${m.n}走）が高く2着順位を1段昇格`);
+          }
+        } else if (m.level < 0 && i < arr.length - 1) {
+          [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
+          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}耐性（${m.n}走）が低く2着順位を1段降格`);
+        }
+      }
+      const promoted = arr.filter((boat, idx) => idx < original.indexOf(boat));
+      return { order: arr, notes, promoted };
     };
 
     const templateForScenario = (headBoat, rawKind) => {
@@ -4565,6 +4591,8 @@ export default function App() {
       const kind = kindOfHead(headBoat);
       const tpl = templateForScenario(headBoat, kind);
       const sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
+      const blockedSecondSet = new Set(tpl.blockedSecond || []);
+      const resistanceSecond = applyResistanceToSecond(sec.order, headBoat, kind, blockedSecondSet);
       const third = rankByTwoOfThree(tpl.third, []);
 
       // まくりで直内から叩かれる艇は、2着では原則ブロック。
@@ -4589,14 +4617,15 @@ export default function App() {
 
       return {
         ...tpl,
-        secondRank: sec.order,
+        secondRank: resistanceSecond.order,
         thirdRank,
         thirdAllowed: [...thirdAllowed],
-        secondPromoted: sec.promoted,
+        secondPromoted: [...new Set([...(sec.promoted || []), ...(resistanceSecond.promoted || [])])],
         thirdPromoted: third.promoted,
         // 説明文では2着順位の実移動だけを「昇格」と表記する。
         // 3着内の並び替えは買い目へ反映するが、基本筋の艇を誤って昇格扱いしない。
-        reasons: [...sec.reasons, ...blockedNotes, ...resistanceThird.notes],
+        reasons: [...sec.reasons, ...resistanceSecond.notes, ...blockedNotes, ...resistanceThird.notes],
+        resistanceNotes: [...resistanceSecond.notes, ...resistanceThird.notes],
       };
     };
 
@@ -4775,8 +4804,9 @@ export default function App() {
       if (!scenarioCache.has(key)) {
         const tpl = templateForScenario(head, kind);
         const sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
-        const third = rankByTwoOfThree(tpl.third, []);
         const blockedSet = new Set(tpl.blockedSecond || []);
+        const resistanceSecond = applyResistanceToSecond(sec.order, head, tpl.kind, blockedSet);
+        const third = rankByTwoOfThree(tpl.third, []);
         const thirdAllowed = new Set();
         for (const boat of blockedSet) {
           const baseIdx = tpl.third.indexOf(boat);
@@ -4790,9 +4820,10 @@ export default function App() {
         const resistanceThird = applyResistanceToThird(thirdRankBase, head, tpl.kind, blockedSet, thirdAllowed);
         const thirdRank = resistanceThird.order;
         scenarioCache.set(key, {
-          ...tpl, secondRank: sec.order, thirdRank, thirdAllowed: [...thirdAllowed],
-          secondPromoted: sec.promoted, thirdPromoted: third.promoted,
-          reasons: [...sec.reasons, ...resistanceThird.notes],
+          ...tpl, secondRank: resistanceSecond.order, thirdRank, thirdAllowed: [...thirdAllowed],
+          secondPromoted: [...new Set([...(sec.promoted || []), ...(resistanceSecond.promoted || [])])], thirdPromoted: third.promoted,
+          reasons: [...sec.reasons, ...resistanceSecond.notes, ...resistanceThird.notes],
+          resistanceNotes: [...resistanceSecond.notes, ...resistanceThird.notes],
         });
       }
       return scenarioCache.get(key);
@@ -4844,6 +4875,7 @@ export default function App() {
           label: "本線",
           desc: `1着率1位を1着固定／${honSc.kind}の基本筋＋2勝ルールで2・3着選定`,
           tickets: nextHon,
+          ticketScenarios: Object.fromEntries(nextHon.map((t) => [t, `${honHead}号艇${honSc.kind}`])),
           scenarioEngine: [honSc],
         };
       }
@@ -4914,10 +4946,16 @@ export default function App() {
       const move = d.reasons.length ? `／${d.reasons.slice(0, 1).join("、")}` : "";
       return `${d.head}号艇${d.kind}：2着${d.secondRank.slice(0,3).join("・")}、3着${d.thirdRank.slice(0,3).join("・")}（${d.note}）${move}`;
     }).join("／");
+    const taikouTicketScenarios = Object.fromEntries(taikouTickets.map((t) => {
+      const h = Number(String(t).split("-")[0]);
+      const sc = engineDetails.find((d) => Number(d.head) === h) || getScenario(h);
+      return [t, `${h}号艇${sc.kind}`];
+    }));
     const taikou = {
       label: "対抗",
       desc: `決まり手別の基本筋＋モーター・平均ST・コース別成績の2勝ルール${detailText ? `／${detailText}` : ""}`,
       tickets: taikouTickets,
+      ticketScenarios: taikouTicketScenarios,
       scenarioEngine: engineDetails,
     };
 
@@ -5176,6 +5214,24 @@ export default function App() {
       ? [honmei, taikou, ana, fukuhei]
       : [honmei, taikou, ana];
 
+    // 表示・説明・実際の買い目を完全一致させる。
+    // 各カードのシナリオ内訳は、そのカードに本当に入っている買い目だけから再構築する。
+    for (const bet of bets) {
+      const byLabel = new Map();
+      for (const t of bet.tickets || []) {
+        const h = Number(String(t).split("-")[0]);
+        const label = bet.ticketScenarios?.[t] || `${h}号艇${getScenario(h).kind}`;
+        if (!byLabel.has(label)) byLabel.set(label, []);
+        byLabel.get(label).push(t);
+      }
+      bet.scenarioGroups = [...byLabel.entries()].map(([label, tickets]) => ({
+        label,
+        tickets: sortTicketsForDisplay([...new Set(tickets)]),
+        compressed: compressTickets(sortTicketsForDisplay([...new Set(tickets)])),
+      }));
+      bet.scenarioSummary = bet.scenarioGroups.map((g) => g.label).join("・");
+    }
+
     // EVランキングは選択済みの買い目だけでなく、3連単120通り全体を対象にする。
     let evList = [];
     if (odds) {
@@ -5316,7 +5372,21 @@ export default function App() {
         // シナリオ表示も本線〜展リハと同じ専用テンプレートを使う。
         // これにより、3まくりの2号艇除外、3まくり差しの3-12中心、5まくりの5-16固定が揃う。
         const displayScenario = scenarioForKind(head, c.type);
-        let tickets = scenarioTicketCandidates(head, displayScenario, 8, "balanced");
+        const scenarioLabel = `${head}号艇${displayScenario.kind}`;
+        const linked = [];
+        const linkedCards = [];
+        for (const bet of bets) {
+          const matched = (bet.tickets || []).filter((t) => bet.ticketScenarios?.[t] === scenarioLabel);
+          if (matched.length) {
+            linked.push(...matched);
+            linkedCards.push(bet.label);
+          }
+        }
+        // 実カードに同じシナリオの買い目がある場合は、その実買い目だけを表示する。
+        // ない場合だけテンプレート例を表示する。
+        let tickets = linked.length
+          ? sortTicketsForDisplay([...new Set(linked)])
+          : scenarioTicketCandidates(head, displayScenario, 8, "balanced");
         const label = c.type === "逃げ" ? `逃げ（1号艇）`
           : `${c.type}（${head}号艇）`;
         // 説明文は「決まり手率（場の平均）」と「リハーサル出現率（今日の隊形）」を併記する。
@@ -5342,6 +5412,8 @@ export default function App() {
           label,
           desc,
           tickets,
+          linkedCards: [...new Set(linkedCards)],
+          resistanceNotes: displayScenario.resistanceNotes || [],
         };
       });
     }
@@ -8363,6 +8435,16 @@ export default function App() {
                                     </span>
                                   </div>
                                   <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>{sc.desc}</div>
+                                  {Array.isArray(sc.linkedCards) && sc.linkedCards.length > 0 && (
+                                    <div style={{ fontSize: 10, color: "#5dd39e", marginBottom: 6 }}>
+                                      実買い目と一致：{sc.linkedCards.join("・")}
+                                    </div>
+                                  )}
+                                  {Array.isArray(sc.resistanceNotes) && sc.resistanceNotes.length > 0 && (
+                                    <div style={{ fontSize: 10, color: "#d7b4ef", marginBottom: 6, lineHeight: 1.5 }}>
+                                      耐性補正：{sc.resistanceNotes.join("／")}
+                                    </div>
+                                  )}
                                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                                     {compressTickets(sortTicketsForDisplay(sc.tickets)).map((t) => (
                                       <span key={t} style={{
@@ -8529,14 +8611,17 @@ export default function App() {
                                 ※総合1着率＝展開リハーサル1000回で、決まり手を問わずその艇が1着になった割合です。
                               </div>
                             )}
-                            {bet.label === "穴" && Array.isArray(bet.scenarioGroups) && bet.scenarioGroups.length > 0 && (
+                            {Array.isArray(bet.scenarioGroups) && bet.scenarioGroups.length > 0 && (
                               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
                                 {bet.scenarioGroups.map((g) => (
                                   <span key={g.label} style={{
-                                    fontSize: 10, color: "#e5d6b4", background: "#2b2416",
-                                    border: "1px solid #5b4826", borderRadius: 6, padding: "3px 8px",
+                                    fontSize: 10,
+                                    color: bet.label === "穴" ? "#e5d6b4" : bet.label === "展リハ" ? "#e8d5f5" : "#bcd7ee",
+                                    background: bet.label === "穴" ? "#2b2416" : bet.label === "展リハ" ? "#2a1c3a" : "#13283b",
+                                    border: `1px solid ${bet.label === "穴" ? "#5b4826" : bet.label === "展リハ" ? "#4a3560" : "#294967"}`,
+                                    borderRadius: 6, padding: "3px 8px",
                                   }}>
-                                    {g.label}：{g.tickets.join("・")}
+                                    {g.label}：{(g.compressed || compressTickets(g.tickets)).join("・")}
                                   </span>
                                 ))}
                               </div>
