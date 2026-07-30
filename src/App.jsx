@@ -4546,6 +4546,7 @@ export default function App() {
         ...tpl,
         secondRank: sec.order,
         thirdRank,
+        thirdAllowed: [...thirdAllowed],
         secondPromoted: sec.promoted,
         thirdPromoted: third.promoted,
         // 説明文では2着順位の実移動だけを「昇格」と表記する。
@@ -4611,26 +4612,80 @@ export default function App() {
       const out = [];
       const push = (second, third) => {
         if (!second || !third || second === head || third === head || second === third) return;
+        if ((sc.blockedSecond || []).includes(second)) return;
         const t = `${head}-${second}-${third}`;
         if (!out.includes(t)) out.push(t);
       };
-      const baseSecondTop = (sc.baseSecond || sc.secondRank || []).slice(0, 2);
-      const baseThirdTop = (sc.baseThird || sc.thirdRank || []).slice(0, 3);
-      const dynamicSecond = (sc.secondRank || []).slice(0, mode === "solid" ? 2 : 3);
-      const dynamicThird = (sc.thirdRank || []).slice(0, mode === "solid" ? 3 : 4);
+      const uniq = (xs) => [...new Set((xs || []).filter(Boolean))];
+      const baseSecond = uniq(sc.baseSecond || sc.secondRank || []);
+      const baseThird = uniq(sc.baseThird || sc.thirdRank || []);
+      const promotedSecond = uniq(sc.secondPromoted || []);
+      const promotedThird = uniq(sc.thirdPromoted || []);
+      const blocked = new Set(sc.blockedSecond || []);
+      const thirdAllowed = new Set(sc.thirdAllowed || []);
+      const safeThird = (xs) => uniq(xs).filter((b) => !blocked.has(b) || thirdAllowed.has(b));
 
-      // 基本筋の核を先に確保。3まくりなら 3-1-4 / 3-4-1 が候補から消えない。
-      for (const second of baseSecondTop) {
-        for (const third of baseThirdTop) push(second, third);
+      // まくり差しは「内を突く展開」なので、外の追走艇を2着へ広げない。
+      // 3Cなら1・2、4Cなら1・2、5Cなら残った内艇、6Cなら1・5を中心にする。
+      if (sc.kind === "まくり差し") {
+        const innerBase = baseSecond.filter((b) => Number(courseByBoat[b]) < Number(sc.course));
+        const secondCore = uniq((innerBase.length ? innerBase : baseSecond).slice(0, 2));
+        const thirdCore = safeThird([
+          ...baseThird.slice(0, 2),
+          ...promotedThird.filter((b) => Number(courseByBoat[b]) < Number(sc.course)),
+          ...baseThird.slice(2, 4),
+        ]);
+        for (const second of secondCore) {
+          for (const third of thirdCore) push(second, third);
+        }
+        return out.slice(0, cap);
       }
-      // 2勝ルールで昇格した艇と基本筋を組み合わせる。
-      for (const second of dynamicSecond) {
-        const thirds = [...new Set([...dynamicThird, ...baseThirdTop])];
-        for (const third of thirds) push(second, third);
+
+      // まくりは基本筋を残しつつ、実際に2勝して順位が上がった艇だけ2着へ追加。
+      // 3Cまくりで5が昇格した場合は、先頭4点を 3-1-4 / 3-1-5 / 3-5-1 / 3-5-4 にする。
+      if (sc.kind === "まくり") {
+        const baseS1 = baseSecond[0];
+        const baseS2 = baseSecond[1];
+        const promo = promotedSecond.find((b) => !blocked.has(b));
+        const thirdCore = safeThird(uniq([...baseThird.slice(0, 3), ...promotedThird]));
+        if (baseS1 && baseS2) {
+          push(baseS1, baseS2);
+          if (promo) {
+            push(baseS1, promo);
+            push(promo, baseS1);
+            push(promo, baseS2);
+            push(baseS2, baseS1);
+            push(baseS2, promo);
+          } else {
+            push(baseS2, baseS1);
+            const altThird = thirdCore.find((b) => b !== baseS1 && b !== baseS2);
+            if (altThird) {
+              push(baseS1, altThird);
+              push(baseS2, altThird);
+            }
+          }
+        }
+        const secondCore = uniq([
+          ...baseSecond.slice(0, mode === "solid" ? 2 : 2),
+          ...promotedSecond,
+        ]).filter((b) => !blocked.has(b));
+        for (const second of secondCore) {
+          for (const third of thirdCore) push(second, third);
+        }
+        return out.slice(0, cap);
       }
-      // 基本2着艇に昇格した3着候補も組み合わせる。
-      for (const second of baseSecondTop) {
-        for (const third of dynamicThird) push(second, third);
+
+      // 逃げ・差しは基本上位2艇を軸にし、2勝で本当に昇格した艇だけ追加する。
+      const secondCore = uniq([
+        ...baseSecond.slice(0, 2),
+        ...promotedSecond,
+      ]).filter((b) => !blocked.has(b));
+      const thirdCore = safeThird(uniq([
+        ...baseThird.slice(0, mode === "solid" ? 3 : 4),
+        ...promotedThird,
+      ]));
+      for (const second of secondCore) {
+        for (const third of thirdCore) push(second, third);
       }
       return out.slice(0, cap);
     };
@@ -4639,6 +4694,43 @@ export default function App() {
     const getScenario = (head) => {
       if (!scenarioCache.has(head)) scenarioCache.set(head, scenarioRanksForHead(head));
       return scenarioCache.get(head);
+    };
+    const scenarioForKind = (head, kind) => {
+      const key = `${head}:${kind}`;
+      if (!scenarioCache.has(key)) {
+        const tpl = templateForScenario(head, kind);
+        const sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
+        const third = rankByTwoOfThree(tpl.third, []);
+        const blockedSet = new Set(tpl.blockedSecond || []);
+        const thirdAllowed = new Set();
+        for (const boat of blockedSet) {
+          const baseIdx = tpl.third.indexOf(boat);
+          const benchmark = tpl.third.slice(0, Math.max(1, baseIdx)).find((b) => !blockedSet.has(b));
+          if (benchmark && metricWins(boat, benchmark).count >= 2) thirdAllowed.add(boat);
+        }
+        const thirdRank = [
+          ...third.order.filter((b) => !blockedSet.has(b) || thirdAllowed.has(b)),
+          ...third.order.filter((b) => blockedSet.has(b) && !thirdAllowed.has(b)),
+        ];
+        scenarioCache.set(key, {
+          ...tpl, secondRank: sec.order, thirdRank, thirdAllowed: [...thirdAllowed],
+          secondPromoted: sec.promoted, thirdPromoted: third.promoted,
+          reasons: [...sec.reasons],
+        });
+      }
+      return scenarioCache.get(key);
+    };
+    const rehearsalKindOfHead = (head) => {
+      if (Number(courseByBoat[head]) === 1) return "逃げ";
+      const rows = [];
+      Object.entries(rehPct || {}).forEach(([key, pct]) => {
+        const m = /^(.+)\((\d)\)$/.exec(key);
+        if (m && Number(m[2]) === Number(head) && m[1] !== "抜き") rows.push({ kind: m[1], pct: Number(pct) || 0 });
+      });
+      rows.sort((a,b) => b.pct - a.pct);
+      let kind = rows[0]?.kind || kindOfHead(head);
+      if (Number(courseByBoat[head]) === 2 && kind === "まくり差し") kind = "まくり";
+      return kind;
     };
 
     const ticketScenarioFit = (ticket) => {
@@ -4710,8 +4802,10 @@ export default function App() {
         if (taikouTickets.length > before) added++;
       }
 
-      const candidates = buildTickets([head], sc.secondRank.slice(0, 4), sc.thirdRank.slice(0, 5), 20);
-      const rankedCandidates = hasUsableProbMap ? sortByProb(candidates) : candidates;
+      // 追加枠も専用テンプレート内だけで補完する。
+      // secondRank上位を無条件に広げる旧buildTicketsは、未昇格艇まで2着へ入るため使わない。
+      const candidates = scenarioTicketCandidates(head, sc, 24, "balanced");
+      const rankedCandidates = candidates;
       for (const t of rankedCandidates) {
         if (added >= quota || taikouTickets.length >= TK_MAX) break;
         const before = taikouTickets.length;
@@ -4724,8 +4818,8 @@ export default function App() {
     // 頭ごとの枠で12点に届かない場合は、同じシナリオ順位を保ったまま補完。
     for (const d of engineDetails) {
       if (taikouTickets.length >= TK_MAX) break;
-      const more = buildTickets([d.head], d.secondRank, d.thirdRank, 20);
-      for (const t of (hasUsableProbMap ? sortByProb(more) : more)) {
+      const more = scenarioTicketCandidates(d.head, d, 24, "balanced");
+      for (const t of more) {
         pushUnique(t);
         if (taikouTickets.length >= TK_MAX) break;
       }
@@ -4876,7 +4970,24 @@ export default function App() {
           : `EV条件該当なしのため評価2・3位頭の中穴へフォールバック`;
       }
 
-      ana = { label: "穴", desc: `シナリオ整合性を満たす買い目から選定／${desc}`, tickets };
+      const ticketScenarios = {};
+      for (const t of tickets) {
+        const h = Number(String(t).split("-")[0]);
+        const sc = getScenario(h);
+        ticketScenarios[t] = `${h}号艇${sc.kind}`;
+      }
+      const scenarioGroups = Object.entries(ticketScenarios).reduce((acc, [t, label]) => {
+        let row = acc.find((x) => x.label === label);
+        if (!row) { row = { label, tickets: [] }; acc.push(row); }
+        row.tickets.push(t);
+        return acc;
+      }, []);
+      const scenarioText = scenarioGroups.map((g) => g.label).join("・");
+      ana = {
+        label: "穴",
+        desc: `シナリオ整合性を満たす買い目から選定${scenarioText ? `（${scenarioText}）` : ""}／${desc}`,
+        tickets, ticketScenarios, scenarioGroups,
+      };
     }
 
     // 合成オッズ（オッズ貼り付け時）= 1 ÷ Σ(1/各点オッズ)
@@ -4940,7 +5051,9 @@ export default function App() {
       if (gaps.length > 0) {
         const per = gaps.length >= 2 ? 6 : FUKU_MAX;
         for (const g of gaps) {
-          const sc = getScenario(g.boat);
+          const rehKind = rehearsalKindOfHead(g.boat);
+          const sc = scenarioForKind(g.boat, rehKind);
+          g.kind = rehKind;
           const cand = scenarioTicketCandidates(g.boat, sc, 24, "balanced")
             .filter((t) => !coveredSet.has(t) && ticketScenarioFit(t) >= 5);
           // オッズがあるときは「EV1.0以上」に絞ってから確率上位を採る。
@@ -4961,7 +5074,7 @@ export default function App() {
           }
         }
         const gapStr = gaps
-          .map((g) => `${g.boat}号艇（総合1着率${round1(g.reh)}%・本線・対抗で頭なし）`)
+          .map((g) => `${g.boat}号艇${g.kind || ""}（総合1着率${round1(g.reh)}%・本線・対抗で頭なし）`)
           .join("、");
         desc = `展リハ1000回試走での総合1着率が3位以内・8%以上で、本線・対抗に頭がない艇＝${gapStr}${hasOdds ? "／その艇頭からEV1.0以上を優先" : "／その艇頭を推定確率順"}`;
       } else if (rehBoatPct) {
@@ -4969,7 +5082,13 @@ export default function App() {
       } else {
         desc = "全艇の平均STを入力すると、展リハ発の買い目が出ます";
       }
-      fukuhei = { label: "展リハ", desc, tickets, gaps };
+      const ticketScenarios = {};
+      for (const t of tickets) {
+        const h = Number(String(t).split("-")[0]);
+        const g = gaps.find((x) => Number(x.boat) === h);
+        ticketScenarios[t] = `${h}号艇${g?.kind || rehearsalKindOfHead(h)}`;
+      }
+      fukuhei = { label: "展リハ", desc, tickets, gaps, ticketScenarios };
     }
 
     // 合成オッズは展開リハにも付ける（0点のときは null になる）
@@ -8340,6 +8459,18 @@ export default function App() {
                             {bet.label === "展リハ" && (
                               <div style={{ fontSize: 10, color: "#8ea1b5", lineHeight: 1.6, marginBottom: 8 }}>
                                 ※総合1着率＝展開リハーサル1000回で、決まり手を問わずその艇が1着になった割合です。
+                              </div>
+                            )}
+                            {bet.label === "穴" && Array.isArray(bet.scenarioGroups) && bet.scenarioGroups.length > 0 && (
+                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+                                {bet.scenarioGroups.map((g) => (
+                                  <span key={g.label} style={{
+                                    fontSize: 10, color: "#e5d6b4", background: "#2b2416",
+                                    border: "1px solid #5b4826", borderRadius: 6, padding: "3px 8px",
+                                  }}>
+                                    {g.label}：{g.tickets.join("・")}
+                                  </span>
+                                ))}
                               </div>
                             )}
                             {compShown ? (
