@@ -4464,9 +4464,10 @@ export default function App() {
     };
 
     const rankByTwoOfThree = (base, blocked = []) => {
+      const original = [...base];
       const arr = [...base];
       const blockedSet = new Set(blocked || []);
-      const moved = [];
+      const lastWinAgainst = new Map();
       // 後位艇が直前艇に2項目以上勝つ場合だけ、1段ずつ昇格する。
       for (let pass = 0; pass < arr.length; pass++) {
         let changed = false;
@@ -4476,13 +4477,21 @@ export default function App() {
           const cmp = metricWins(challenger, upper);
           if (cmp.count >= 2) {
             arr[i - 1] = challenger; arr[i] = upper;
-            moved.push(`${challenger}号艇が${cmp.won.join("・")}で${upper}号艇を上回り昇格`);
+            lastWinAgainst.set(challenger, { upper, won: cmp.won });
             changed = true;
           }
         }
         if (!changed) break;
       }
-      return { order: arr, reasons: [...new Set(moved)] };
+      // 実際に基本順位より上へ動いた艇だけを「昇格」と表示する。
+      // 入れ替え途中の比較や、元から上位だった艇は昇格理由に含めない。
+      const promoted = arr.filter((boat, idx) => idx < original.indexOf(boat));
+      const reasons = promoted.map((boat) => {
+        const detail = lastWinAgainst.get(boat);
+        if (!detail) return `${boat}号艇が基本順位から昇格`;
+        return `${boat}号艇が${detail.won.join("・")}で${detail.upper}号艇を上回り昇格`;
+      });
+      return { order: arr, reasons, promoted };
     };
 
     const kindOfHead = (headBoat) => {
@@ -4510,7 +4519,33 @@ export default function App() {
       const tpl = templateForScenario(headBoat, kind);
       const sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
       const third = rankByTwoOfThree(tpl.third, []);
-      return { ...tpl, secondRank: sec.order, thirdRank: third.order, reasons: [...sec.reasons, ...third.reasons] };
+
+      // まくりで直内から叩かれる艇は、2着では原則ブロック。
+      // 3着は「モーター・平均ST・コース別成績」のうち2項目以上で、
+      // 基本上位の非ブロック艇を上回った場合だけ上位候補へ復活させる。
+      const blockedSet = new Set(tpl.blockedSecond || []);
+      const thirdAllowed = new Set();
+      for (const boat of blockedSet) {
+        const baseIdx = tpl.third.indexOf(boat);
+        const benchmark = tpl.third.slice(0, Math.max(1, baseIdx)).find((b) => !blockedSet.has(b));
+        if (benchmark && metricWins(boat, benchmark).count >= 2) thirdAllowed.add(boat);
+      }
+      const thirdRank = [
+        ...third.order.filter((b) => !blockedSet.has(b) || thirdAllowed.has(b)),
+        ...third.order.filter((b) => blockedSet.has(b) && !thirdAllowed.has(b)),
+      ];
+      const blockedNotes = [...blockedSet]
+        .filter((b) => !thirdAllowed.has(b))
+        .map((b) => `${b}号艇は叩かれる想定のため3着上位から降格`);
+
+      return {
+        ...tpl,
+        secondRank: sec.order,
+        thirdRank,
+        secondPromoted: sec.promoted,
+        thirdPromoted: third.promoted,
+        reasons: [...sec.reasons, ...third.reasons, ...blockedNotes],
+      };
     };
 
     // ── 展開連動: 決まり手から「1号艇を脅かす濃い攻め手艇」を抽出 ──
@@ -4578,10 +4613,28 @@ export default function App() {
     for (const head of taikouHeads) {
       if (taikouTickets.length >= TK_MAX) break;
       const sc = scenarioRanksForHead(head);
-      const candidates = buildTickets([head], sc.secondRank.slice(0, 4), sc.thirdRank.slice(0, 5), 20);
-      const rankedCandidates = hasUsableProbMap ? sortByProb(candidates) : candidates;
       const quota = Math.max(3, Math.floor(TK_MAX / Math.max(1, taikouHeads.length)));
       let added = 0;
+
+      // シナリオ筋を先に確保する。
+      // 2着へ昇格した艇には、3着基本上位を複数組み合わせて
+      // 「昇格艇の1点だけ」にならないようにする。
+      const priority = [];
+      const primarySeconds = sc.secondRank.slice(0, 2);
+      for (const second of primarySeconds) {
+        const thirdLimit = sc.secondPromoted?.includes(second) ? 3 : 2;
+        const thirds = sc.thirdRank.filter((b) => b !== second).slice(0, thirdLimit);
+        for (const third of thirds) priority.push(`${head}-${second}-${third}`);
+      }
+      for (const t of priority) {
+        if (added >= quota || taikouTickets.length >= TK_MAX) break;
+        const before = taikouTickets.length;
+        pushUnique(t);
+        if (taikouTickets.length > before) added++;
+      }
+
+      const candidates = buildTickets([head], sc.secondRank.slice(0, 4), sc.thirdRank.slice(0, 5), 20);
+      const rankedCandidates = hasUsableProbMap ? sortByProb(candidates) : candidates;
       for (const t of rankedCandidates) {
         if (added >= quota || taikouTickets.length >= TK_MAX) break;
         const before = taikouTickets.length;
