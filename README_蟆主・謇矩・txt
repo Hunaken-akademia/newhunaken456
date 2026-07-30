@@ -1,17 +1,21 @@
-WAKE 攻められ耐性（進入別・攻めコース別）パッチ
+WAKE 攻められ耐性：直近1年・最低3レース表示パッチ
 
-1. Supabase SQL Editorで sql_add_resistance_by_course.sql を全文実行
-2. src/App.jsx を既存プロジェクトの src/App.jsx へ上書き
-3. package.json を上書き
-4. GitHub/Vercelへ反映（またはプロジェクト直下で npm install → npm run build）
+【上書きするファイル】
+1. src/App.jsx
+2. package.json
 
-変更内容
+【SQL】
+sql_add_resistance_by_course.sql は、すでに同名RPCを作成済みなら再実行不要です。
+未実行の場合だけSupabase SQL Editorで全文実行してください。
+プロジェクト内の既存ファイルへ上書きするものではありません。
+
+【変更内容】
+- 表示期間を直近1年だけに変更
+- 合計3レース以上で数値表示
+- 1〜2レースは「データ不足」
 - 現在の進入コースと同じ過去レースだけを集計
-- 3C／4C／5C／6Cなど、攻めたコース別に内訳表示
-- まくり／まくり差し／差しを分離
-- 直近3か月／6か月を表示
-- 6コースは「対象外」表示
-- 買い目ロジックには未反映
+- 攻め艇のコース別内訳を表示
+- まくり／まくり差し／差しを別表示
+- 6コースは対象外
 
-旧 racer_resistance_split / resistance_baseline_split は残っていても問題ありません。
-新しいRPC名を使用するため、既存関数のDROPは不要です。
+上書き後、package.jsonがあるフォルダで npm run build を実行するか、GitHubへ反映してVercelの自動ビルドを行ってください。

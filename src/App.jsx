@@ -3748,8 +3748,7 @@ export default function App() {
 
     setResistanceStatus("攻められ耐性：読込中");
     const periods = [
-      { key: "3m", label: "直近3か月", days: 90 },
-      { key: "6m", label: "直近6か月", days: 180 },
+      { key: "1y", label: "直近1年", days: 365 },
     ];
     const targetCourses = [...new Set(pairs.map((x) => x.course).filter((c) => c >= 1 && c <= 5))];
 
@@ -6941,8 +6940,7 @@ export default function App() {
               {resistanceByBoat?.[b] && (() => {
                 const myCourse = Number(courses?.[b] || b);
                 const periods = [
-                  { key: "3m", label: "直近3か月" },
-                  { key: "6m", label: "直近6か月" },
+                  { key: "1y", label: "直近1年" },
                 ];
                 const defs = [
                   { key: "まくり", label: "まくり" },
@@ -6958,7 +6956,7 @@ export default function App() {
                   return { n, avg, hold };
                 };
                 const summaryColor = (summary, baseline) => {
-                  if (summary.n < 8) return "#7d91a8";
+                  if (summary.n < 3) return "#7d91a8";
                   if (!Number.isFinite(summary.avg) || !Number.isFinite(baseline.avg)) return "#dce8f4";
                   if (summary.avg <= baseline.avg - 0.3) return "#5dd39e";
                   if (summary.avg >= baseline.avg + 0.3) return "#ff8d86";
@@ -6999,7 +6997,7 @@ export default function App() {
                                     <div key={d.key} style={{ borderTop: "1px solid rgba(44,71,98,.55)", paddingTop: 4 }}>
                                       <div style={{ color: summaryColor(summary, baseline), lineHeight: 1.55 }}>
                                         <b style={{ display: "inline-block", minWidth: 62 }}>{d.label}</b>
-                                        {summary.n < 8 ? `${summary.n}回 / データ不足` : (
+                                        {summary.n < 3 ? `${summary.n}回 / データ不足` : (
                                           <>
                                             {summary.n}回 / 平均<b>{safeFixed(summary.avg, 2)}</b>着 / 3着内<b>{safeFixed(summary.hold, 1)}</b>%
                                             {Number.isFinite(baseline.avg) ? <span style={{ color: "#7d91a8" }}>（同条件基準{safeFixed(baseline.avg, 2)}着）</span> : null}
@@ -7012,7 +7010,7 @@ export default function App() {
                                           return (
                                             <div key={`${d.key}-${r.attack_course}`}>
                                               {Number(r.attack_course)}Cから：{n}回 / 平均{safeFixed(r.avg_rank, 2)}着 / 3着内{safeFixed(r.hold3, 1)}%
-                                              {n < 8 ? "（参考）" : ""}
+                                              {n < 3 ? "（参考）" : ""}
                                             </div>
                                           );
                                         }) : <div>攻めコース別の該当なし</div>}
