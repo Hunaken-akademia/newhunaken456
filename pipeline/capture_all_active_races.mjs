@@ -51,16 +51,61 @@ for (const s of schedules) {
 console.log(`capture jobs=${jobs.length}`);
 const results = await mapLimit(jobs, CONCURRENCY, async j => {
   const q = new URLSearchParams({ action:"capture", venue:j.venue, race:String(j.race), date:now.date, final:j.final?"1":"0", t:String(Date.now()) });
-  let data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
+  const captureUrl = `${BASE}/api/yoso?${q}`;
+  let data = await getJson(captureUrl, TOKEN ? {"x-capture-token":TOKEN} : {});
+
+  if (j.venue === "常滑") {
+    console.log(`[TOKONAME CAPTURE DEBUG ${j.race}R]`, JSON.stringify({
+      requestUrl: captureUrl,
+      left: j.left,
+      final: j.final,
+      responseKeys: Object.keys(data || {}),
+      rowsType: Array.isArray(data?.rows) ? "array" : typeof data?.rows,
+      rowsLength: Array.isArray(data?.rows) ? data.rows.length : null,
+      rows: data?.rows ?? null,
+      oddsCount: data?.oddsCount ?? null,
+      reviewSaved: data?.reviewSaved ?? null,
+      error: data?.error ?? null,
+      warning: data?.warning ?? null,
+      reason: data?.reason ?? null,
+      sourceUrl: data?.sourceUrl ?? null,
+      fetchStatus: data?.fetchStatus ?? null,
+      htmlLength: data?.htmlLength ?? null
+    }, null, 2));
+  }
+
   let rows = Array.isArray(data.rows) ? data.rows.length : 0;
   // 展示公開が遅れた場合は、締切30分前以降かつ締切前に同一run内でもう一度だけ確認する。
   // 60分前から取得対象にすることで通常runでも複数回の保存機会を確保しつつ、早すぎる再試行は避ける。
   if (rows < 6 && j.left <= 30 && j.left >= 0) {
     await new Promise((resolve) => setTimeout(resolve, 35000));
     q.set("t", String(Date.now()));
-    data = await getJson(`${BASE}/api/yoso?${q}`, TOKEN ? {"x-capture-token":TOKEN} : {});
+    const retryUrl = `${BASE}/api/yoso?${q}`;
+    data = await getJson(retryUrl, TOKEN ? {"x-capture-token":TOKEN} : {});
+
+    if (j.venue === "常滑") {
+      console.log(`[TOKONAME RETRY DEBUG ${j.race}R]`, JSON.stringify({
+        requestUrl: retryUrl,
+        left: j.left,
+        final: j.final,
+        responseKeys: Object.keys(data || {}),
+        rowsType: Array.isArray(data?.rows) ? "array" : typeof data?.rows,
+        rowsLength: Array.isArray(data?.rows) ? data.rows.length : null,
+        rows: data?.rows ?? null,
+        oddsCount: data?.oddsCount ?? null,
+        reviewSaved: data?.reviewSaved ?? null,
+        error: data?.error ?? null,
+        warning: data?.warning ?? null,
+        reason: data?.reason ?? null,
+        sourceUrl: data?.sourceUrl ?? null,
+        fetchStatus: data?.fetchStatus ?? null,
+        htmlLength: data?.htmlLength ?? null
+      }, null, 2));
+    }
+
     rows = Array.isArray(data.rows) ? data.rows.length : 0;
   }
+
   let resultCompleted = false;
   let resultReason = "";
   if (j.final) {
@@ -83,6 +128,7 @@ const results = await mapLimit(jobs, CONCURRENCY, async j => {
       resultReason = e.message || String(e);
     }
   }
+
   const preRaceAvailable = !!data?.reviewSaved?.preRaceAvailable;
   const preRaceUpdated = !!data?.reviewSaved?.preRaceUpdated;
   const preRaceCapturedAt = String(data?.reviewSaved?.preRaceCapturedAt || "");
