@@ -139,62 +139,10 @@ const results = await mapLimit(
       t:String(Date.now())
     });
 
-    const captureUrl = `${BASE}/api/yoso?${q}`;
-
     let data = await getJson(
-      captureUrl,
+      `${BASE}/api/yoso?${q}`,
       TOKEN ? { "x-capture-token":TOKEN } : {}
     );
-
-    // 常滑だけ capture API の返却内容を詳しく表示
-    if (j.venue === "常滑") {
-      console.log(
-        `[TOKONAME CAPTURE DEBUG ${j.race}R]`,
-        JSON.stringify({
-          requestUrl:captureUrl,
-          left:j.left,
-          final:j.final,
-
-          responseKeys:Object.keys(data || {}),
-          rowsType:Array.isArray(data?.rows)
-            ? "array"
-            : typeof data?.rows,
-          rowsLength:Array.isArray(data?.rows)
-            ? data.rows.length
-            : null,
-          rows:data?.rows ?? null,
-
-          source:data?.source ?? null,
-          url:data?.url ?? null,
-          boatcastUrls:data?.boatcastUrls ?? null,
-          weatherUrl:data?.weatherUrl ?? null,
-
-          displayPending:data?.displayPending ?? null,
-          displayError:data?.displayError ?? null,
-          displayReasonCode:data?.displayReasonCode ?? null,
-          displayErrorDetail:data?.displayErrorDetail ?? null,
-          displayDisabled:data?.displayDisabled ?? null,
-
-          racers:data?.racers ?? null,
-          motors:data?.motors ?? null,
-          weather:data?.weather ?? null,
-
-          oddsCount:data?.oddsCount ?? null,
-          oddsUrl:data?.oddsUrl ?? null,
-          oddsError:data?.oddsError ?? null,
-          reviewSaved:data?.reviewSaved ?? null,
-
-          error:data?.error ?? null,
-          warning:data?.warning ?? null,
-          reason:data?.reason ?? null,
-          sourceUrl:data?.sourceUrl ?? null,
-          fetchStatus:data?.fetchStatus ?? null,
-          htmlLength:data?.htmlLength ?? null,
-          fetchedAt:data?.fetchedAt ?? null,
-          appVersion:data?.appVersion ?? null
-        }, null, 2)
-      );
-    }
 
     let rows = Array.isArray(data.rows)
       ? data.rows.length
@@ -209,61 +157,10 @@ const results = await mapLimit(
 
       q.set("t", String(Date.now()));
 
-      const retryUrl = `${BASE}/api/yoso?${q}`;
-
       data = await getJson(
-        retryUrl,
+        `${BASE}/api/yoso?${q}`,
         TOKEN ? { "x-capture-token":TOKEN } : {}
       );
-
-      if (j.venue === "常滑") {
-        console.log(
-          `[TOKONAME RETRY DEBUG ${j.race}R]`,
-          JSON.stringify({
-            requestUrl:retryUrl,
-            left:j.left,
-            final:j.final,
-
-            responseKeys:Object.keys(data || {}),
-            rowsType:Array.isArray(data?.rows)
-              ? "array"
-              : typeof data?.rows,
-            rowsLength:Array.isArray(data?.rows)
-              ? data.rows.length
-              : null,
-            rows:data?.rows ?? null,
-
-            source:data?.source ?? null,
-            url:data?.url ?? null,
-            boatcastUrls:data?.boatcastUrls ?? null,
-            weatherUrl:data?.weatherUrl ?? null,
-
-            displayPending:data?.displayPending ?? null,
-            displayError:data?.displayError ?? null,
-            displayReasonCode:data?.displayReasonCode ?? null,
-            displayErrorDetail:data?.displayErrorDetail ?? null,
-            displayDisabled:data?.displayDisabled ?? null,
-
-            racers:data?.racers ?? null,
-            motors:data?.motors ?? null,
-            weather:data?.weather ?? null,
-
-            oddsCount:data?.oddsCount ?? null,
-            oddsUrl:data?.oddsUrl ?? null,
-            oddsError:data?.oddsError ?? null,
-            reviewSaved:data?.reviewSaved ?? null,
-
-            error:data?.error ?? null,
-            warning:data?.warning ?? null,
-            reason:data?.reason ?? null,
-            sourceUrl:data?.sourceUrl ?? null,
-            fetchStatus:data?.fetchStatus ?? null,
-            htmlLength:data?.htmlLength ?? null,
-            fetchedAt:data?.fetchedAt ?? null,
-            appVersion:data?.appVersion ?? null
-          }, null, 2)
-        );
-      }
 
       rows = Array.isArray(data.rows)
         ? data.rows.length
