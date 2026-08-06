@@ -3442,13 +3442,29 @@ export default function App() {
         const makuriRow = rowAfter("捲り", 6);      // [捲られ, 捲り2..6]
         const mzRow = rowAfter("捲り差し", 6);      // [捲られ差, 捲り差し2..6]
         if (!nigeRow && !sashiRow && !makuriRow) return null;
-        // 各行末の「出走回数」は括弧なしの「14回」形式。
-        // 決まり手ごとの回数は「(5回)」なので除外し、1〜6艇分だけ保存する。
-        const starts = [];
-        const startsRe = /(?:^|[^（(\d])(\d+)\s*回/gm;
-        let startsMatch;
-        while ((startsMatch = startsRe.exec(seg)) !== null && starts.length < 6) {
-          starts.push(Number(startsMatch[1]));
+        // 各コース行は「決まり手4項目の回数 + 行末の出走回数」の5個で構成される。
+        // コピー時に括弧と数字の間へ改行が入る場合があるため、
+        // 「括弧の直後ではない数字」判定ではなく、5個1組の末尾を出走回数として読む。
+        const countTokens = [...seg.matchAll(/(\d+)\s*回/g)].map((m) => Number(m[1]));
+        let starts = null;
+        for (let offset = 0; offset + 30 <= countTokens.length; offset += 1) {
+          const candidate = [];
+          let valid = true;
+          for (let row = 0; row < 6; row += 1) {
+            const chunk = countTokens.slice(offset + row * 5, offset + row * 5 + 5);
+            if (chunk.length < 5) { valid = false; break; }
+            const rowStarts = chunk[4];
+            // 出走回数は各決まり手の発生回数以上になる。
+            if (!Number.isFinite(rowStarts) || rowStarts < Math.max(...chunk.slice(0, 4))) {
+              valid = false;
+              break;
+            }
+            candidate.push(rowStarts);
+          }
+          if (valid) {
+            starts = candidate;
+            break;
+          }
         }
         return {
           nige: nigeRow ? nigeRow[0] : null,
@@ -3459,7 +3475,7 @@ export default function App() {
           makuri: makuriRow ? makuriRow.slice(1) : null,
           makuraresashi: mzRow ? mzRow[0] : null,
           makurizashi: mzRow ? mzRow.slice(1) : null,
-          starts: starts.length === 6 ? starts : null,
+          starts,
         };
       };
 
