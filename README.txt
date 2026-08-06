@@ -1,11 +1,15 @@
-WAKE patch v5
+WAKE patch v7
 
-変更内容:
-- 各1〜6号艇カード内にあった「攻められ耐性」をカード外へ移動
-- 攻められ耐性を独立した一覧セクションとして表示
-- 集計期間は直近1年固定
-- 実進入コース基準を明記
-- 既存の補正ロジック・取得処理・DB・認証・決済は変更なし
+Changes:
+- Moved the attack-resistance section to between Tenkai Rehearsal and Nige Simulation.
+- Added the Kimarite Rate reference table above attack resistance.
+- Kimarite Rate supports the existing 6-month / 1-year selector.
+- Kimarite Rate is display-only and is not passed into AI evaluation, scenario logic, or ticket selection.
+- Attack resistance remains fixed to the latest 1 year.
 
-上書き先:
+Replace:
 src/App.jsx
+
+Validation:
+- JSX syntax checked with the TypeScript parser: 0 diagnostics.
+- Full Vite build could not run in this environment because the internal npm registry does not provide playwright.
