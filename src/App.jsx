@@ -7788,104 +7788,127 @@ export default function App() {
                 </div>
               )}
 
-              {/* 攻められ耐性（現在の進入コース限定・攻めコース別） */}
-              {resistanceByBoat?.[b] && (() => {
-                const myCourse = Number(courses?.[b] || b);
-                const periods = [
-                  { key: "1y", label: "直近1年" },
-                ];
-                const defs = [
-                  { key: "まくり", label: "まくり" },
-                  { key: "まくり差し", label: "まくり差し" },
-                  { key: "差し", label: "差し" },
-                ];
-                const summarize = (rows, kind) => {
-                  const target = (rows || []).filter((r) => String(r?.kimarite || "") === kind);
-                  const n = target.reduce((sum, r) => sum + Number(r?.n || 0), 0);
-                  if (!n) return { n: 0, avg: null, rate2: null, rate3: null };
-                  const weighted = (key) => target.reduce((sum, r) => sum + Number(r?.[key] || 0) * Number(r?.n || 0), 0) / n;
-                  const avg = target.reduce((sum, r) => sum + Number(r?.avg_rank || 0) * Number(r?.n || 0), 0) / n;
-                  return { n, avg, rate2: weighted("rate2"), rate3: weighted("rate3") };
-                };
-                const summaryColor = (summary, baseline) => {
-                  if (summary.n < 3) return "#7d91a8";
-                  const own = Number(summary.rate2 || 0) + Number(summary.rate3 || 0);
-                  const base = Number(baseline.rate2 || 0) + Number(baseline.rate3 || 0);
-                  if (!Number.isFinite(own) || !Number.isFinite(base)) return "#dce8f4";
-                  if (own >= base + 10) return "#5dd39e";
-                  if (own <= base - 10) return "#ff8d86";
-                  return "#dce8f4";
-                };
-                return (
-                  <div style={{
-                    gridColumn: "1 / -1", borderTop: "1px solid #1d3149", paddingTop: 7, marginTop: 2,
-                    fontSize: 11, color: "#9db5cc",
-                  }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", marginBottom: 6 }}>
-                      <span style={{ background: "#0e1b2c", borderRadius: 5, padding: "3px 7px", fontWeight: 800, color: "#7da3c8" }}>
-                        攻められ耐性（{myCourse}コース時）
-                      </span>
-                      <span style={{ color: "#607f9d" }}>※2着率は2着補正、3着率は3着補正に使用</span>
-                    </div>
-                    {myCourse === 6 ? (
-                      <div style={{ color: "#7d91a8", padding: "5px 2px" }}>
-                        6コースは外側に攻め艇がいないため対象外
-                      </div>
-                    ) : (
-                      <div style={{ display: "grid", gap: 8 }}>
-                        {periods.map((period) => {
-                          const periodData = resistanceByBoat?.[b]?.[period.key] || {};
-                          const rows = periodData?.rows || [];
-                          const baseRows = resistanceBaseline?.[period.key]?.[myCourse] || [];
-                          return (
-                            <div key={period.key} style={{ background: "rgba(14,27,44,.55)", borderRadius: 7, padding: "6px 8px" }}>
-                              <div style={{ fontWeight: 900, color: "#8fb4d8", marginBottom: 4 }}>{period.label}</div>
-                              <div style={{ display: "grid", gap: 6 }}>
-                                {defs.map((d) => {
-                                  const summary = summarize(rows, d.key);
-                                  const baseline = summarize(baseRows, d.key);
-                                  const details = (rows || [])
-                                    .filter((r) => String(r?.kimarite || "") === d.key && Number(r?.n || 0) > 0)
-                                    .sort((a, z) => Number(a.attack_course) - Number(z.attack_course));
-                                  return (
-                                    <div key={d.key} style={{ borderTop: "1px solid rgba(44,71,98,.55)", paddingTop: 4 }}>
-                                      <div style={{ color: summaryColor(summary, baseline), lineHeight: 1.55 }}>
-                                        <b style={{ display: "inline-block", minWidth: 62 }}>{d.label}</b>
-                                        {summary.n < 3 ? `${summary.n}回 / データ不足` : (
-                                          <>
-                                            {summary.n}回 / 平均<b>{safeFixed(summary.avg, 2)}</b>着 / 2着<b>{safeFixed(summary.rate2, 1)}</b>% / 3着<b>{safeFixed(summary.rate3, 1)}</b>%
-                                            {Number.isFinite(baseline.rate2) ? <span style={{ color: "#7d91a8" }}>（基準 2着{safeFixed(baseline.rate2, 1)}%・3着{safeFixed(baseline.rate3, 1)}%）</span> : null}
-                                          </>
-                                        )}
-                                      </div>
-                                      <div style={{ marginLeft: 62, marginTop: 2, display: "grid", gap: 1, color: "#7890a8", fontSize: 10 }}>
-                                        {details.length ? details.map((r) => {
-                                          const n = Number(r?.n || 0);
-                                          return (
-                                            <div key={`${d.key}-${r.attack_course}`}>
-                                              {Number(r.attack_course)}Cから：{n}回 / 平均{safeFixed(r.avg_rank, 2)}着 / 2着{safeFixed(r.rate2, 1)}% / 3着{safeFixed(r.rate3, 1)}%
-                                              {n < 3 ? "（参考）" : ""}
-                                            </div>
-                                          );
-                                        }) : <div>攻めコース別の該当なし</div>}
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
                 </>
               )}
             </div>
             );
           })}
+        </div>
+
+
+        {/* 展開分析：攻められ耐性（直近1年固定） */}
+        <div style={{ marginBottom: 24 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+            <div>
+              <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8" }}>攻められ耐性</div>
+              <div style={{ fontSize: 10, color: "#607f9d", marginTop: 3 }}>直近1年固定・実進入コース基準</div>
+            </div>
+            <span style={{ fontSize: 10, color: resistanceStatus.includes("失敗") ? "#ff8a80" : "#5dd39e" }}>{resistanceStatus}</span>
+          </div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {[1, 2, 3, 4, 5, 6].map((b) => (
+              <div key={`resistance-${b}`} style={{ background: "#16273c", borderRadius: 10, padding: "10px 12px" }}>
+                {/* 攻められ耐性（現在の進入コース限定・攻めコース別） */}
+                {resistanceByBoat?.[b] && (() => {
+                  const myCourse = Number(courses?.[b] || b);
+                  const periods = [
+                    { key: "1y", label: "直近1年" },
+                  ];
+                  const defs = [
+                    { key: "まくり", label: "まくり" },
+                    { key: "まくり差し", label: "まくり差し" },
+                    { key: "差し", label: "差し" },
+                  ];
+                  const summarize = (rows, kind) => {
+                    const target = (rows || []).filter((r) => String(r?.kimarite || "") === kind);
+                    const n = target.reduce((sum, r) => sum + Number(r?.n || 0), 0);
+                    if (!n) return { n: 0, avg: null, rate2: null, rate3: null };
+                    const weighted = (key) => target.reduce((sum, r) => sum + Number(r?.[key] || 0) * Number(r?.n || 0), 0) / n;
+                    const avg = target.reduce((sum, r) => sum + Number(r?.avg_rank || 0) * Number(r?.n || 0), 0) / n;
+                    return { n, avg, rate2: weighted("rate2"), rate3: weighted("rate3") };
+                  };
+                  const summaryColor = (summary, baseline) => {
+                    if (summary.n < 3) return "#7d91a8";
+                    const own = Number(summary.rate2 || 0) + Number(summary.rate3 || 0);
+                    const base = Number(baseline.rate2 || 0) + Number(baseline.rate3 || 0);
+                    if (!Number.isFinite(own) || !Number.isFinite(base)) return "#dce8f4";
+                    if (own >= base + 10) return "#5dd39e";
+                    if (own <= base - 10) return "#ff8d86";
+                    return "#dce8f4";
+                  };
+                  return (
+                    <div style={{
+                      gridColumn: "1 / -1", borderTop: "1px solid #1d3149", paddingTop: 7, marginTop: 2,
+                      fontSize: 11, color: "#9db5cc",
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", marginBottom: 6 }}>
+                        <span style={{ background: "#0e1b2c", borderRadius: 5, padding: "3px 7px", fontWeight: 800, color: "#7da3c8" }}>
+                          攻められ耐性（{myCourse}コース時）
+                        </span>
+                        <span style={{ color: "#607f9d" }}>※2着率は2着補正、3着率は3着補正に使用</span>
+                      </div>
+                      {myCourse === 6 ? (
+                        <div style={{ color: "#7d91a8", padding: "5px 2px" }}>
+                          6コースは外側に攻め艇がいないため対象外
+                        </div>
+                      ) : (
+                        <div style={{ display: "grid", gap: 8 }}>
+                          {periods.map((period) => {
+                            const periodData = resistanceByBoat?.[b]?.[period.key] || {};
+                            const rows = periodData?.rows || [];
+                            const baseRows = resistanceBaseline?.[period.key]?.[myCourse] || [];
+                            return (
+                              <div key={period.key} style={{ background: "rgba(14,27,44,.55)", borderRadius: 7, padding: "6px 8px" }}>
+                                <div style={{ fontWeight: 900, color: "#8fb4d8", marginBottom: 4 }}>{period.label}</div>
+                                <div style={{ display: "grid", gap: 6 }}>
+                                  {defs.map((d) => {
+                                    const summary = summarize(rows, d.key);
+                                    const baseline = summarize(baseRows, d.key);
+                                    const details = (rows || [])
+                                      .filter((r) => String(r?.kimarite || "") === d.key && Number(r?.n || 0) > 0)
+                                      .sort((a, z) => Number(a.attack_course) - Number(z.attack_course));
+                                    return (
+                                      <div key={d.key} style={{ borderTop: "1px solid rgba(44,71,98,.55)", paddingTop: 4 }}>
+                                        <div style={{ color: summaryColor(summary, baseline), lineHeight: 1.55 }}>
+                                          <b style={{ display: "inline-block", minWidth: 62 }}>{d.label}</b>
+                                          {summary.n < 3 ? `${summary.n}回 / データ不足` : (
+                                            <>
+                                              {summary.n}回 / 平均<b>{safeFixed(summary.avg, 2)}</b>着 / 2着<b>{safeFixed(summary.rate2, 1)}</b>% / 3着<b>{safeFixed(summary.rate3, 1)}</b>%
+                                              {Number.isFinite(baseline.rate2) ? <span style={{ color: "#7d91a8" }}>（基準 2着{safeFixed(baseline.rate2, 1)}%・3着{safeFixed(baseline.rate3, 1)}%）</span> : null}
+                                            </>
+                                          )}
+                                        </div>
+                                        <div style={{ marginLeft: 62, marginTop: 2, display: "grid", gap: 1, color: "#7890a8", fontSize: 10 }}>
+                                          {details.length ? details.map((r) => {
+                                            const n = Number(r?.n || 0);
+                                            return (
+                                              <div key={`${d.key}-${r.attack_course}`}>
+                                                {Number(r.attack_course)}Cから：{n}回 / 平均{safeFixed(r.avg_rank, 2)}着 / 2着{safeFixed(r.rate2, 1)}% / 3着{safeFixed(r.rate3, 1)}%
+                                                {n < 3 ? "（参考）" : ""}
+                                              </div>
+                                            );
+                                          }) : <div>攻めコース別の該当なし</div>}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+                {!resistanceByBoat?.[b] && (
+                  <div style={{ color: "#7d91a8", fontSize: 11 }}>
+                    {b}号艇：攻められ耐性データ未取得
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
 
         {/* スリット予測 */}

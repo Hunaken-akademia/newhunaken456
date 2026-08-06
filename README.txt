@@ -1,10 +1,11 @@
-WAKE patch v4
+WAKE patch v5
 
-Replace:
-  src/App.jsx
+変更内容:
+- 各1〜6号艇カード内にあった「攻められ耐性」をカード外へ移動
+- 攻められ耐性を独立した一覧セクションとして表示
+- 集計期間は直近1年固定
+- 実進入コース基準を明記
+- 既存の補正ロジック・取得処理・DB・認証・決済は変更なし
 
-Fix:
-- Removed stray closing React Fragment around lines 8019-8020.
-- JSX syntax was checked with TypeScript transpile parser: 0 diagnostics.
-
-This patch only contains the modified source file.
+上書き先:
+src/App.jsx
