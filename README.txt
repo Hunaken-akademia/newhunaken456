@@ -1,2 +1,2 @@
-公式結果HTMLの3連単払戻セルが「8,220」のように通貨記号なしでも解析できる修正です。
-GitHubの api/yoso.js を上書きしてください。
+Replace your project file at src/App.jsx with this file.
+This patch keeps the rehPct-related logic and adds the UI folding changes.
