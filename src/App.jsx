@@ -367,6 +367,66 @@ function buildRacerCourseStatsFromDb(rawRows, profiles, courses, venueName) {
 }
 
 
+function buildRacerKimariteTableFromDb(rawRows, profiles, courses) {
+  const periods = [
+    { label: "直近6ヶ月", days: 180 },
+    { label: "直近1年", days: 365 },
+  ];
+  const out = Object.fromEntries(periods.map((p) => [p.label, {}]));
+  const normalizeKimarite = (value) => String(value || "").trim().replace(/捲り/g, "まくり");
+
+  for (let boat = 1; boat <= 6; boat++) {
+    const regno = Number(profiles?.[boat]?.regNo || profiles?.[boat]?.regno || profiles?.[boat]?.registerNo || 0);
+    const course = Number(courses?.[boat] || boat);
+    if (!regno || !course) continue;
+
+    for (const period of periods) {
+      const from = daysAgoIso(period.days);
+      const rows = (rawRows || []).filter((r) => (
+        Number(r.regno) === regno
+        && Number(r.course) === course
+        && String(r.race_date || "").slice(0, 10) >= from
+        && r.rank != null
+      ));
+      const starts = rows.length;
+      const counts = { nige: 0, sashi: 0, makuri: 0, makurizashi: 0 };
+
+      for (const row of rows) {
+        const kimarite = normalizeKimarite(row.kimarite);
+        const rank = Number(row.rank);
+        if (course === 1) {
+          if (rank === 1 && kimarite === "逃げ") counts.nige++;
+          else if (kimarite === "差し") counts.sashi++;
+          else if (kimarite === "まくり") counts.makuri++;
+          else if (kimarite === "まくり差し") counts.makurizashi++;
+        } else {
+          if (kimarite === "逃げ") counts.nige++; // 2〜6Cでは「逃し」
+          if (rank === 1 && kimarite === "差し") counts.sashi++;
+          if (rank === 1 && kimarite === "まくり") counts.makuri++;
+          if (rank === 1 && kimarite === "まくり差し") counts.makurizashi++;
+        }
+      }
+
+      const cell = (count) => ({
+        count,
+        rate: starts > 0 ? round1((count / starts) * 100) : null,
+      });
+      out[period.label][boat] = {
+        boat,
+        course,
+        starts,
+        nige: cell(counts.nige),
+        sashi: cell(counts.sashi),
+        makuri: cell(counts.makuri),
+        makurizashi: cell(counts.makurizashi),
+      };
+    }
+  }
+
+  return out;
+}
+
+
 function buildDbAverageStTableFromRows(rawRows, profiles, venueName, courses) {
   const placeNo = PLACE_NO_BY_VENUE[venueName] || null;
   const periods = [
@@ -547,7 +607,7 @@ async function fetchRaceResultsForRacers(regnos, days = 365) {
   const nums = [...new Set((regnos || []).map((v) => Number(v)).filter(Boolean))];
   if (!nums.length) return [];
   const qs = new URLSearchParams();
-  qs.set("select", "regno,course,rank,place_no,race_date,race_no,st,is_f");
+  qs.set("select", "regno,course,rank,kimarite,place_no,race_date,race_no,st,is_f");
   qs.set("regno", `in.(${nums.join(",")})`);
   qs.set("race_date", `gte.${daysAgoIso(days)}`);
   qs.set("order", "race_date.desc");
@@ -2275,6 +2335,11 @@ export default function App() {
   // 選手成績 {win:{区分:[6]}, ren2:{区分:[6]}, ren3:{区分:[6]}}
   const RACER_CATS = CORE_CATEGORY_PERIOD_LABELS;
   const [racerStats, setRacerStats] = useState(null);
+  // 閲覧専用の選手別決まり手率。既存の予想ロジック用 kimari とは完全に分離する。
+  const racerKimariteTable = useMemo(
+    () => buildRacerKimariteTableFromDb(dbRacerRows, racerProfiles, courses),
+    [dbRacerRows, racerProfiles, courses]
+  );
   const [racerCat, setRacerCat] = useState("直近6ヶ月");
   const [resistanceByBoat, setResistanceByBoat] = useState({});
   const [resistanceBaseline, setResistanceBaseline] = useState({});
@@ -8248,29 +8313,38 @@ export default function App() {
             )}
 
             {/* 決まり手率（参考表示のみ・予想ロジック未反映） */}
-            {kimari?.[kimariTablePeriod] && (() => {
-              const km = kimari[kimariTablePeriod];
-              const pct = (v) => v != null && Number.isFinite(Number(v)) ? `${safeFixed(Number(v), 1)}%` : "-";
+            {racerKimariteTable?.[kimariTablePeriod] && (() => {
+              const kmByBoat = racerKimariteTable[kimariTablePeriod];
               const rows = [1, 2, 3, 4, 5, 6].map((b) => {
+                const stat = kmByBoat?.[b] || null;
                 const course = Number(courses?.[b] || b);
-                const idx = course - 2;
+                const exactStarts = racerStats?.n?.[kimariTablePeriod]?.[b - 1];
                 return {
                   boat: b,
                   course,
                   name: racerProfiles?.[b]?.name || "選手名未取得",
-                  nigeOrNigashi: course === 1 ? km.nige : course === 2 ? km.nigashi : null,
-                  sashi: course === 1 ? km.sasare : km.sashi?.[idx],
-                  makuri: course === 1 ? km.makurare : km.makuri?.[idx],
-                  makurizashi: course === 1 ? km.makuraresashi : km.makurizashi?.[idx],
-                  starts: km.starts?.[b - 1] ?? null,
+                  nige: stat?.nige || null,
+                  sashi: stat?.sashi || null,
+                  makuri: stat?.makuri || null,
+                  makurizashi: stat?.makurizashi || null,
+                  starts: Number.isFinite(Number(exactStarts)) ? Number(exactStarts) : stat?.starts ?? null,
                 };
               });
+              const rateCell = (cell) => {
+                if (!cell || cell.rate == null || !Number.isFinite(Number(cell.rate))) return "-";
+                return (
+                  <div style={{ lineHeight: 1.25, whiteSpace: "nowrap" }}>
+                    <div>{safeFixed(Number(cell.rate), 1)}%</div>
+                    <div style={{ marginTop: 3, fontSize: 9.5, color: "#7f9ab3" }}>({Number(cell.count || 0)}回)</div>
+                  </div>
+                );
+              };
               return (
                 <div style={{ marginBottom: 14 }}>
                   <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
                     <div>
                       <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8" }}>決まり手率</div>
-                      <div style={{ fontSize: 10, color: "#607f9d", marginTop: 3 }}>実進入コース基準</div>
+                      <div style={{ fontSize: 10, color: "#607f9d", marginTop: 3 }}>選手別・実進入コース基準</div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                       <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10, color: "#8fb4d8" }}>
@@ -8311,12 +8385,12 @@ export default function App() {
                               <span style={{ color: "#dce8f4", fontWeight: 800 }}>{r.name}</span>
                             </td>
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#8fb4d8", whiteSpace: "nowrap" }}>{r.course}C</td>
-                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{pct(r.nigeOrNigashi)}</td>
-                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{pct(r.sashi)}</td>
-                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{pct(r.makuri)}</td>
-                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{pct(r.makurizashi)}</td>
+                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{rateCell(r.nige)}</td>
+                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{rateCell(r.sashi)}</td>
+                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{rateCell(r.makuri)}</td>
+                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{rateCell(r.makurizashi)}</td>
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4", whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>
-                              {Number.isFinite(Number(r.starts)) && Number(r.starts) > 0 ? `${Number(r.starts)}回` : "-"}
+                              {Number.isFinite(Number(r.starts)) ? `${Number(r.starts)}回` : "-"}
                             </td>
                           </tr>
                         ))}
@@ -8324,8 +8398,9 @@ export default function App() {
                     </table>
                   </div>
                   <div style={{ fontSize: 9.5, color: "#607f9d", marginTop: 5, lineHeight: 1.5 }}>
-                    ※ 「逃げ」列は、1コースでは逃げ率、2〜6コースでは逃し率を表示します。1コースは「差され・まくられ・まくられ差し」、2〜6コースは「差し・まくり・まくり差し」です。
-                    この表は閲覧用で、AI評価・展開予想・買い目計算には使用しません。
+                    ※ 出走回数は、選択期間内に各選手が現在の実進入コースを走った回数です。各率の下には該当決まり手の回数を表示します。<br />
+                    ※ 「逃げ」列は、1コースでは逃げ率、2〜6コースでは逃し率です。1コースは「差され・まくられ・まくられ差し」、2〜6コースは「差し・まくり・まくり差し」です。<br />
+                    ※ この表は閲覧用で、AI評価・展開予想・買い目計算には使用しません。
                   </div>
                 </div>
               );
