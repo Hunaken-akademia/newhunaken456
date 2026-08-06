@@ -248,33 +248,6 @@ function safeFixed(value, digits = 1, fallback = "—") {
   return Number.isFinite(n) ? n.toFixed(digits) : fallback;
 }
 
-const AI_DISPLAY_DRAFTS_KEY = "hunaken_ai_display_drafts_v1";
-
-function loadAiDisplayDrafts() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(AI_DISPLAY_DRAFTS_KEY) || "{}");
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveAiDisplayDraft(raceKey, payload) {
-  if (!raceKey || !payload) return;
-  try {
-    const all = loadAiDisplayDrafts();
-    all[raceKey] = payload;
-    localStorage.setItem(AI_DISPLAY_DRAFTS_KEY, JSON.stringify(all));
-  } catch (e) {
-    console.warn("AI display draft save failed", e);
-  }
-}
-
-function getAiDisplayDraft(raceKey) {
-  const row = loadAiDisplayDrafts()?.[raceKey];
-  return row && typeof row === "object" ? row : null;
-}
-
 function normalizeRaceGrade(v) {
   const s = String(v || "").trim().toUpperCase();
   if (!s) return "";
@@ -556,49 +529,6 @@ async function fetchRaceResultsForRacers(regnos, days = 365) {
   return attachRaceMeta(rows, metas);
 }
 
-
-async function fetchRacerResistanceByCourse(regno, myCourse, days = 365) {
-  if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
-  const course = Number(myCourse);
-  if (!Number.isInteger(course) || course < 1 || course > 5) return [];
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/racer_resistance_by_course`, {
-    method: "POST",
-    headers: publicSupabaseHeaders(true),
-    body: JSON.stringify({
-      p_regno: Number(regno),
-      p_my_course: course,
-      p_from: daysAgoIso(days),
-      p_to: todayIso(),
-    }),
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`racer_resistance_by_course ${res.status}${txt ? `: ${txt.slice(0, 160)}` : ""}`);
-  }
-  const rows = await res.json();
-  return Array.isArray(rows) ? rows : [];
-}
-
-async function fetchResistanceBaselineByCourse(myCourse, days = 365) {
-  if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
-  const course = Number(myCourse);
-  if (!Number.isInteger(course) || course < 1 || course > 5) return [];
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/resistance_baseline_by_course`, {
-    method: "POST",
-    headers: publicSupabaseHeaders(true),
-    body: JSON.stringify({
-      p_my_course: course,
-      p_from: daysAgoIso(days),
-      p_to: todayIso(),
-    }),
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`resistance_baseline_by_course ${res.status}${txt ? `: ${txt.slice(0, 160)}` : ""}`);
-  }
-  const rows = await res.json();
-  return Array.isArray(rows) ? rows : [];
-}
 
 async function fetchRaceResultsForVenue(placeNo, days = 365) {
   if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
@@ -946,6 +876,18 @@ const SEASON_PERIOD = { "春": "3〜5月", "夏": "6〜8月", "秋": "9〜11月"
 //         シナリオ選定・頭候補の判定から参照できるようにした。
 function runTenkaiRehearsal({ slit, scoreByBoat = {}, seedKey = "", iters = 1000 }) {
   if (!slit || !Array.isArray(slit) || slit.length !== 6) return null;
+  // 平均STとして扱えない値（NaN・Infinity・負値）や重複/欠落コースは、
+  // Math.abs 等で補正せずリハーサル自体を無効化する。誤入力を「速いST」に変換しないため。
+  const courseSet = new Set();
+  for (const e of slit) {
+    const course = Number(e?.course);
+    const boat = Number(e?.boat);
+    const st = Number(e?.st);
+    if (!Number.isInteger(course) || course < 1 || course > 6
+      || !Number.isInteger(boat) || boat < 1 || boat > 6
+      || !Number.isFinite(st) || st < 0 || courseSet.has(course)) return null;
+    courseSet.add(course);
+  }
   let seed = 0;
   const key = String(seedKey || "");
   for (let i = 0; i < key.length; i++) seed = (seed * 31 + key.charCodeAt(i)) >>> 0;
@@ -962,19 +904,6 @@ function runTenkaiRehearsal({ slit, scoreByBoat = {}, seedKey = "", iters = 1000
     while (v === 0) v = rnd();
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
   };
-  // ST・進入の異常値は、絶対値化などで正常値へ見せかけずリハーサル自体を無効にする。
-  const validSlit = slit.every((e) => {
-    const st = Number(e?.st);
-    const boat = Number(e?.boat);
-    const course = Number(e?.course);
-    return Number.isFinite(st) && st >= 0 && st <= 0.6
-      && Number.isInteger(boat) && boat >= 1 && boat <= 6
-      && Number.isInteger(course) && course >= 1 && course <= 6;
-  });
-  const uniqueBoats = new Set(slit.map((e) => Number(e.boat)));
-  const uniqueCourses = new Set(slit.map((e) => Number(e.course)));
-  if (!validSlit || uniqueBoats.size !== 6 || uniqueCourses.size !== 6) return null;
-
   const byCourse = {};
   slit.forEach((e) => { byCourse[e.course] = e; });
   if (!byCourse[1]) return null;
@@ -996,13 +925,13 @@ function runTenkaiRehearsal({ slit, scoreByBoat = {}, seedKey = "", iters = 1000
 
   for (let i = 0; i < ITERS; i++) {
     const s = {};
-    // コースによる一律ST補正は入れず、入力された平均STと同一分散の揺らぎだけを使う。
+    // コースだけを理由に4〜6コースを一律0.01秒速くする補正は、実測校正がないため撤廃。
     slit.forEach((e) => { s[e.course] = Number(e.st) + gauss() * 0.05; });
     const c1 = byCourse[1];
 
     // 攻め手判定: 各コースの「1号艇に対するST差 − 必要量」を比べ、最も余裕が大きい艇が攻める。
     // （旧実装のように固定順で先着勝ちにすると、内側コースの攻めが構造的に過大評価される）
-    let attacker = null, attackerAdv = 0, attackerTh = 0, bestMargin = 0;
+    let attacker = null, attackerAdv = null, attackerTh = null, bestMargin = 0;
     for (const c of [3, 4, 5, 6]) {
       const e = byCourse[c];
       if (!e) continue;
@@ -1017,13 +946,11 @@ function runTenkaiRehearsal({ slit, scoreByBoat = {}, seedKey = "", iters = 1000
       attackerTh = th;
     }
     if (attacker) {
-      // 最終的な攻め手が決まってから、乱数を1回だけ使って決まり手を判定する。
+      // 攻め手が確定してから決まり手抽選を1回だけ行う。候補走査中の乱数消費による順序依存を避ける。
       const c = Number(attacker.course);
       const zashiWindow = c <= 4 ? 0.05 : 0.06;
       const zashiP = c <= 4 ? 0.45 : 0.55;
-      const attackKind = attackerAdv < attackerTh + zashiWindow && rnd() < zashiP
-        ? "まくり差し"
-        : "まくり";
+      const attackKind = attackerAdv < attackerTh + zashiWindow && rnd() < zashiP ? "まくり差し" : "まくり";
       addResult(attackKind, attacker.boat);
       continue;
     }
@@ -1170,6 +1097,23 @@ function ticketListIncludesResult(tickets, result) {
   if (!normalized || !Array.isArray(tickets)) return false;
   return tickets.some((ticket) => expandTrifectaTicket(ticket).includes(normalized));
 }
+
+// 保存用の正規化: 表示配列（圧縮表記が混ざっていても可）を完全展開した3連単の配列にする。
+// 例: ["3-1-245","3-2-1"] → ["3-1-2","3-1-4","3-1-5","3-2-1"]
+// 重複は先勝ちで除去し、表示順は維持する。保存する tickets は必ずこの関数を通す。
+function expandTicketsForSave(tickets) {
+  const out = [];
+  const seen = new Set();
+  for (const t of Array.isArray(tickets) ? tickets : []) {
+    for (const e of expandTrifectaTicket(t)) {
+      if (!seen.has(e)) { seen.add(e); out.push(e); }
+    }
+  }
+  return out;
+}
+
+// 表示スナップショットの保存キー
+const AI_BET_SNAPSHOT_STORAGE_KEY = "hunaken_ai_bet_snapshots_v1";
 
 function stakeForTrifectaResult(record, result) {
   const normalized = normalizeTrifectaResult(result);
@@ -1817,6 +1761,14 @@ export default function App() {
     const rn = Number(race);
     setRaceWinds((p) => ({ ...p, [rn]: value }));
     if (rn === Number(raceNo)) setWind(value || "無風");
+    // 共有風を変えたレースは、変更前の表示スナップショットを破棄する。
+    // 現在表示中のレースなら、新しい風でのAI買い目が表示された時点でスナップショットが自動更新される。
+    // 別レースなら、そのレース画面を開いて表示を確認するまで一括記録の対象外になる（旧買い目の誤保存防止）。
+    try {
+      const snapKey = `${raceDate}_${venue}_${rn}`;
+      const snap = aiBetSnapshotsRef.current?.[snapKey];
+      if (snap && String(snap.wind || "") !== String(value || "")) invalidateAiBetSnapshot(snapKey);
+    } catch (e) { /* noop */ }
     setRaceWindsMsg("保存中…");
     try {
       const res = await fetch("/api/yoso?action=save_manual_wind", {
@@ -1928,6 +1880,13 @@ export default function App() {
   // モーター情報 {no, rate, win1, ren2, ren3}
   const [motors, setMotors] = useState({ 1: null, 2: null, 3: null, 4: null, 5: null, 6: null });
   const [racerProfiles, setRacerProfiles] = useState({});
+  // 選手カードは初期状態を折りたたみにして、必要な艇だけ展開する。
+  const [expandedBoatCards, setExpandedBoatCards] = useState({});
+  const toggleBoatCard = (boat) => {
+    setExpandedBoatCards((prev) => ({ ...prev, [boat]: !prev[boat] }));
+  };
+  const openAllBoatCards = () => setExpandedBoatCards({ 1: true, 2: true, 3: true, 4: true, 5: true, 6: true });
+  const closeAllBoatCards = () => setExpandedBoatCards({});
   const [dbRacerRows, setDbRacerRows] = useState([]);
   const [dbRacerStatus, setDbRacerStatus] = useState("DB選手成績：未取得");
 
@@ -1950,7 +1909,7 @@ export default function App() {
     try { localStorage.setItem("hunaken_breakdown_fixed_order_v1", breakdownFixedOrder ? "1" : "0"); } catch { /* noop */ }
   }, [breakdownFixedOrder]);
   // 各買い目で実際に買う点数（このレース用）。未設定キーは「全点」扱い
-  const [betLimits, setBetLimits] = useState({}); // {本線:6, 対抗:4, 穴:8, 展開リハ:12}
+  const [betLimits, setBetLimits] = useState({}); // {本線:6, 対抗:4, 穴:8, 超穴:3}
   const setBetLimit = (label, n) => setBetLimits((p) => ({ ...p, [label]: n }));
   // 「買い目組む」: 対象の組み合わせ(最大4)と点数を選んでAIに厳選させる
   const [pickerParts, setPickerParts] = useState(["本線"]);
@@ -1962,8 +1921,12 @@ export default function App() {
   // 記録関連（予想・的中率・収支・AI収支・舟券収支・バックアップ）の表示フラグ。
   // Webアプリ版（Vercel）では localStorage に永続保存されるため有効。
   const SHOW_RECORDS = true;
-  // 一括記録の保存形式。過去版はレースずれの可能性があるため集計対象外にする。
-  const BATCH_CAPTURE_VERSION = 3;
+  // 舟券収支記録UIは撤廃。既存データ・保存処理は安全のため残す。
+  const SHOW_BET_LEDGER = false;
+  // 一括記録の保存形式。過去版はレースずれ・iframe再計算による買い目ずれの可能性があるため集計対象外にする。
+  // v3以前: iframeで再計算した買い目を保存（画面表示と不一致になる不具合あり）
+  // v4: 画面表示スナップショットをそのまま保存
+  const BATCH_CAPTURE_VERSION = 4;
   // 下段の選び順・配分は任意。未選択なら上段の本線・対抗・穴の点数設定をそのまま使う。
   const SHOW_CUSTOM_AI_PICKER = true;
   const SHOW_VENUE_AI_LEDGER = false;
@@ -1988,6 +1951,39 @@ export default function App() {
   const [venueLedgerLoading, setVenueLedgerLoading] = useState(false);
   const [venueLedgerError, setVenueLedgerError] = useState("");
   const [aiCaptureQueue, setAiCaptureQueue] = useState([]); // [{date,venue,race,captureToken}] 一括記録キュー
+  // ── 画面表示AI買い目スナップショット ──
+  // key = `${date}_${venue}_${race}`。そのレース画面で実際に表示した本線/対抗/穴（点数設定適用後・完全展開済み）を保持する。
+  // 一括記録はこのスナップショットだけを保存元にする（iframe再計算は使わない）。
+  const aiBetSnapshotsRef = useRef({});
+  const persistAiBetSnapshots = (next) => {
+    aiBetSnapshotsRef.current = next;
+    try { localStorage.setItem(AI_BET_SNAPSHOT_STORAGE_KEY, JSON.stringify(next)); } catch (e) { /* noop */ }
+  };
+  const storeAiBetSnapshot = (snap) => {
+    if (!snap?.key) return;
+    persistAiBetSnapshots({ ...(aiBetSnapshotsRef.current || {}), [snap.key]: snap });
+  };
+  const invalidateAiBetSnapshot = (key) => {
+    if (!key || !(aiBetSnapshotsRef.current || {})[key]) return;
+    const next = { ...(aiBetSnapshotsRef.current || {}) };
+    delete next[key];
+    persistAiBetSnapshots(next);
+  };
+  useEffect(() => {
+    if (captureAiMode) return;
+    try {
+      const raw = localStorage.getItem(AI_BET_SNAPSHOT_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (!parsed || typeof parsed !== "object") return;
+      const maxAge = 48 * 60 * 60 * 1000;
+      const next = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (v && Array.isArray(v.bets) && Date.now() - Number(v.updatedAt || 0) <= maxAge) next[k] = v;
+      }
+      persistAiBetSnapshots(next);
+    } catch (e) { /* noop */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captureAiMode]);
   const aiCaptureQueueRef = useRef([]);
   const aiCaptureFrameRef = useRef(null);
   const [captureLoadedKey, setCaptureLoadedKey] = useState("");
@@ -2247,7 +2243,6 @@ export default function App() {
     setDbRacerStatus("DB選手成績：未取得");
     setOdds(null);
     setKimari(null); setNigeSim(null); setDbNigeRows([]); setNigeStatus("逃げシミュ：未取得"); setRacerStats(null); setStTable(null); setStMeta(null);
-    setResistanceByBoat({}); setResistanceBaseline({}); setResistanceStatus("攻められ耐性：未取得");
     setResultDigits({ first: "", second: "", third: "" });
     setAutoMsg("");
     setSaveMsg("");
@@ -2265,9 +2260,6 @@ export default function App() {
   const RACER_CATS = CORE_CATEGORY_PERIOD_LABELS;
   const [racerStats, setRacerStats] = useState(null);
   const [racerCat, setRacerCat] = useState("直近6ヶ月");
-  const [resistanceByBoat, setResistanceByBoat] = useState({});
-  const [resistanceBaseline, setResistanceBaseline] = useState({});
-  const [resistanceStatus, setResistanceStatus] = useState("攻められ耐性：未取得");
   // 期間比較（買い目の被りを見る）
   const [cmpA, setCmpA] = useState("直近6ヶ月");
   const [cmpB, setCmpB] = useState("直近3ヶ月");
@@ -3726,71 +3718,6 @@ export default function App() {
   }, [dbRacerRows, racerProfiles, courses, venue]);
 
   useEffect(() => {
-    let alive = true;
-    const pairs = [1, 2, 3, 4, 5, 6]
-      .map((boat) => ({
-        boat,
-        regno: Number(racerProfiles?.[boat]?.regNo || 0),
-        course: Number(courses?.[boat] || boat),
-      }))
-      .filter((x) => x.regno);
-
-    if (!pairs.length) {
-      setResistanceByBoat({});
-      setResistanceBaseline({});
-      setResistanceStatus("攻められ耐性：選手未取得");
-      return () => { alive = false; };
-    }
-    if (!CORRECTION_TABLE_ENABLED) {
-      setResistanceStatus("攻められ耐性：ENVなし");
-      return () => { alive = false; };
-    }
-
-    setResistanceStatus("攻められ耐性：読込中");
-    const periods = [
-      { key: "1y", label: "直近1年", days: 365 },
-    ];
-    const targetCourses = [...new Set(pairs.map((x) => x.course).filter((c) => c >= 1 && c <= 5))];
-
-    Promise.all(periods.map(async (period) => {
-      const baselineEntries = await Promise.all(
-        targetCourses.map(async (course) => [course, await fetchResistanceBaselineByCourse(course, period.days)])
-      );
-      const items = await Promise.all(pairs.map(async ({ boat, regno, course }) => ({
-        boat,
-        course,
-        rows: course === 6 ? [] : await fetchRacerResistanceByCourse(regno, course, period.days),
-      })));
-      return { ...period, baselines: Object.fromEntries(baselineEntries), items };
-    })).then((results) => {
-      if (!alive) return;
-      const nextByBoat = {};
-      const nextBaseline = {};
-      for (const result of results) {
-        nextBaseline[result.key] = result.baselines || {};
-        for (const item of result.items) {
-          if (!nextByBoat[item.boat]) nextByBoat[item.boat] = {};
-          nextByBoat[item.boat][result.key] = { course: item.course, rows: item.rows || [] };
-        }
-      }
-      setResistanceBaseline(nextBaseline);
-      setResistanceByBoat(nextByBoat);
-      setResistanceStatus(`攻められ耐性：読込済 ${pairs.length}艇（進入別・攻めコース別）`);
-    }).catch((e) => {
-      console.error("racer resistance load error", e);
-      if (!alive) return;
-      setResistanceByBoat({});
-      setResistanceBaseline({});
-      setResistanceStatus(`攻められ耐性：失敗 ${String(e?.message || e).slice(0, 70)}`);
-    });
-
-    return () => { alive = false; };
-  }, [
-    JSON.stringify([1,2,3,4,5,6].map((b) => racerProfiles?.[b]?.regNo || "")),
-    JSON.stringify([1,2,3,4,5,6].map((b) => courses?.[b] || b)),
-  ]);
-
-  useEffect(() => {
     if (!dbRacerRows.length || !Object.keys(racerProfiles || {}).length) return;
     const dbSt = buildDbAverageStTableFromRows(dbRacerRows, racerProfiles, venue, courses);
     setStTable((prev) => ({ ...(prev || {}), ...dbSt }));
@@ -4356,461 +4283,10 @@ export default function App() {
         }
       }
     }
-    let honmei = {
+    const honmei = {
       label: "本線",
       desc: "1着率1位を1着固定／2・3着は推定確率上位",
       tickets: honTickets,
-    };
-
-    // ── 展開リハーサル（当日ST・進入・評価ベースのモンテカルロ） ──
-    //   決まり手率は「その場の平均的な傾向」、リハーサルは「今日この隊形ならどう動くか」。
-    //   この2つは別物なので、以降のシナリオ選定・頭候補の両方で併用する。
-    //   （全艇の平均STが未入力だと slit が null になり、その場合は従来どおり決まり手率のみで動く）
-    const rehScoreByBoat = {};
-    ranked.forEach((r) => { rehScoreByBoat[r.boat] = r.score || 0; });
-    const rehearsal = runTenkaiRehearsal({
-      slit,
-      scoreByBoat: rehScoreByBoat,
-      seedKey: `${raceDate}_${venue}_${raceNo}`,
-    });
-    const rehPct = rehearsal?.pctOf || null;    // {"まくり(4)": 27.6, ...}
-    const rehBoatPct = rehearsal?.boatPct || null; // {4: 36.3, ...}
-
-
-    // ── 決まり手別シナリオエンジン Ver.1 ──
-    // 競艇の基本筋を土台に、モーター・平均ST・コース別選手成績の
-    // 3項目中2項目以上で上回る艇だけを昇格させる。
-    // 展開上つぶされる艇は2着へ昇格させず、3着だけ復活を許可する。
-    const boatByCourse = {};
-    const courseByBoat = {};
-    ranked.forEach((r) => {
-      const c = Number(r.course || courses?.[r.boat] || r.boat);
-      if (c >= 1 && c <= 6) { boatByCourse[c] = r.boat; courseByBoat[r.boat] = c; }
-    });
-    for (let c = 1; c <= 6; c++) {
-      if (!boatByCourse[c]) boatByCourse[c] = c;
-      if (!courseByBoat[c]) courseByBoat[c] = c;
-    }
-
-    const scenarioMetric = (boat, key) => {
-      const r = ranked.find((x) => x.boat === boat);
-      return Number(r?.points?.[key] ?? 0);
-    };
-    const metricWins = (a, b) => {
-      const keys = ["モーター", "ST", "成績"];
-      const won = keys.filter((k) => scenarioMetric(a, k) > scenarioMetric(b, k));
-      const lost = keys.filter((k) => scenarioMetric(a, k) < scenarioMetric(b, k));
-      return { won, lost, count: won.length };
-    };
-    const coursesToBoats = (list, headBoat) => (list || [])
-      .map((c) => boatByCourse[c])
-      .filter((b, i, a) => b && b !== headBoat && a.indexOf(b) === i);
-
-    // 攻められ耐性は「現在と同じ進入コース × 攻め艇のコース × 決まり手」で照合する。
-    // 母数3件以上だけを使い、3項目2勝ルールを壊さないよう3着順位の補助に限定する。
-    const resistanceMatch = (victimBoat, attackBoat, kind, minN = 3, targetPosition = 3) => {
-      const victimCourse = Number(courseByBoat[victimBoat]);
-      const attackCourse = Number(courseByBoat[attackBoat]);
-      if (!victimCourse || !attackCourse || attackCourse <= victimCourse || victimCourse === 6) return null;
-      const rows = resistanceByBoat?.[victimBoat]?.["1y"]?.rows || [];
-      const row = rows.find((r) => Number(r?.attack_course) === attackCourse && String(r?.kimarite || "") === String(kind || ""));
-      const n = Number(row?.n || 0);
-      if (n < minN) return null;
-      const baseRows = resistanceBaseline?.["1y"]?.[victimCourse] || [];
-      const base = baseRows.find((r) => Number(r?.attack_course) === attackCourse && String(r?.kimarite || "") === String(kind || ""));
-      const avg = Number(row?.avg_rank);
-      const baseAvg = Number(base?.avg_rank);
-      const rateKey = Number(targetPosition) === 2 ? "rate2" : "rate3";
-      const rate = Number(row?.[rateKey]);
-      const baseRate = Number(base?.[rateKey]);
-      let level = 0;
-      // 2着補正は2着率、3着補正は3着率を同条件基準と直接比較する。
-      // 平均着順は表示用に残すが、順位補正の判定には混ぜない。
-      if (Number.isFinite(baseRate) && Number.isFinite(rate) && rate >= baseRate + 10) level = 1;
-      if (Number.isFinite(baseRate) && Number.isFinite(rate) && rate <= baseRate - 10) level = -1;
-      return { n, avg, baseAvg, rate, baseRate, rateKey, level, attackCourse, victimCourse };
-    };
-
-    const applyResistanceToThird = (order, headBoat, kind, blockedSet = new Set(), allowedSet = new Set()) => {
-      const arr = [...(order || [])];
-      const notes = [];
-      // 良好耐性は最大1段だけ昇格、低耐性は最大1段だけ降格。
-      // 叩かれる艇は既存の復活条件を満たした場合だけ対象にする。
-      for (let i = 0; i < arr.length; i++) {
-        const boat = arr[i];
-        if (blockedSet.has(boat) && !allowedSet.has(boat)) continue;
-        const m = resistanceMatch(boat, headBoat, kind, 3, 3);
-        if (!m || m.level === 0) continue;
-        if (m.level > 0 && i > 0) {
-          [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
-          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}時の3着率${m.rate.toFixed(1)}%（基準${m.baseRate.toFixed(1)}%）で3着順位を1段昇格`);
-        } else if (m.level < 0 && i < arr.length - 1) {
-          [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
-          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}時の3着率${m.rate.toFixed(1)}%（基準${m.baseRate.toFixed(1)}%）で3着順位を1段降格`);
-        }
-      }
-      return { order: arr, notes };
-    };
-
-    // 2着耐性は3着より厳しく扱う。母数6件以上かつ、隣の艇に3指標のうち
-    // 少なくとも1項目で勝っている場合だけ最大1段動かす。展開NG艇は対象外。
-    const applyResistanceToSecond = (order, headBoat, kind, blockedSet = new Set()) => {
-      const original = [...(order || [])];
-      const arr = [...original];
-      const notes = [];
-      for (let i = 0; i < arr.length; i++) {
-        const boat = arr[i];
-        if (blockedSet.has(boat)) continue;
-        const m = resistanceMatch(boat, headBoat, kind, 6, 2);
-        if (!m || m.level === 0) continue;
-        if (m.level > 0 && i > 0) {
-          const upper = arr[i - 1];
-          if (!blockedSet.has(upper) && metricWins(boat, upper).count >= 1) {
-            [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
-            notes.push(`${boat}号艇は対${m.attackCourse}C${kind}時の2着率${m.rate.toFixed(1)}%（${m.n}走・基準${m.baseRate.toFixed(1)}%）で2着順位を1段昇格`);
-          }
-        } else if (m.level < 0 && i < arr.length - 1) {
-          [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
-          notes.push(`${boat}号艇は対${m.attackCourse}C${kind}時の2着率${m.rate.toFixed(1)}%（${m.n}走・基準${m.baseRate.toFixed(1)}%）で2着順位を1段降格`);
-        }
-      }
-      const promoted = arr.filter((boat, idx) => idx < original.indexOf(boat));
-      return { order: arr, notes, promoted };
-    };
-
-    const templateForScenario = (headBoat, rawKind) => {
-      const c = Number(courseByBoat[headBoat] || headBoat);
-      let kind = String(rawKind || "").trim();
-      if (c === 1) kind = "逃げ";
-      // 2コースに「まくり差し」は存在しないため、誤って選ばれた場合はまくり扱い。
-      if (c === 2 && kind === "まくり差し") kind = "まくり";
-
-      let second = [1,2,3,4,5,6].filter((x) => x !== c);
-      let third = [...second];
-      let blockedSecond = [];
-      let followers = [];
-      let note = "気配順";
-
-      if (kind === "逃げ") {
-        // 逃げはDBの逃がし2着率・3着率を基本順位にする。
-        const outerCourses = [2,3,4,5,6];
-        const valueAt = (arr, course) => {
-          const boat = boatByCourse[course];
-          const v = arr?.[boat - 2];
-          return Number.isFinite(Number(v)) ? Number(v) : -1;
-        };
-        second = [...outerCourses].sort((a,b) => valueAt(nigeSim?.second, b) - valueAt(nigeSim?.second, a));
-        third = [...outerCourses].sort((a,b) => valueAt(nigeSim?.third, b) - valueAt(nigeSim?.third, a));
-        note = "逃がし2着率・3着率を基礎";
-      } else if (c === 2 && kind === "差し") {
-        second = [1,3,4,5,6]; third = [3,1,4,5,6]; note = "2差しは1・3残りが基本";
-      } else if (c === 2 && kind === "まくり") {
-        second = [3,4,5,6,1]; third = [4,3,1,5,6]; blockedSecond = [1]; followers = [3,4,5,6]; note = "2まくりは3・4追走が基本";
-      } else if (c === 3 && kind === "まくり") {
-        second = [1,4,5,6,2]; third = [4,1,2,5,6]; blockedSecond = [2]; followers = [4,5,6]; note = "3まくりは3-14が基本";
-      } else if (c === 3 && kind === "まくり差し") {
-        second = [1,2,4,5,6]; third = [2,1,4,5,6]; followers = [1,2]; note = "3まくり差しは3-12が基本";
-      } else if (c === 4 && kind === "差し") {
-        second = [3,1,2,5,6]; third = [1,3,2,5,6]; followers = [3,1]; note = "3攻めから4差しなら4-3を許可";
-      } else if (c === 4 && kind === "まくり") {
-        second = [5,1,6,2,3]; third = [1,5,6,3,2]; blockedSecond = [3]; followers = [5,6,1]; note = "4まくりは4-15、気配次第で4-6";
-      } else if (c === 4 && kind === "まくり差し") {
-        second = [1,2,3,5,6]; third = [2,1,3,5,6]; followers = [1,2,3]; note = "4まくり差しは4-12、外の5は追走しにくい";
-      } else if (c === 5 && kind === "まくり") {
-        second = [1,6,4,3,2]; third = [6,1,4,3,2]; blockedSecond = [2,3,4]; followers = [1,6]; note = "5まくりは5-16が基本";
-      } else if (c === 5 && kind === "まくり差し") {
-        second = [1,2,3,4,6]; third = [2,1,3,4,6]; followers = [1,2,3,4]; note = "5より内でまくられず残る艇を優先";
-      } else if (c === 6 && kind === "まくり") {
-        second = [1,5,4,3,2]; third = [5,1,4,3,2]; blockedSecond = [2,3,4]; followers = [1,5]; note = "6まくりは6-15が基本";
-      } else if (c === 6 && kind === "まくり差し") {
-        second = [1,5,4,3,2]; third = [5,1,4,3,2]; followers = [1,5]; note = "5の攻めを利用する6-15が基本";
-      }
-      const secondBoats = coursesToBoats(second, headBoat);
-      const thirdBoats = coursesToBoats(third, headBoat);
-      return {
-        kind, course: c,
-        second: secondBoats,
-        third: thirdBoats,
-        baseSecond: [...secondBoats],
-        baseThird: [...thirdBoats],
-        blockedSecond: coursesToBoats(blockedSecond, headBoat),
-        followers: coursesToBoats(followers, headBoat),
-        note,
-      };
-    };
-
-    // まくり差しの「壁ST後手」を評価する。
-    // 攻め艇の直内艇が0.03以上遅い、または全艇でST下位2艇なら壁が弱いとみなす。
-    const makurizashiWallState = (headBoat) => {
-      const attackCourse = Number(courseByBoat[headBoat]);
-      if (!slit || attackCourse < 3 || attackCourse > 5) return null;
-      const wallBoat = boatByCourse[attackCourse - 1];
-      const headSt = Number(slit.find((x) => Number(x.boat) === Number(headBoat))?.st);
-      const wallSt = Number(slit.find((x) => Number(x.boat) === Number(wallBoat))?.st);
-      if (!Number.isFinite(headSt) || !Number.isFinite(wallSt)) return null;
-      const stSlowOrder = [...slit]
-        .filter((x) => Number.isFinite(Number(x.st)))
-        .sort((a, b) => Number(b.st) - Number(a.st))
-        .map((x) => Number(x.boat));
-      const delta = wallSt - headSt;
-      const late = delta >= 0.03 || stSlowOrder.slice(0, 2).includes(Number(wallBoat));
-      return { attackCourse, wallBoat, headSt, wallSt, delta, late };
-    };
-
-    // まくり差しは基本の内残り筋を守り、直内艇のSTが遅い時だけ外艇を拾う。
-    // ・外艇の3着追加: 壁ST後手＋壁艇に3指標中2勝、または総合評価3位以内
-    // ・外艇の2着昇格: 壁ST後手＋総合評価2位以内＋内の上位候補2艇に2勝
-    const applyMakurizashiWallPolicy = (tpl, secondOrder, thirdOrder) => {
-      if (tpl.kind !== "まくり差し") {
-        return { secondOrder: [...secondOrder], thirdOrder: [...thirdOrder], secondExceptional: [], thirdPromoted: [], notes: [] };
-      }
-      const wall = makurizashiWallState(boatByCourse[tpl.course]);
-      if (!wall?.late) {
-        return { secondOrder: [...secondOrder], thirdOrder: [...thirdOrder], secondExceptional: [], thirdPromoted: [], notes: [] };
-      }
-
-      const sec = [...secondOrder];
-      const third = [...thirdOrder];
-      const secondExceptional = [];
-      const thirdPromoted = [];
-      const notes = [];
-      const overallRankOf = (boat) => {
-        const idx = ranked.findIndex((r) => Number(r.boat) === Number(boat));
-        return idx >= 0 ? idx + 1 : 99;
-      };
-      const outerCourses = [];
-      for (let c = tpl.course + 1; c <= Math.min(6, tpl.course + 2); c++) outerCourses.push(c);
-      const outerBoats = outerCourses.map((c) => boatByCourse[c]).filter(Boolean);
-      const innerBenchmarks = sec
-        .filter((b) => Number(courseByBoat[b]) < Number(tpl.course))
-        .slice(0, 3);
-
-      for (const boat of outerBoats) {
-        const wallWins = metricWins(boat, wall.wallBoat);
-        const rank = overallRankOf(boat);
-        const keepThird = wallWins.count >= 2 || rank <= 3;
-        if (keepThird) {
-          const i = third.indexOf(boat);
-          if (i >= 0) third.splice(i, 1);
-          const insertAt = Math.min(2 + thirdPromoted.length, third.length);
-          third.splice(insertAt, 0, boat);
-          thirdPromoted.push(boat);
-          notes.push(`${wall.wallBoat}号艇のST後手（${wall.wallSt.toFixed(2)}／攻め艇${wall.headSt.toFixed(2)}）で外の${boat}号艇が展開を拾い、3着候補へ昇格`);
-        }
-
-        const beaten = innerBenchmarks.filter((b) => metricWins(boat, b).count >= 2);
-        const exceptional = rank <= 2 && beaten.length >= Math.min(2, innerBenchmarks.length) && innerBenchmarks.length > 0;
-        if (exceptional) {
-          const i = sec.indexOf(boat);
-          if (i >= 0) sec.splice(i, 1);
-          const beatenIdx = beaten.map((b) => sec.indexOf(b)).filter((i) => i >= 0);
-          const insertAt = beatenIdx.length ? Math.min(...beatenIdx) : Math.min(1, sec.length);
-          sec.splice(insertAt, 0, boat);
-          secondExceptional.push(boat);
-          notes.push(`${boat}号艇は壁ST後手に加え総合評価上位・3項目で内艇を上回るため2着へ例外昇格`);
-        }
-      }
-      return { secondOrder: sec, thirdOrder: third, secondExceptional, thirdPromoted, notes };
-    };
-
-    const rankByTwoOfThree = (base, blocked = []) => {
-      const original = [...base];
-      const arr = [...base];
-      const blockedSet = new Set(blocked || []);
-      const lastWinAgainst = new Map();
-      // 後位艇が直前艇に2項目以上勝つ場合だけ、1段ずつ昇格する。
-      for (let pass = 0; pass < arr.length; pass++) {
-        let changed = false;
-        for (let i = 1; i < arr.length; i++) {
-          const challenger = arr[i], upper = arr[i - 1];
-          if (blockedSet.has(challenger)) continue;
-          const cmp = metricWins(challenger, upper);
-          if (cmp.count >= 2) {
-            arr[i - 1] = challenger; arr[i] = upper;
-            lastWinAgainst.set(challenger, { upper, won: cmp.won });
-            changed = true;
-          }
-        }
-        if (!changed) break;
-      }
-      // 実際に基本順位より上へ動いた艇だけを「昇格」と表示する。
-      // 入れ替え途中の比較や、元から上位だった艇は昇格理由に含めない。
-      const promoted = arr.filter((boat, idx) => idx < original.indexOf(boat));
-      const reasons = promoted.map((boat) => {
-        const detail = lastWinAgainst.get(boat);
-        if (!detail) return `${boat}号艇が基本順位から昇格`;
-        return `${boat}号艇が${detail.won.join("・")}で${detail.upper}号艇を上回り昇格`;
-      });
-      return { order: arr, reasons, promoted };
-    };
-
-    // まくりで叩かれる内艇は「一律除外」ではなく、当日の強さで扱いを変える。
-    // ・低評価: 2着/3着とも除外
-    // ・中評価: 3着だけ残す
-    // ・突出: 3項目中2勝以上＋総合評価上位なら2着へ例外昇格
-    const applyCrushedBoatPolicy = (tpl, secResult, thirdResult) => {
-      const blocked = [...new Set(tpl.blockedSecond || [])];
-      const secondOrder = [...(secResult.order || [])];
-      const thirdBase = [...(thirdResult.order || [])];
-      const secondExceptional = [];
-      const thirdAllowed = [];
-      const thirdExcluded = [];
-      const notes = [];
-
-      const overallRankOf = (boat) => {
-        const idx = ranked.findIndex((r) => r.boat === boat);
-        return idx >= 0 ? idx + 1 : 99;
-      };
-      const overallScoreOf = (boat) => Number(ranked.find((r) => r.boat === boat)?.score || 0);
-
-      for (const boat of blocked) {
-        const benchmarks = secondOrder.filter((b) => b !== boat && !blocked.includes(b)).slice(0, 3);
-        const beaten = benchmarks.filter((b) => metricWins(boat, b).count >= 2);
-        const rank = overallRankOf(boat);
-        const score = overallScoreOf(boat);
-        const benchmarkScores = benchmarks.map(overallScoreOf).filter(Number.isFinite);
-        const avgBenchmark = benchmarkScores.length
-          ? benchmarkScores.reduce((a, b) => a + b, 0) / benchmarkScores.length
-          : 0;
-
-        // 3着は「基本流し」。ただし総合評価下位かつ内訳でも勝てない艇だけ切る。
-        const keepThird = rank <= 4 || beaten.length >= 1 || score >= avgBenchmark - 3;
-        if (keepThird) {
-          thirdAllowed.push(boat);
-          notes.push(`${boat}号艇は叩かれる想定だが評価が残るため3着候補に維持`);
-        } else {
-          thirdExcluded.push(boat);
-          notes.push(`${boat}号艇は叩かれる想定かつ総合評価・内訳とも低く3着候補から除外`);
-        }
-
-        // 2着への例外昇格は厳格。総合評価2位以内かつ上位候補2艇以上に2勝。
-        const exceptional = rank <= 2 && beaten.length >= Math.min(2, benchmarks.length);
-        if (exceptional && benchmarks.length) {
-          const current = secondOrder.indexOf(boat);
-          if (current >= 0) secondOrder.splice(current, 1);
-          const beatenIdx = beaten
-            .map((b) => secondOrder.indexOf(b))
-            .filter((i) => i >= 0);
-          const insertAt = beatenIdx.length ? Math.min(...beatenIdx) : Math.min(1, secondOrder.length);
-          secondOrder.splice(insertAt, 0, boat);
-          secondExceptional.push(boat);
-          notes.push(`${boat}号艇は叩かれる想定だが総合評価上位かつ3項目で突出し2着へ例外昇格`);
-        }
-      }
-
-      const thirdOrder = [
-        ...thirdBase.filter((b) => !thirdExcluded.includes(b)),
-        ...thirdBase.filter((b) => thirdExcluded.includes(b)),
-      ];
-      return {
-        secondOrder,
-        thirdOrder,
-        secondExceptional,
-        thirdAllowed,
-        thirdExcluded,
-        notes,
-      };
-    };
-
-    const kindOfHead = (headBoat) => {
-      if (Number(courseByBoat[headBoat]) === 1) return "逃げ";
-      const candidates = [];
-      if (rehPct) {
-        Object.entries(rehPct).forEach(([key, pct]) => {
-          const m = /^(.+)\((\d)\)$/.exec(key);
-          if (m && Number(m[2]) === headBoat && m[1] !== "抜き") candidates.push({ kind: m[1], v: Number(pct) || 0, src: "展リハ" });
-        });
-      }
-      if (km) {
-        const idx = headBoat - 2;
-        [["まくり", km.makuri?.[idx]], ["まくり差し", km.makurizashi?.[idx]], ["差し", km.sashi?.[idx]]]
-          .forEach(([kind, v]) => { if (v != null) candidates.push({ kind, v: Number(v) || 0, src: "決まり手率" }); });
-      }
-      candidates.sort((a,b) => b.v - a.v);
-      let kind = candidates[0]?.kind || "まくり";
-      if (Number(courseByBoat[headBoat]) === 2 && kind === "まくり差し") kind = "まくり";
-      return kind;
-    };
-
-    const scenarioRanksForHead = (headBoat) => {
-      const kind = kindOfHead(headBoat);
-      const tpl = templateForScenario(headBoat, kind);
-      let sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
-
-      // 4コースまくりでは、追走候補の5Cと6Cを直接比較する。
-      // 基本順位の間に1号艇がいるため、隣接比較だけでは6Cが5Cを3項目で
-      // 上回っていても昇格できないケースがあった。5C対6Cで2勝以上なら
-      // 両者の位置を直接入れ替え、6Cを5Cより上位へ昇格させる。
-      if (tpl.course === 4 && kind === "まくり") {
-        const boat5 = boatByCourse[5];
-        const boat6 = boatByCourse[6];
-        const i5 = sec.order.indexOf(boat5);
-        const i6 = sec.order.indexOf(boat6);
-        const cmp65 = boat5 && boat6 ? metricWins(boat6, boat5) : { count: 0, won: [] };
-        if (i5 >= 0 && i6 >= 0 && i6 > i5 && cmp65.count >= 2) {
-          const nextOrder = [...sec.order];
-          [nextOrder[i5], nextOrder[i6]] = [nextOrder[i6], nextOrder[i5]];
-          const promoted = nextOrder.filter((boat, idx) => idx < tpl.second.indexOf(boat));
-          sec = {
-            ...sec,
-            order: nextOrder,
-            promoted: [...new Set([...(sec.promoted || []), ...promoted, boat6])],
-            reasons: [...new Set([
-              ...(sec.reasons || []),
-              `${boat6}号艇が${cmp65.won.join("・")}で${boat5}号艇を上回り昇格`,
-            ])],
-          };
-        }
-      }
-      const third = rankByTwoOfThree(tpl.third, []);
-      const crushed = applyCrushedBoatPolicy(tpl, sec, third);
-      const wallPolicy = applyMakurizashiWallPolicy(tpl, crushed.secondOrder, crushed.thirdOrder);
-      const allSecondExceptional = [...new Set([
-        ...(crushed.secondExceptional || []),
-        ...(wallPolicy.secondExceptional || []),
-      ])];
-      const effectiveBlockedSet = new Set(
-        (tpl.blockedSecond || []).filter((b) => !allSecondExceptional.includes(b))
-      );
-      const resistanceSecond = applyResistanceToSecond(
-        wallPolicy.secondOrder,
-        headBoat,
-        kind,
-        effectiveBlockedSet
-      );
-      const thirdAllowed = new Set(crushed.thirdAllowed || []);
-      const resistanceThird = applyResistanceToThird(
-        wallPolicy.thirdOrder,
-        headBoat,
-        kind,
-        new Set(tpl.blockedSecond || []),
-        thirdAllowed
-      );
-      const thirdRank = resistanceThird.order
-        .filter((b) => !(crushed.thirdExcluded || []).includes(b));
-
-      return {
-        ...tpl,
-        secondRank: resistanceSecond.order,
-        thirdRank,
-        thirdAllowed: [...thirdAllowed],
-        thirdExcluded: [...(crushed.thirdExcluded || [])],
-        secondExceptional: allSecondExceptional,
-        secondPromoted: [...new Set([
-          ...(sec.promoted || []),
-          ...(resistanceSecond.promoted || []),
-          ...allSecondExceptional,
-        ])],
-        thirdPromoted: [...new Set([...(third.promoted || []), ...(wallPolicy.thirdPromoted || [])])],
-        reasons: [...new Set([
-          ...(sec.reasons || []),
-          ...(crushed.notes || []),
-          ...(wallPolicy.notes || []),
-          ...resistanceSecond.notes,
-          ...resistanceThird.notes,
-        ])],
-        resistanceNotes: [...new Set([...resistanceSecond.notes, ...resistanceThird.notes])],
-      };
     };
 
     // ── 展開連動: 決まり手から「1号艇を脅かす濃い攻め手艇」を抽出 ──
@@ -4843,377 +4319,76 @@ export default function App() {
         if (scenarioHeads.length >= 2) break;
       }
     }
-    // 展開リハーサルで頭出現率が高い艇も頭候補に格上げする。
-    //   決まり手率は場全体の平均なので「今日この隊形なら攻めが決まりやすい」形を拾えない。
-    //   リハーサルで頭率18%以上（＝1000回中180回以上その艇が頭）なら実戦的な頭候補とみなす。
-    const REH_HEAD_MIN = 18;
-    if (rehBoatPct) {
-      const rehHeads = Object.entries(rehBoatPct)
-        .map(([b, pct]) => ({ boat: Number(b), pct }))
-        .filter((x) => x.boat !== 1 && x.pct >= REH_HEAD_MIN)
-        .sort((a, b) => b.pct - a.pct);
-      for (const h of rehHeads) {
-        if (scenarioHeads.includes(h.boat)) continue;
-        // 決まり手ベースの頭より前に入れる（当日の隊形の方が情報として新しい）
-        scenarioHeads.unshift(h.boat);
-        if (scenarioHeads.length >= 3) break;
-      }
-      scenarioHeads.splice(3); // 頭は最大3艇まで
-    }
 
-    const hasUsableProbMap = probMap && Object.values(probMap).some((p) => Number.isFinite(Number(p)) && Number(p) > 0);
-
-    // シナリオ順位を使った買い目候補生成。
-    // 昇格艇を入れても、元の基本筋（特に追走艇）が全消しにならないよう
-    // baseSecond / baseThird の上位艇をアンカーとして必ず候補へ残す。
-    const scenarioTicketCandidates = (head, sc, cap = 24, mode = "balanced") => {
-      const out = [];
-      const push = (second, third) => {
-        if (!second || !third || second === head || third === head || second === third) return;
-        if ((sc.blockedSecond || []).includes(second) && !(sc.secondExceptional || []).includes(second)) return;
-        const t = `${head}-${second}-${third}`;
-        if (!out.includes(t)) out.push(t);
-      };
-      const uniq = (xs) => [...new Set((xs || []).filter(Boolean))];
-      const baseSecond = uniq(sc.baseSecond || sc.secondRank || []);
-      const baseThird = uniq(sc.baseThird || sc.thirdRank || []);
-      const promotedSecond = uniq(sc.secondPromoted || []);
-      const promotedThird = uniq(sc.thirdPromoted || []);
-      const exceptionalSecond = new Set(sc.secondExceptional || []);
-      const blocked = new Set((sc.blockedSecond || []).filter((b) => !exceptionalSecond.has(b)));
-      const thirdAllowed = new Set(sc.thirdAllowed || []);
-      const thirdExcluded = new Set(sc.thirdExcluded || []);
-      const safeThird = (xs) => uniq(xs).filter(
-        (b) => !thirdExcluded.has(b) && (!blocked.has(b) || thirdAllowed.has(b))
-      );
-
-      // まくり差しは基本の内残り筋を軸にする。
-      // ただし直内艇のSTが遅い場合は、壁の外側が展開を拾って3着へ入り、
-      // 総合評価と3指標が突出した艇だけ2着へ例外昇格する。
-      if (sc.kind === "まくり差し") {
-        const innerBase = baseSecond.filter((b) => Number(courseByBoat[b]) < Number(sc.course));
-        const exceptionalOuter = uniq(sc.secondExceptional || [])
-          .filter((b) => Number(courseByBoat[b]) > Number(sc.course));
-        const secondCore = uniq([
-          ...(innerBase.length ? innerBase.slice(0, 2) : baseSecond.slice(0, 2)),
-          ...exceptionalOuter,
-        ]);
-        const promotedOuterThird = uniq(sc.thirdPromoted || [])
-          .filter((b) => Number(courseByBoat[b]) > Number(sc.course));
-        const thirdCore = safeThird([
-          ...baseThird.slice(0, 2),
-          ...promotedOuterThird,
-          ...(sc.thirdRank || []).slice(0, 5),
-        ]);
-        for (const second of secondCore) {
-          for (const third of thirdCore) push(second, third);
-        }
-        return out.slice(0, cap);
-      }
-
-      // 5・6コースまくりは2着基本筋を固定し、総流しにしない。
-      // 5Cは5-16、6Cは6-15を軸に、3着は評価上位2艇まで。
-      if (sc.kind === "まくり" && [5, 6].includes(Number(sc.course))) {
-        const s1 = baseSecond[0], s2 = baseSecond[1];
-        const thirdPool = safeThird(uniq([...(sc.thirdRank || []), ...promotedThird]))
-          .filter((b) => b !== s1 && b !== s2)
-          .slice(0, 2);
-        push(s1, s2);
-        push(s2, s1);
-        for (const x of thirdPool) {
-          push(s1, x);
-          push(s2, x);
-        }
-        return out.slice(0, Math.min(cap, 6));
-      }
-
-      // 4コースまくりは2着順位を優先し、3着は評価で残った艇へ広く流す。
-      // 叩かれる2・3Cは低評価なら切り、中評価なら3着、突出時のみ2着へ例外昇格。
-      if (sc.kind === "まくり" && Number(sc.course) === 4) {
-        const c1 = boatByCourse[1];
-        const c5 = boatByCourse[5];
-        const c6 = boatByCourse[6];
-        const i5 = (sc.secondRank || []).indexOf(c5);
-        const i6 = (sc.secondRank || []).indexOf(c6);
-        const outerTop = i6 >= 0 && i5 >= 0 && i6 < i5 ? c6 : c5;
-        const outerOther = outerTop === c6 ? c5 : c6;
-        const secondCore = uniq([
-          ...(sc.secondRank || []),
-          outerTop,
-          c1,
-          outerOther,
-          ...(sc.secondExceptional || []),
-        ]).filter((b) => b && !blocked.has(b));
-        const thirdPool = safeThird(sc.thirdRank || []);
-
-        // 少点数では最上位2着候補から3着へ流し、点数増加で次の2着候補へ広げる。
-        for (const second of secondCore) {
-          for (const third of thirdPool) push(second, third);
-        }
-        return out.slice(0, cap);
-      }
-
-      // まくりは基本筋を残しつつ、実際に2勝して順位が上がった艇だけ2着へ追加。
-      // 3Cまくりで5が昇格した場合は、先頭4点を 3-1-4 / 3-1-5 / 3-5-1 / 3-5-4 にする。
-      if (sc.kind === "まくり") {
-        const baseS1 = baseSecond[0];
-        const baseS2 = baseSecond[1];
-        const promo = promotedSecond.find((b) => !blocked.has(b));
-        const thirdCore = safeThird(uniq([...baseThird.slice(0, 3), ...promotedThird]));
-        if (baseS1 && baseS2) {
-          push(baseS1, baseS2);
-          if (promo) {
-            push(baseS1, promo);
-            push(promo, baseS1);
-            push(promo, baseS2);
-            push(baseS2, baseS1);
-            push(baseS2, promo);
-          } else {
-            push(baseS2, baseS1);
-            const altThird = thirdCore.find((b) => b !== baseS1 && b !== baseS2);
-            if (altThird) {
-              push(baseS1, altThird);
-              push(baseS2, altThird);
-            }
-          }
-        }
-        const secondCore = uniq([
-          ...baseSecond.slice(0, mode === "solid" ? 2 : 2),
-          ...promotedSecond,
-        ]).filter((b) => !blocked.has(b));
-        for (const second of secondCore) {
-          for (const third of thirdCore) push(second, third);
-        }
-        return out.slice(0, cap);
-      }
-
-      // 逃げ・差しは基本上位2艇を軸にし、2勝で本当に昇格した艇だけ追加する。
-      const secondCore = uniq([
-        ...baseSecond.slice(0, 2),
-        ...promotedSecond,
-      ]).filter((b) => !blocked.has(b));
-      const thirdCore = safeThird(uniq([
-        ...baseThird.slice(0, mode === "solid" ? 3 : 4),
-        ...promotedThird,
-      ]));
-      for (const second of secondCore) {
-        for (const third of thirdCore) push(second, third);
-      }
-      return out.slice(0, cap);
-    };
-
-    const scenarioCache = new Map();
-    const getScenario = (head) => {
-      if (!scenarioCache.has(head)) scenarioCache.set(head, scenarioRanksForHead(head));
-      return scenarioCache.get(head);
-    };
-    const scenarioForKind = (head, kind) => {
-      const key = `${head}:${kind}`;
-      if (!scenarioCache.has(key)) {
-        const tpl = templateForScenario(head, kind);
-        let sec = rankByTwoOfThree(tpl.second, tpl.blockedSecond);
-
-      // 4コースまくりでは、追走候補の5Cと6Cを直接比較する。
-      // 基本順位の間に1号艇がいるため、隣接比較だけでは6Cが5Cを3項目で
-      // 上回っていても昇格できないケースがあった。5C対6Cで2勝以上なら
-      // 両者の位置を直接入れ替え、6Cを5Cより上位へ昇格させる。
-      if (tpl.course === 4 && kind === "まくり") {
-        const boat5 = boatByCourse[5];
-        const boat6 = boatByCourse[6];
-        const i5 = sec.order.indexOf(boat5);
-        const i6 = sec.order.indexOf(boat6);
-        const cmp65 = boat5 && boat6 ? metricWins(boat6, boat5) : { count: 0, won: [] };
-        if (i5 >= 0 && i6 >= 0 && i6 > i5 && cmp65.count >= 2) {
-          const nextOrder = [...sec.order];
-          [nextOrder[i5], nextOrder[i6]] = [nextOrder[i6], nextOrder[i5]];
-          const promoted = nextOrder.filter((boat, idx) => idx < tpl.second.indexOf(boat));
-          sec = {
-            ...sec,
-            order: nextOrder,
-            promoted: [...new Set([...(sec.promoted || []), ...promoted, boat6])],
-            reasons: [...new Set([
-              ...(sec.reasons || []),
-              `${boat6}号艇が${cmp65.won.join("・")}で${boat5}号艇を上回り昇格`,
-            ])],
-          };
-        }
-      }
-        const third = rankByTwoOfThree(tpl.third, []);
-        const crushed = applyCrushedBoatPolicy(tpl, sec, third);
-        const effectiveBlockedSet = new Set(
-          (tpl.blockedSecond || []).filter((b) => !crushed.secondExceptional.includes(b))
-        );
-        const resistanceSecond = applyResistanceToSecond(
-          crushed.secondOrder,
-          head,
-          tpl.kind,
-          effectiveBlockedSet
-        );
-        const thirdAllowed = new Set(crushed.thirdAllowed || []);
-        const resistanceThird = applyResistanceToThird(
-          crushed.thirdOrder,
-          head,
-          tpl.kind,
-          new Set(tpl.blockedSecond || []),
-          thirdAllowed
-        );
-        const thirdRank = resistanceThird.order
-          .filter((b) => !(crushed.thirdExcluded || []).includes(b));
-        scenarioCache.set(key, {
-          ...tpl,
-          secondRank: resistanceSecond.order,
-          thirdRank,
-          thirdAllowed: [...thirdAllowed],
-          thirdExcluded: [...(crushed.thirdExcluded || [])],
-          secondExceptional: [...(crushed.secondExceptional || [])],
-          secondPromoted: [...new Set([
-            ...(sec.promoted || []),
-            ...(resistanceSecond.promoted || []),
-            ...(crushed.secondExceptional || []),
-          ])],
-          thirdPromoted: third.promoted,
-          reasons: [...new Set([
-            ...(sec.reasons || []),
-            ...(crushed.notes || []),
-            ...resistanceSecond.notes,
-            ...resistanceThird.notes,
-          ])],
-          resistanceNotes: [...new Set([...resistanceSecond.notes, ...resistanceThird.notes])],
-        });
-      }
-      return scenarioCache.get(key);
-    };
-    const rehearsalKindOfHead = (head) => {
-      if (Number(courseByBoat[head]) === 1) return "逃げ";
-      const rows = [];
-      Object.entries(rehPct || {}).forEach(([key, pct]) => {
-        const m = /^(.+)\((\d)\)$/.exec(key);
-        if (m && Number(m[2]) === Number(head) && m[1] !== "抜き") rows.push({ kind: m[1], pct: Number(pct) || 0 });
-      });
-      rows.sort((a,b) => b.pct - a.pct);
-      let kind = rows[0]?.kind || kindOfHead(head);
-      if (Number(courseByBoat[head]) === 2 && kind === "まくり差し") kind = "まくり";
-      return kind;
-    };
-
-    const ticketScenarioFit = (ticket) => {
-      const [head, second, third] = String(ticket || "").split("-").map(Number);
-      if (![head, second, third].every(Number.isFinite)) return -999;
-      const sc = getScenario(head);
-      const blocked = new Set(
-        (sc.blockedSecond || []).filter((b) => !(sc.secondExceptional || []).includes(b))
-      );
-      if (blocked.has(second)) return -999;
-      const sIdx = sc.secondRank.indexOf(second);
-      const tIdx = sc.thirdRank.indexOf(third);
-      if (sIdx < 0 || tIdx < 0) return -999;
-      let fit = 12 - sIdx * 2 - tIdx;
-      if ((sc.baseSecond || []).slice(0,2).includes(second)) fit += 3;
-      if ((sc.baseThird || []).slice(0,3).includes(third)) fit += 2;
-      if ((sc.secondPromoted || []).includes(second)) fit += 2;
-      return fit;
-    };
-
-    // 本線も主シナリオへ接続。頭は従来どおり1着率1位で固定し、
-    // 2・3着だけを決まり手別の基本筋＋2勝ルールで組み直す。
-    if (honHead) {
-      const honSc = getScenario(honHead);
-      const honScenarioCandidates = scenarioTicketCandidates(honHead, honSc, 24, "solid");
-      const honSorted = hasUsableProbMap
-        ? [...honScenarioCandidates].sort((a,b) => {
-            const pd = probOf(b) - probOf(a);
-            if (Math.abs(pd) > 1e-12) return pd;
-            return ticketScenarioFit(b) - ticketScenarioFit(a);
-          })
-        : [...honScenarioCandidates].sort((a,b) => ticketScenarioFit(b) - ticketScenarioFit(a));
-      const nextHon = honSorted.slice(0, HON_TARGET);
-      if (nextHon.length >= HON_MIN) {
-        honmei = {
-          label: "本線",
-          desc: `1着率1位を1着固定／${honSc.kind}の基本筋＋2勝ルールで2・3着選定`,
-          tickets: nextHon,
-          ticketScenarios: Object.fromEntries(nextHon.map((t) => [t, `${honHead}号艇${honSc.kind}`])),
-          scenarioEngine: [honSc],
-        };
-      }
-    }
-
-    // 対抗：決まり手別シナリオエンジンで2・3着を組み立てる。
-    // 頭候補は1着率2位＋展開濃厚艇。本線との重複は除外する。
+    // 対抗（確率モデル駆動）: 頭候補は現行どおり1着率2位＋展開濃厚艇。
+    //   各頭の20通りをprobMapの確率降順で採用し、本線と被る目は除外する。
     const honSet = new Set(honmei.tickets);
     const taikouTickets = [];
     const pushUnique = (t) => {
       if (!t) return;
       if (!taikouTickets.includes(t) && !honSet.has(t)) taikouTickets.push(t);
     };
-    const a1 = r1[0], a2 = r1[1];
+    const a1 = r1[0], a2 = r1[1];      // 1着率1位・2位
+    const axis = r3[0];                // 3連対率1位（フォールバック用の軸）
+    const partners2 = [...new Set([...r3.slice(0, 4), ...stRank.slice(0, 3), ...order.slice(0, 4)])].filter(Boolean);
     const taikouHeads = [...new Set([a2, ...scenarioHeads].filter(Boolean))];
-    const engineDetails = [];
-    const TK_MAX = 12;
+    const hasUsableProbMap = probMap && Object.values(probMap).some((p) => Number.isFinite(Number(p)) && Number(p) > 0);
+    let taikouFlowNote = scenarioHeads.length > 0
+      ? `／展開濃厚艇${scenarioHeads.join("・")}号を頭に反映`
+      : "";
 
-    for (const head of taikouHeads) {
-      if (taikouTickets.length >= TK_MAX) break;
-      const sc = getScenario(head);
-      const quota = Math.max(3, Math.floor(TK_MAX / Math.max(1, taikouHeads.length)));
-      let added = 0;
-
-      // シナリオ筋を先に確保する。
-      // 2着へ昇格した艇には、3着基本上位を複数組み合わせて
-      // 「昇格艇の1点だけ」にならないようにする。
-      const priority = scenarioTicketCandidates(head, sc, 12, "balanced");
-      for (const t of priority) {
-        if (added >= quota || taikouTickets.length >= TK_MAX) break;
-        const before = taikouTickets.length;
-        pushUnique(t);
-        if (taikouTickets.length > before) added++;
-      }
-
-      // 追加枠も専用テンプレート内だけで補完する。
-      // secondRank上位を無条件に広げる旧buildTicketsは、未昇格艇まで2着へ入るため使わない。
-      const candidates = scenarioTicketCandidates(head, sc, 24, "balanced");
-      const rankedCandidates = candidates;
-      for (const t of rankedCandidates) {
-        if (added >= quota || taikouTickets.length >= TK_MAX) break;
-        const before = taikouTickets.length;
-        pushUnique(t);
-        if (taikouTickets.length > before) added++;
-      }
-      engineDetails.push({ head, ...sc });
-    }
-
-    // 頭ごとの枠で12点に届かない場合は、同じシナリオ順位を保ったまま補完。
-    for (const d of engineDetails) {
-      if (taikouTickets.length >= TK_MAX) break;
-      const more = scenarioTicketCandidates(d.head, d, 24, "balanced");
-      for (const t of more) {
-        pushUnique(t);
-        if (taikouTickets.length >= TK_MAX) break;
-      }
-    }
-    // シナリオ頭が取れない場合だけ旧順位で安全に補完。
-    if (taikouTickets.length < 4 && a2) {
-      const others = order.filter((b) => b !== a2);
-      for (const t of buildTickets([a2], others, others, 12)) {
-        pushUnique(t);
-        if (taikouTickets.length >= 4) break;
+    if (hasUsableProbMap && taikouHeads.length > 0) {
+      for (const head of taikouHeads) {
+        const others = [1, 2, 3, 4, 5, 6].filter((b) => b !== head);
+        const headCandidates = sortByProb(buildTickets([head], others, others, 20));
+        for (const t of headCandidates) {
+          pushUnique(t);
+          if (taikouTickets.length >= 12) break;
+        }
+        if (taikouTickets.length >= 12) break;
       }
     }
 
-    const detailText = engineDetails.slice(0, 2).map((d) => {
-      const move = d.reasons.length ? `／${d.reasons.slice(0, 1).join("、")}` : "";
-      return `${d.head}号艇${d.kind}：2着${d.secondRank.slice(0,3).join("・")}、3着${d.thirdRank.slice(0,3).join("・")}（${d.note}）${move}`;
-    }).join("／");
-    const taikouTicketScenarios = Object.fromEntries(taikouTickets.map((t) => {
-      const h = Number(String(t).split("-")[0]);
-      const sc = engineDetails.find((d) => Number(d.head) === h) || getScenario(h);
-      return [t, `${h}号艇${sc.kind}`];
-    }));
+    // probMapが空・全0、または確率候補だけで埋まらない場合は現行ヒューリスティックで補完する。
+    if (taikouTickets.length < 12) {
+      if (scenarioHeads.length > 0) {
+        for (const h of scenarioHeads) {
+          const others = partners2.filter((b) => b !== h);
+          for (const c of others) { if (c !== 1) pushUnique(`${h}-1-${c}`); if (taikouTickets.length >= 6) break; }
+          for (const b of others) { if (b !== 1) pushUnique(`${h}-${b}-1`); if (taikouTickets.length >= 6) break; }
+          if (taikouTickets.length >= 6) break;
+        }
+      }
+      if (a2 && taikouTickets.length < 12) {
+        const head = a2;
+        if (axis && axis !== head) {
+          for (const c of partners2) { if (c !== head && c !== axis) pushUnique(`${head}-${axis}-${c}`); if (taikouTickets.length >= 12) break; }
+          for (const b of partners2) { if (b !== head && b !== axis) pushUnique(`${head}-${b}-${axis}`); if (taikouTickets.length >= 12) break; }
+        }
+        if (taikouTickets.length < 12) {
+          for (const b of partners2) {
+            if (b === head) continue;
+            for (const c of partners2) { if (c !== head && c !== b) pushUnique(`${head}-${b}-${c}`); if (taikouTickets.length >= 12) break; }
+            if (taikouTickets.length >= 12) break;
+          }
+        }
+      }
+      if (taikouTickets.length < 12 && a1 && a2) {
+        for (const c of partners2) { if (c !== a1 && c !== a2) pushUnique(`${a2}-${a1}-${c}`); if (taikouTickets.length >= 12) break; }
+      }
+      if (taikouTickets.length < 12) {
+        const top4 = order.slice(0, 4);
+        const more = buildTickets(top4.slice(0, 2), top4, top4, 12);
+        for (const t of more) { pushUnique(t); if (taikouTickets.length >= 12) break; }
+      }
+    }
+
     const taikou = {
       label: "対抗",
-      desc: `決まり手別の基本筋＋モーター・平均ST・コース別成績の2勝ルール${detailText ? `／${detailText}` : ""}`,
+      desc: hasUsableProbMap
+        ? `1着率2位＋展開濃厚艇を頭候補／推定確率上位・本線重複除外${taikouFlowNote}`
+        : `確率未取得のため従来ロジックで補完／本線重複除外${taikouFlowNote}`,
       tickets: taikouTickets,
-      ticketScenarios: taikouTicketScenarios,
-      scenarioEngine: engineDetails,
     };
 
     // 穴: オッズ取得時は120通り全体からEV基準で選定。
@@ -5280,16 +4455,10 @@ export default function App() {
       const excluded = new Set([...honmei.tickets, ...taikou.tickets]);
       const hasOdds = odds && Object.values(odds).some((o) => Number.isFinite(Number(o)) && Number(o) > 0);
       const evCandidates = hasOdds
-        ? all120.filter((t) => {
+        ? sortByEv(all120.filter((t) => {
             const o = Number(odds?.[t]);
-            return !excluded.has(t)
-              && ticketScenarioFit(t) >= 6
-              && Number.isFinite(o) && o >= 20 && probOf(t) * o >= 1.0;
-          }).sort((a,b) => {
-            const evDiff = (probOf(b) * Number(odds?.[b] || 0)) - (probOf(a) * Number(odds?.[a] || 0));
-            if (Math.abs(evDiff) > 1e-12) return evDiff;
-            return ticketScenarioFit(b) - ticketScenarioFit(a);
-          })
+            return !excluded.has(t) && Number.isFinite(o) && o >= 20 && probOf(t) * o >= 1.0;
+          }))
         : [];
 
       let tickets = evCandidates.slice(0, 12);
@@ -5303,9 +4472,7 @@ export default function App() {
       } else {
         // 従来の妙味艇ロジックへフォールバックし、カードが空になるのを防ぐ。
         const legacy = [];
-        const pushU = (t) => {
-          if (t && ticketScenarioFit(t) >= 5 && !legacy.includes(t) && !excluded.has(t)) legacy.push(t);
-        };
+        const pushU = (t) => { if (t && !legacy.includes(t) && !excluded.has(t)) legacy.push(t); };
         if (meritBoats.length > 0) {
           const fillers = [...new Set([...order.slice(0, 3), ...meritBoats])];
           for (const m of meritBoats) {
@@ -5342,24 +4509,7 @@ export default function App() {
           : `EV条件該当なしのため評価2・3位頭の中穴へフォールバック`;
       }
 
-      const ticketScenarios = {};
-      for (const t of tickets) {
-        const h = Number(String(t).split("-")[0]);
-        const sc = getScenario(h);
-        ticketScenarios[t] = `${h}号艇${sc.kind}`;
-      }
-      const scenarioGroups = Object.entries(ticketScenarios).reduce((acc, [t, label]) => {
-        let row = acc.find((x) => x.label === label);
-        if (!row) { row = { label, tickets: [] }; acc.push(row); }
-        row.tickets.push(t);
-        return acc;
-      }, []);
-      const scenarioText = scenarioGroups.map((g) => g.label).join("・");
-      ana = {
-        label: "穴",
-        desc: `シナリオ整合性を満たす買い目から選定${scenarioText ? `（${scenarioText}）` : ""}／${desc}`,
-        tickets, ticketScenarios, scenarioGroups,
-      };
+      ana = { label: "穴", desc, tickets };
     }
 
     // 合成オッズ（オッズ貼り付け時）= 1 ÷ Σ(1/各点オッズ)
@@ -5371,123 +4521,53 @@ export default function App() {
       return { odds: 1 / inv, covered: vals.length, total: tickets.length };
     };
 
-    // ── 展開リハ（展リハ発の「拾えていない買い目」） ──
-    //
-    //   本線・対抗・穴もシナリオ整合性を使うが、展リハはリハーサルで拾えた別頭を専用テンプレートで補完する。
-    //   そのため、展開リハーサル（今日のST・進入・評価で1000回試走した結果）で
-    //   頭に来やすい艇でも、総合評価が低いと3カードのどこにも頭として現れないことがある。
-    //   （例: リハーサルで頭率19%の4号艇が、本線〜穴で1点も頭になっていない）
-    //
-    //   このカードは「リハーサル的には濃いのに、上3カードで頭として拾えていない艇」を
-    //   検出して、その艇頭の目だけを出す“抜け拾い”専用カードです。
-    //   ※ v141: 旧「超穴」を廃止し、その枠をこのカードに置き換えました。
-    //     超穴は穴とほぼ同じ目が出る（オッズ条件が重なる）ことが多く、
-    //     独立したカードとして機能していなかったためです。
-    const FUKU_REH_MIN = 8;   // 頭出現率がこれ未満の艇は対象外(%)
-    const FUKU_REH_RANK_MAX = 3; // 展開リハ総合1着率の上位3艇だけを対象にする
-    const FUKU_MAX = 12;      // 最大点数
+    // 超穴: 120通り全体からEV1.0以上・50倍以上を抽出し、合成10倍を維持して最大12点。
+    const rankPos = Object.fromEntries(order.map((b, i) => [b, i]));
+    const likeliness = (t) => t.split("-").reduce((a, b) => a + (rankPos[Number(b)] ?? 9), 0);
     const all120Tickets = buildTickets([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], 120);
-    const hasOdds = odds && Object.values(odds).some((o) => Number.isFinite(Number(o)) && Number(o) > 0);
-    let fukuhei;
-    {
-      // 買い目の重複除外は本線・対抗・穴すべてを対象にする。
-      const coveredSet = new Set([...honmei.tickets, ...taikou.tickets, ...ana.tickets]);
-      // 「展開リハ」の採用判定は、本線・対抗で既に頭として使われているかだけを見る。
-      const mainCounterSet = new Set([...honmei.tickets, ...taikou.tickets]);
-      const mainCounterHeads = new Set(
-        [...mainCounterSet].map((t) => Number(String(t).split("-")[0])).filter(Number.isFinite)
-      );
-      const headCountOf = (b) => {
-        let n = 0;
-        mainCounterSet.forEach((t) => { if (Number(String(t).split("-")[0]) === b) n += 1; });
-        return n;
-      };
-      let tickets = [];
-      let desc;
-      let gaps = [];
-      if (rehBoatPct) {
-        // 新ルール:
-        //  1) 展開リハ総合1着率3位以内
-        //  2) 頭率8%以上
-        //  3) 本線・対抗で頭として採用されていない
-        // 条件該当艇がなければカード自体を表示しない。
-        gaps = [1, 2, 3, 4, 5, 6]
-          .map((b) => ({ boat: b, reh: Number(rehBoatPct[b] ?? 0) }))
-          .filter((g) => Number.isFinite(g.reh))
-          .sort((a, b) => b.reh - a.reh)
-          .slice(0, FUKU_REH_RANK_MAX)
-          .filter((g) => g.reh >= FUKU_REH_MIN && !mainCounterHeads.has(g.boat))
-          .map((g) => ({ ...g, cov: headCountOf(g.boat), gap: g.reh }))
-          .slice(0, 2);
-      }
-      if (gaps.length > 0) {
-        const per = gaps.length >= 2 ? 6 : FUKU_MAX;
-        for (const g of gaps) {
-          const rehKind = rehearsalKindOfHead(g.boat);
-          const sc = scenarioForKind(g.boat, rehKind);
-          g.kind = rehKind;
-          const cand = scenarioTicketCandidates(g.boat, sc, 24, "balanced")
-            .filter((t) => !coveredSet.has(t) && ticketScenarioFit(t) >= 5);
-          // オッズがあるときは「EV1.0以上」に絞ってから確率上位を採る。
-          //   単純なEV降順だと最も人気の無い目ばかりになり、拾いの意味が薄れるため。
-          const evOk = hasOdds
-            ? cand.filter((t) => {
-              const o = Number(odds?.[t]);
-              return Number.isFinite(o) && o > 0 && probOf(t) * o >= 1.0;
-            })
-            : [];
-          const sorted = evOk.length ? sortByProb(evOk) : sortByProb(cand);
-          let n = 0;
-          for (const t of sorted) {
-            if (n >= per || tickets.length >= FUKU_MAX) break;
-            if (tickets.includes(t)) continue;
-            tickets.push(t);
-            n += 1;
-          }
-        }
-        const gapStr = gaps
-          .map((g) => `${g.boat}号艇${g.kind || ""}（総合1着率${round1(g.reh)}%・本線・対抗で頭なし）`)
-          .join("、");
-        desc = `展リハ1000回試走での総合1着率が3位以内・8%以上で、本線・対抗に頭がない艇＝${gapStr}${hasOdds ? "／その艇頭からEV1.0以上を優先" : "／その艇頭を推定確率順"}`;
-      } else if (rehBoatPct) {
-        desc = "展リハ1000回試走で総合1着率3位以内・8%以上の艇は、本線または対抗で頭として拾えています";
-      } else {
-        desc = "全艇の平均STを入力すると、展リハ発の買い目が出ます";
-      }
-      const ticketScenarios = {};
-      for (const t of tickets) {
-        const h = Number(String(t).split("-")[0]);
-        const g = gaps.find((x) => Number(x.boat) === h);
-        ticketScenarios[t] = `${h}号艇${g?.kind || rehearsalKindOfHead(h)}`;
-      }
-      fukuhei = { label: "展リハ", desc, tickets, gaps, ticketScenarios };
-    }
-
-    // 合成オッズは展開リハにも付ける（0点のときは null になる）
-    [honmei, taikou, ana, fukuhei].forEach((b) => { b.comp = compOdds(b.tickets); });
-
-    // 展開リハは「抜けがあるときだけ」出す。抜けが無いレースでカードを出しても情報にならないため。
-    const bets = fukuhei.tickets.length > 0
-      ? [honmei, taikou, ana, fukuhei]
-      : [honmei, taikou, ana];
-
-    // 表示・説明・実際の買い目を完全一致させる。
-    // 各カードのシナリオ内訳は、そのカードに本当に入っている買い目だけから再構築する。
-    for (const bet of bets) {
-      const byLabel = new Map();
-      for (const t of bet.tickets || []) {
-        const h = Number(String(t).split("-")[0]);
-        const label = bet.ticketScenarios?.[t] || `${h}号艇${getScenario(h).kind}`;
-        if (!byLabel.has(label)) byLabel.set(label, []);
-        byLabel.get(label).push(t);
-      }
-      bet.scenarioGroups = [...byLabel.entries()].map(([label, tickets]) => ({
-        label,
-        tickets: sortTicketsForDisplay([...new Set(tickets)]),
-        compressed: compressTickets(sortTicketsForDisplay([...new Set(tickets)])),
+    let choBet;
+    if (odds && Object.values(odds).some((o) => Number.isFinite(Number(o)) && Number(o) > 0)) {
+      const evLongshots = sortByEv(all120Tickets.filter((t) => {
+        const o = Number(odds?.[t]);
+        return Number.isFinite(o) && o >= 50 && probOf(t) * o >= 1.0;
       }));
-      bet.scenarioSummary = bet.scenarioGroups.map((g) => g.label).join("・");
+      const picked = [];
+      for (const t of evLongshots) {
+        const trial = [...picked, t];
+        const c = compOdds(trial);
+        if (trial.length <= 12 && c && c.odds >= 10) picked.push(t);
+        if (picked.length >= 12) break;
+      }
+      if (picked.length > 0) {
+        choBet = {
+          label: "超穴",
+          desc: "120通りからEV1.0以上・50倍以上をEV順／合成10倍以上を維持",
+          tickets: picked,
+        };
+      } else {
+        // 条件該当0点は現行の1点勝負（最大3点）へフォールバック。
+        const single = sortByEv(all120Tickets.filter((t) => Number(odds?.[t]) > 10))
+          .slice(0, 3);
+        const safeSingle = single.length ? single : sortByProb(all120Tickets).slice(0, 3);
+        choBet = {
+          label: "超穴",
+          desc: "条件該当なしのため1点勝負（最大3点）",
+          tickets: safeSingle,
+        };
+      }
+    } else {
+      const cand = sortByProb(all120Tickets).slice(0, 3);
+      const safeCand = cand.length ? cand : all120Tickets.slice(0, 3);
+      choBet = {
+        label: "超穴",
+        desc: "オッズ未取得のため推定確率上位を目安表示",
+        tickets: safeCand,
+      };
     }
+
+    [honmei, taikou, ana, choBet].forEach((b) => { b.comp = compOdds(b.tickets); });
+
+    const bets = [honmei, taikou, ana, choBet];
 
     // EVランキングは選択済みの買い目だけでなく、3連単120通り全体を対象にする。
     let evList = [];
@@ -5524,86 +4604,46 @@ export default function App() {
     const headRank = [...order].sort((a, b) => headScore(b) - headScore(a));
     const heads = headRank.slice(0, 2); // 頭1〜2艇に確定
 
-    // 決まり手シナリオ（決まり手率＋展開リハーサルのブレンドで3〜4個を採用）
-    //
-    //   v139 まで: 決まり手率（場全体の平均）×気配係数 のみで選定していた。
-    //   その結果、展開リハーサル（当日の隊形シミュレーション）で最も濃い展開が
-    //   シナリオにも買い目にも一切出てこない、というズレが起きていた。
-    //   （例: リハーサルで4号艇まくり27.6%なのに、シナリオは5号艇まくり差し3.7%）
-    //
-    //   v140 から: 2つの情報源を明示的にブレンドする。
-    //     prior = 決まり手率ベースのシェア（その場でその決まり手が出る平均的な割合）
-    //     reh   = 展開リハーサル出現率（今日のST・進入・評価ならどう動くか）
-    //     score = prior × 0.45 + reh × 0.55
-    //   両方が指す展開ほど上位に来る。片方しか無い展開も候補には残るが順位は下がる。
-    const REH_W_PRIOR = 0.45; // 決まり手率（場の平均傾向）の重み
-    const REH_W_REH = 0.55;   // 展開リハーサル（当日の隊形）の重み
+    // 決まり手シナリオ（決まり手率データから可能性が高い2〜3個を採用）
     let scenarios = [];
-    if (km || rehPct) {
+    if (km) {
       const cand = [];
-      const seenCand = new Set();
-      const addCand = (type, boat, rate) => {
-        const key = `${type}-${boat}`;
-        if (seenCand.has(key)) return;
-        seenCand.add(key);
-        cand.push({ type, boat, rate: rate ?? 0 });
-      };
-      if (km) {
-        // 逃げ（1号艇）
-        if (km.nige != null) addCand("逃げ", 1, km.nige);
-        // 2〜6号艇のまくり・まくり差し・差し
-        const arrAt = (arr, boat) => (arr && arr[boat - 2] != null ? arr[boat - 2] : null);
-        for (let b = 2; b <= 6; b++) {
-          const mk = arrAt(km.makuri, b);
-          const mz = arrAt(km.makurizashi, b);
-          const sa = arrAt(km.sashi, b);
-          if (mk != null && mk > 0) addCand("まくり", b, mk);
-          if (mz != null && mz > 0) addCand("まくり差し", b, mz);
-          if (sa != null && sa > 0) addCand("差し", b, sa);
-        }
+      // 逃げ（1号艇）
+      if (km.nige != null) cand.push({ type: "逃げ", boat: 1, rate: km.nige });
+      // 2〜6号艇のまくり・まくり差し・差し
+      const arrAt = (arr, boat) => (arr && arr[boat - 2] != null ? arr[boat - 2] : null);
+      for (let b = 2; b <= 6; b++) {
+        const mk = arrAt(km.makuri, b);
+        const mz = arrAt(km.makurizashi, b);
+        const sa = arrAt(km.sashi, b);
+        if (mk != null && mk > 0) cand.push({ type: "まくり", boat: b, rate: mk });
+        if (mz != null && mz > 0) cand.push({ type: "まくり差し", boat: b, rate: mz });
+        if (sa != null && sa > 0) cand.push({ type: "差し", boat: b, rate: sa });
       }
-      // リハーサルで出現した展開も候補に加える（決まり手率データが薄い/未取得でも拾える）
-      if (rehPct) {
-        for (const k of Object.keys(rehPct)) {
-          const m = /^(.+)\((\d)\)$/.exec(k);
-          if (!m) continue;
-          const type = m[1];
-          const boat = Number(m[2]);
-          if (type === "抜き") continue; // 抜きは買い目の頭として扱わない
-          if (rehPct[k] < 3) continue;   // ノイズ級の出現率は候補にしない
-          addCand(type, boat, 0);
-        }
-      }
-
       // 気配で重み付け（気配上位の決まり手ほど現実味）→ rate × 気配係数
-      const kehaiOf = (boat) => {
-        const pos = order.indexOf(boat);
-        return pos >= 0 ? (1 + (6 - pos) * 0.06) : 1;
-      };
-      const priorSum = cand.reduce((a, c) => a + c.rate * kehaiOf(c.boat), 0);
       const weighted = cand.map((c) => {
-        const kehai = kehaiOf(c.boat);
-        // prior をシェア(%)に正規化して、リハーサル出現率(%)と同じ土俵に乗せる
-        const prior = priorSum > 0 ? ((c.rate * kehai) / priorSum) * 100 : 0;
-        const reh = rehPct ? (rehPct[`${c.type}(${c.boat})`] ?? 0) : null;
-        const score = reh == null ? prior : prior * REH_W_PRIOR + reh * REH_W_REH;
-        return { ...c, kehai, prior, reh, score };
+        const pos = order.indexOf(c.boat);
+        const kehai = pos >= 0 ? (1 + (6 - pos) * 0.06) : 1;
+        return { ...c, score: c.rate * kehai };
       }).sort((a, b) => b.score - a.score);
 
-      // 採用ルール（枠の取り合いで濃い展開が押し出されないように優先順位を明示）
-      //   1) 展開リハーサル最上位の展開は必ず入れる ← 視聴者指摘の本丸
-      //   2) 本命頭（heads[0]）の展開を1枠だけ確保
-      //      ※ 旧実装は heads 2艇ぶん確保していたため、3枠中2枠が埋まり
-      //        リハーサルで濃い展開が入る余地が無かった
-      //   3) 残りはブレンドスコア順
-      const SC_MAX = rehPct ? 4 : 3;
+      // 本命頭候補の艇は必ずシナリオ候補に含める。
+      // 例：4号艇が本命なら、4号艇のまくり/差し/まくり差しで一番現実味のある展開を表示する。
+      const picked = weighted.filter((c) => c.rate >= 10).slice(0, 3);
+      const headPicked = heads
+        .map((h) => weighted.filter((c) => c.boat === h).sort((a, b) => b.score - a.score)[0])
+        .filter(Boolean);
       const seenScenario = new Set();
+      const scenarioCountByBoat = new Map();
       const top = [];
       const pushSc = (c) => {
         if (!c || top.length >= SC_MAX) return;
         const key = `${c.type}-${c.boat}`;
         if (seenScenario.has(key)) return;
+        // 同じ艇の別決まり手だけで4枠を占有しない。最大2展開までは設計意図どおり許容。
+        if ((scenarioCountByBoat.get(c.boat) || 0) >= 2) return;
         seenScenario.add(key);
+        scenarioCountByBoat.set(c.boat, (scenarioCountByBoat.get(c.boat) || 0) + 1);
         top.push(c);
       };
       if (rehPct) {
@@ -5624,86 +4664,30 @@ export default function App() {
       }
       top.sort((a, b) => b.score - a.score);
 
-      // シナリオ信頼度（的中確率ではなく、展開の根拠がどれだけ揃っているかの目安）
-      // ・ブレンドスコア：場の決まり手傾向＋当日の展開リハ
-      // ・上位シナリオとの差：候補同士の抜け具合
-      // ・一致度：決まり手傾向と展開リハが同じ方向を向いているか
-      // 以上を0〜95点に収め、星1〜5へ変換する。
-      const scenarioConfidence = (c, index) => {
-        const nextScore = top[index + 1]?.score ?? c.score;
-        const gap = Math.max(0, c.score - nextScore);
-        const hasPrior = Number(c.prior) > 0;
-        const hasReh = c.reh != null && Number(c.reh) > 0;
-        const agreement = hasPrior && hasReh
-          ? Math.max(0, 10 - Math.abs(Number(c.prior) - Number(c.reh)) * 0.25)
-          : 0;
-        const dualSourceBonus = hasPrior && hasReh ? 8 : 0;
-        const singleSourcePenalty = hasPrior && hasReh ? 0 : 6;
-        const raw = 28
-          + Number(c.score || 0) * 0.62
-          + gap * 0.28
-          + agreement
-          + dualSourceBonus
-          - singleSourcePenalty;
-        const value = Math.max(20, Math.min(95, Math.round(raw)));
-        const stars = value >= 82 ? 5
-          : value >= 67 ? 4
-          : value >= 52 ? 3
-          : value >= 37 ? 2
-          : 1;
-        return { value, stars };
-      };
-
-      scenarios = top.map((c, scenarioIndex) => {
+      scenarios = top.map((c) => {
         const head = c.boat;
-        // シナリオ表示も本線〜展リハと同じ専用テンプレートを使う。
-        // これにより、3まくりの2号艇除外、3まくり差しの3-12中心、5まくりの5-16固定が揃う。
-        const displayScenario = scenarioForKind(head, c.type);
-        const scenarioLabel = `${head}号艇${displayScenario.kind}`;
-        const linked = [];
-        const linkedCards = [];
-        for (const bet of bets) {
-          const matched = (bet.tickets || []).filter((t) => bet.ticketScenarios?.[t] === scenarioLabel);
-          if (matched.length) {
-            linked.push(...matched);
-            linkedCards.push(bet.label);
-          }
+        // 相手：気配上位＋（1号艇は軸として絡める）
+        const partners = order.filter((b) => b !== head);
+        let tickets = [];
+        if (c.type === "逃げ") {
+          // 1-相手-相手（気配上位で流す）
+          const s2 = partners.slice(0, 3), s3 = partners.slice(0, 4);
+          tickets = buildTicketsPure([1], s2, s3, 8);
+        } else {
+          // 外の決まり手：頭-（1号艇/気配上位）-（気配上位）
+          const inner = [1, ...partners.filter((b) => b !== 1)].filter(Boolean);
+          const s2 = inner.slice(0, 3), s3 = inner.slice(0, 4);
+          tickets = buildTicketsPure([head], s2, s3, 8);
         }
-        // 実カードに同じシナリオの買い目がある場合は、その実買い目だけを表示する。
-        // ない場合だけテンプレート例を表示する。
-        let tickets = linked.length
-          ? sortTicketsForDisplay([...new Set(linked)])
-          : scenarioTicketCandidates(head, displayScenario, 8, "balanced");
         const label = c.type === "逃げ" ? `逃げ（1号艇）`
           : `${c.type}（${head}号艇）`;
-        // 説明文は「決まり手率（場の平均）」と「リハーサル出現率（今日の隊形）」を併記する。
-        const rehTxt = c.reh != null ? `リハーサル出現率${round1(c.reh)}%` : null;
-        const rateTxt = c.rate > 0 ? `${c.type}率${c.rate}%` : null;
-        let desc;
-        if (rateTxt && rehTxt) {
-          desc = c.type === "逃げ"
-            ? `1号艇の${rateTxt}／${rehTxt}。1号艇先マイから気配上位へ`
-            : `${head}号艇の${rateTxt}／${rehTxt}。外から${c.type}が決まる展開`;
-        } else if (rehTxt) {
-          desc = `${head}号艇の${rehTxt}。決まり手率データでは薄いが、当日のST・進入だと現実味のある展開`;
-        } else {
-          desc = c.type === "逃げ"
-            ? `1号艇の${rateTxt}。1号艇先マイから気配上位へ`
-            : `${head}号艇の${rateTxt}。外から${c.type}が決まる展開`;
-        }
-        const confidence = scenarioConfidence(c, scenarioIndex);
         return {
           type: c.type, boat: head, rate: c.rate,
-          reh: c.reh != null ? round1(c.reh) : null,   // 展開リハーサル出現率(%)
-          prior: round1(c.prior),                       // 決まり手率ベースのシェア(%)
-          blend: round1(c.score),                       // ブレンド後スコア
-          confidence: confidence.value,
-          confidenceStars: confidence.stars,
           label,
-          desc,
+          desc: c.type === "逃げ"
+            ? `1号艇の逃げ率${c.rate}%。1号艇先マイから気配上位へ`
+            : `${head}号艇の${c.type}率${c.rate}%。外から${c.type}が決まる展開`,
           tickets,
-          linkedCards: [...new Set(linkedCards)],
-          resistanceNotes: displayScenario.resistanceNotes || [],
         };
       });
     }
@@ -5742,19 +4726,13 @@ export default function App() {
       // 点数は3〜18点に収める
       total = Math.max(3, Math.min(18, total));
 
-      // 配分の目安（本線・対抗・穴・展開リハ）
-      //   展開リハは展開リハーサルの抜け拾いなので、荒れ寄りのときに厚くする。
+      // 配分の目安（本線・対抗・穴・超穴）
       let dist;
-      if (lean === "honmei") dist = { 本線: 0.5, 対抗: 0.3, 穴: 0.2, 展リハ: 0 };
-      else if (lean === "ana") dist = { 本線: 0.2, 対抗: 0.25, 穴: 0.3, 展リハ: 0.25 };
-      else dist = { 本線: 0.35, 対抗: 0.3, 穴: 0.25, 展リハ: 0.1 };
+      if (lean === "honmei") dist = { 本線: 0.5, 対抗: 0.3, 穴: 0.2, 超穴: 0 };
+      else if (lean === "ana") dist = { 本線: 0.2, 対抗: 0.25, 穴: 0.3, 超穴: 0.25 };
+      else dist = { 本線: 0.35, 対抗: 0.3, 穴: 0.25, 超穴: 0.1 };
       const alloc = {};
-      for (const k of ["本線", "対抗", "穴", "展リハ"]) alloc[k] = Math.round(total * dist[k]);
-      // 展開リハカードが出ないレース（＝リハーサルの抜けが無い）では、その配分を穴に寄せる。
-      if (!bets.some((b) => b.label === "展リハ")) {
-        alloc["穴"] += alloc["展リハ"];
-        alloc["展リハ"] = 0;
-      }
+      for (const k of ["本線", "対抗", "穴", "超穴"]) alloc[k] = Math.round(total * dist[k]);
 
       const leanLabel = lean === "honmei" ? "本命寄り（手堅く絞る）" : lean === "ana" ? "荒れ寄り（穴を厚く）" : "バランス";
       recommend = { total, lean, leanLabel, alloc, notes };
@@ -5803,42 +4781,14 @@ export default function App() {
       confidence = { total, level, color, advice, reasons };
     }
 
-    return { ranked, badge, badgeColor, usedData, bets, flow, recommend, confidence, winProb, probMap, evList, rehearsal };
+    return { ranked, badge, badgeColor, usedData, bets, flow, recommend, confidence, winProb, probMap, evList };
   };
 
   // メイン評価（選択中の区分）
   const aiEval = useMemo(
     () => (result ? evaluateRows(result.rows) : null),
-    // slit（進入・平均ST）と固定シードのキーも展開リハーサル経由で評価に効くため依存に含める
-    [result, sts, fHold, fSts, motors, tilts, wind, racerCat, kimari, kimariPeriod, nigeSim, odds,
-      slit, courses, raceDate, venue, raceNo, resistanceByBoat, resistanceBaseline]
+    [result, sts, fHold, fSts, motors, tilts, wind, racerCat, kimari, kimariPeriod, nigeSim, odds]
   );
-
-  // 通常画面に実際に表示されたAI買い目を、正式な舟券履歴とは別の下書きとして保存する。
-  // 後から一括記録するときは再計算結果ではなく、この表示済み買い目を優先して使用する。
-  useEffect(() => {
-    if (captureAiMode) return;
-    const r = Number(raceNo);
-    if (!venue || !raceDate || !Number.isInteger(r) || r < 1 || r > 12) return;
-    if (!aiEval?.bets?.length || autoLoading) return;
-    const selectedWind = String(raceWinds?.[r] || wind || "").trim();
-    if (!selectedWind) return;
-    const raceKey = `${raceDate}_${venue}_${r}`;
-    const bets = aiEval.bets.map((b) => ({
-      label: String(b?.label || ""),
-      tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
-    }));
-    saveAiDisplayDraft(raceKey, {
-      date: raceDate,
-      venue,
-      race: r,
-      wind: selectedWind,
-      bets,
-      betsSignature: `${raceKey}_${JSON.stringify(bets)}`,
-      savedAt: Date.now(),
-      source: "visible_ai_panel",
-    });
-  }, [captureAiMode, venue, raceDate, raceNo, aiEval, autoLoading, raceWinds, wind]);
 
 
   // 一括記録用の非表示画面では、そのレースのAI買い目を親画面へ返す。
@@ -5876,24 +4826,11 @@ export default function App() {
       return undefined;
     }
 
-    // 同じ風で通常画面に表示済みの買い目があれば、それを唯一の保存元として使用する。
-    // 表示済み下書きがない場合だけ、非表示画面の現在評価をフォールバックにする。
-    const visibleDraft = getAiDisplayDraft(targetKey);
-    const canUseVisibleDraft = visibleDraft
-      && String(visibleDraft.wind || "").trim() === String(selectedManualWind).trim()
-      && Array.isArray(visibleDraft.bets)
-      && visibleDraft.bets.length;
-    const bets = canUseVisibleDraft
-      ? visibleDraft.bets.map((b) => ({
-          label: String(b?.label || ""),
-          tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
-        }))
-      : aiEval.bets.map((b) => ({
-          label: String(b?.label || ""),
-          tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
-        }));
-    const captureSource = canUseVisibleDraft ? "visible_ai_panel" : "capture_fallback";
-    const signature = `${targetKey}_${captureSource}_${JSON.stringify(bets)}`;
+    const bets = aiEval.bets.map((b) => ({
+      label: String(b?.label || ""),
+      tickets: Array.isArray(b?.tickets) ? b.tickets.map(String) : [],
+    }));
+    const signature = `${targetKey}_${JSON.stringify(bets)}`;
     captureLastSignatureRef.current = signature;
     if (captureStableTimerRef.current) window.clearTimeout(captureStableTimerRef.current);
 
@@ -5929,8 +4866,6 @@ export default function App() {
           batchCaptureVersion: BATCH_CAPTURE_VERSION,
           betsSignature: signature,
           bets,
-          captureSource,
-          displayedDraftSavedAt: canUseVisibleDraft ? Number(visibleDraft?.savedAt || 0) : null,
         }, window.location.origin);
       }
     }, 2500);
@@ -6013,10 +4948,9 @@ export default function App() {
           "本線": Math.max(0, Number(betLimits?.["本線"] ?? 0)),
           "対抗": Math.max(0, Number(betLimits?.["対抗"] ?? 0)),
           "穴": Math.max(0, Number(betLimits?.["穴"] ?? 0)),
-          "展リハ": Math.max(0, Number(betLimits?.["展リハ"] ?? 0)),
         };
         const now = Date.now();
-        const recs = ["本線", "対抗", "穴", "展リハ"].flatMap((label, index) => {
+        const recs = ["本線", "対抗", "穴"].flatMap((label, index) => {
           const source = sourceBets.find((b) => String(b?.label) === label);
           const limit = limits[label];
           const tickets = Array.isArray(source?.tickets)
@@ -6046,15 +4980,13 @@ export default function App() {
             batchSourceKey: expectedKey,
             batchSourceRace: targetRace,
             batchBetsSignature: String(event.data?.betsSignature || ""),
-            batchCaptureSource: String(event.data?.captureSource || "capture_fallback"),
-            displayedDraftSavedAt: Number(event.data?.displayedDraftSavedAt || 0) || null,
           }];
         });
 
         if (recs.length) {
           await persistBets((prev) => {
             // このレースの旧一括記録は、本線・対抗・穴をまとめて完全置換する。
-            const batchLabels = new Set(["本線", "対抗", "穴", "展リハ", "展開リハ", "伏兵"]);
+            const batchLabels = new Set(["本線", "対抗", "穴"]);
             const kept = prev.filter((r) => !(
               r?.batchRecorded
               && r?.date === targetDate
@@ -6098,13 +5030,8 @@ export default function App() {
   // AI買い目の自動保存は廃止。一括記録ボタンを押した時だけキューを作る。
 
 
-  useEffect(() => {
-    if (batchBetProgress.total > 0 && batchBetProgress.done >= batchBetProgress.total && aiCaptureQueue.length === 0) {
-      setBatchBetStatus(
-        `✓ 一括記録完了：${batchBetProgress.saved}レース記録、${batchBetProgress.skipped}レーススキップ`
-      );
-    }
-  }, [batchBetProgress, aiCaptureQueue.length]);
+  // （旧）iframe一括記録の完了通知effectは廃止。一括記録は同期処理になり、
+  //  startBatchBetRecording が最終ステータス（スキップ理由つき）を直接設定する。
 
   useEffect(() => {
     if (!aiCaptureQueue.length || captureAiMode) return;
@@ -6323,7 +5250,7 @@ export default function App() {
   // ── 的中率の集計（結果が入っているレコードが対象） ──
   const hitStats = useMemo(() => {
     const judged = statFilter.recs.filter((r) => r.result && r.bets && r.bets.length);
-    const labels = ["本線", "対抗", "穴", "展リハ"];
+    const labels = ["本線", "対抗", "穴"];
     const per = Object.fromEntries(labels.map((l) => [l, { hit: 0, total: 0 }]));
     let comboHit = 0;
     for (const r of judged) {
@@ -6372,11 +5299,80 @@ export default function App() {
   }, [aiEval]);
 
   // ── 展開リハーサル（スタート隊形のモンテカルロ試走） ──
-  //   v140: シミュレーション本体は evaluateRows 内（runTenkaiRehearsal）に移設した。
-  //   表示用のこの値と、シナリオ選定に使う値が必ず同一になるようにするため、
-  //   画面側は aiEval.rehearsal をそのまま参照する。
-  //   （旧実装は表示専用の別memoだったため、リハーサルの結果が買い目に一切反映されなかった）
-  const tenkaiRehearsal = aiEval?.rehearsal || null;
+  //   平均ST・進入・当日評価スコアから、スタート隊形を1000回試走して決まり手の出現分布を出す。
+  const tenkaiRehearsal = useMemo(() => {
+    if (!aiEval || !slit || !Array.isArray(slit) || slit.length !== 6) return null;
+    let seed = 0;
+    const key = `${raceDate}_${venue}_${raceNo}`;
+    for (let i = 0; i < key.length; i++) seed = (seed * 31 + key.charCodeAt(i)) >>> 0;
+    const mulberry32 = (a) => () => {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const rnd = mulberry32(seed || 1);
+    const gauss = () => {
+      let u = 0, v = 0;
+      while (u === 0) u = rnd();
+      while (v === 0) v = rnd();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    };
+    const byCourse = {};
+    slit.forEach((e) => { byCourse[e.course] = e; });
+    if (!byCourse[1]) return null;
+    const scores = {};
+    aiEval.ranked.forEach((r) => { scores[r.boat] = r.score || 0; });
+    const vals = slit.map((e) => scores[e.boat] ?? 0);
+    const mn = Math.min(...vals), mx = Math.max(...vals);
+    const pow = {};
+    slit.forEach((e) => { pow[e.boat] = mx === mn ? 0.5 : ((scores[e.boat] ?? 0) - mn) / (mx - mn); });
+    const ITERS = 1000;
+    const tally = {};
+    const winCount = {};
+    slit.forEach((e) => { winCount[e.boat] = 0; });
+    const addResult = (kind, boat) => {
+      const k = `${kind}(${boat})`;
+      tally[k] = (tally[k] || 0) + 1;
+      winCount[boat] += 1;
+    };
+    for (let i = 0; i < ITERS; i++) {
+      const s = {};
+      slit.forEach((e) => { s[e.course] = Math.abs(e.st) + gauss() * 0.05 - (e.course >= 4 ? 0.01 : 0); });
+      const c1 = byCourse[1];
+      let attacker = null, attackKind = null;
+      for (const c of [4, 3, 5, 6]) {
+        const e = byCourse[c];
+        if (!e) continue;
+        const adv = s[1] - s[c];
+        const th = 0.055 - 0.05 * pow[e.boat];
+        if (adv > th + rnd() * 0.03) {
+          attacker = e;
+          attackKind = (c === 3 || c === 4) && adv < th + 0.05 && rnd() < 0.45 ? "まくり差し" : "まくり";
+          break;
+        }
+      }
+      if (attacker) { addResult(attackKind, attacker.boat); continue; }
+      const c2 = byCourse[2];
+      if (c2) {
+        const gap = s[2] - s[1];
+        const sashiP = Math.max(0, 0.30 - gap * 3) * (0.4 + 0.8 * pow[c2.boat]) * (1 - 0.5 * pow[c1.boat]);
+        if (rnd() < sashiP) { addResult("差し", c2.boat); continue; }
+      }
+      if (rnd() < 0.04) {
+        const cand = slit.filter((e) => e.course >= 3).sort((a, b) => pow[b.boat] - pow[a.boat])[0];
+        if (cand && rnd() < pow[cand.boat] * 0.6) { addResult("抜き", cand.boat); continue; }
+      }
+      addResult("逃げ", c1.boat);
+    }
+    const patterns = Object.entries(tally)
+      .map(([k, n]) => ({ k, pct: (n / ITERS) * 100 }))
+      .sort((a, b) => b.pct - a.pct);
+    const winPct = slit
+      .map((e) => ({ boat: e.boat, course: e.course, pct: (winCount[e.boat] / ITERS) * 100 }))
+      .sort((a, b) => b.pct - a.pct);
+    return { iters: ITERS, patterns, winPct };
+  }, [aiEval, slit, raceDate, venue, raceNo]);
 
   // ── AI予想の収支（もし機械的に買っていたら・1点100円固定） ──
   const aiLedger = useMemo(() => {
@@ -6390,9 +5386,6 @@ export default function App() {
       { key: "h_a", name: "本線＋穴", parts: ["本線", "穴"] },
       { key: "t_a", name: "対抗＋穴", parts: ["対抗", "穴"] },
       { key: "h_t_a", name: "本線＋対抗＋穴", parts: ["本線", "対抗", "穴"] },
-      { key: "fuku", name: "展リハ", parts: ["展リハ"] },
-      { key: "h_f", name: "本線＋展開リハ", parts: ["本線", "展リハ"] },
-      { key: "h_t_f", name: "本線＋対抗＋展開リハ", parts: ["本線", "対抗", "展リハ"] },
     ];
     const stats = {};
     for (const p of patterns) stats[p.key] = { name: p.name, races: 0, spent: 0, ret: 0, hit: 0 };
@@ -6447,6 +5440,63 @@ export default function App() {
       evalB: evalView(evB),
     };
   }, [aiEval, result, racerStats, cmpA, cmpB, sts, fHold, fSts, motors, tilts, wind, kimari, kimariPeriod, nigeSim, odds]);
+
+  // ── 画面表示と保存の唯一の共通元 ──
+  // AI予想パネルの本線/対抗/穴の表示（被りのみモード・点数プルダウン適用後）を1か所で計算する。
+  // 画面のレンダリングも、個別記録も、一括記録スナップショットも、必ずこの関数の結果を使う。
+  const displayedTicketsForBet = (bet) => {
+    let baseTickets = Array.isArray(bet?.tickets) ? bet.tickets : [];
+    if (cmpMode === "overlap" && periodCompare) {
+      if (bet.label === "本線") baseTickets = baseTickets.filter((t) => periodCompare.honmei.overlap.includes(t));
+      if (bet.label === "対抗") baseTickets = baseTickets.filter((t) => periodCompare.taikou.overlap.includes(t));
+      if (bet.label === "穴") baseTickets = baseTickets.filter((t) => periodCompare.ana.overlap.includes(t));
+    }
+    const maxPts = baseTickets.length;
+    const lim = betLimits[bet.label] != null ? Math.min(betLimits[bet.label], maxPts) : maxPts;
+    const shown = baseTickets.slice(0, lim);
+    return { baseTickets, maxPts, lim, shown };
+  };
+
+  // いま画面に表示している本線/対抗/穴の買い目（保存用に完全展開・重複除去済み）。
+  const displayedAiBetLines = useMemo(() => {
+    if (!Array.isArray(aiEval?.bets)) return [];
+    return ["本線", "対抗", "穴"].flatMap((label) => {
+      const bet = aiEval.bets.find((b) => String(b?.label || "") === label);
+      if (!bet) return [];
+      const { shown } = displayedTicketsForBet(bet);
+      const tickets = expandTicketsForSave(shown);
+      return tickets.length ? [{ label, tickets }] : [];
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aiEval, betLimits, cmpMode, periodCompare]);
+
+  // 表示中のAI買い目を、そのレースのスナップショットとして即時保存する（同じレンダーの値のみ）。
+  // 共有風を変更すると aiEval が再計算され、この effect が更新後の表示でスナップショットを上書きする（仕様B-1）。
+  useEffect(() => {
+    if (captureAiMode) return;
+    if (!venue || !raceDate) return;
+    const rn = Number(raceNo);
+    if (!Number.isInteger(rn) || rn < 1 || rn > 12) return;
+    if (autoLoading || raceWindsLoading) return;
+    if (!displayedAiBetLines.length) return;
+    const selectedWind = String(raceWinds?.[rn] || "");
+    if (!selectedWind) return; // 風未設定のレースは一括記録対象外なのでスナップショットも作らない
+    const key = `${raceDate}_${venue}_${rn}`;
+    const signature = `${key}_${JSON.stringify(displayedAiBetLines)}`;
+    const prev = aiBetSnapshotsRef.current?.[key];
+    if (prev && prev.signature === signature && String(prev.wind || "") === selectedWind) return;
+    storeAiBetSnapshot({
+      key,
+      date: raceDate,
+      venue,
+      race: rn,
+      wind: selectedWind,
+      bets: displayedAiBetLines,
+      signature,
+      updatedAt: Date.now(),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displayedAiBetLines, venue, raceDate, raceNo, autoLoading, raceWindsLoading, raceWinds, captureAiMode]);
 
   // ── 「買い目組む」: 選んだ対象（カード）順を尊重してラウンドロビン抽出 ──
   //   各カードの並び順（＝そのカードの狙い・軸）を保ったまま、配分方式に従って拾う。
@@ -6517,10 +5567,10 @@ export default function App() {
 
     // 配分方式に応じてカードの取り出し順を決める
     //   even = 全カードを1点ずつ交互（カード入力順）
-    //   solid = 堅いカード優先（本線→対抗→穴→展開リハ→シナリオ）
-    //   ana = 穴寄り優先（展開リハ→穴→対抗→本線→シナリオ）
+    //   solid = 堅いカード優先（本線→対抗→穴→超穴→シナリオ）
+    //   ana = 穴寄り優先（超穴→穴→対抗→本線→シナリオ）
     const solidRank = (part) => {
-      const map = { "本線": 0, "対抗": 1, "穴": 2, "展リハ": 3 };
+      const map = { "本線": 0, "対抗": 1, "穴": 2, "超穴": 3 };
       if (part in map) return map[part];
       return 5; // シナリオは後ろ
     };
@@ -6596,24 +5646,16 @@ export default function App() {
       return;
     }
 
-    const labels = ["本線", "対抗", "穴", "展リハ"];
-    const lines = labels.flatMap((label, index) => {
-      const source = aiEval.bets.find((b) => String(b?.label || "") === label);
-      const max = Array.isArray(source?.tickets) ? source.tickets.length : 0;
-      const configured = Math.max(0, Number(betLimits?.[label] ?? max));
-      const tickets = Array.isArray(source?.tickets)
-        ? source.tickets.slice(0, Math.min(configured, max)).filter(Boolean)
-        : [];
-      if (!tickets.length) return [];
-      return [{
-        id: `${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`,
-        label,
-        tickets,
-        amountPerPoint: 100,
-        perTicket: null,
-        expanded: false,
-      }];
-    });
+    // 画面に表示している本線/対抗/穴と同じレンダー値（displayedAiBetLines）をそのまま使う。
+    // 表示が圧縮表記でも、保存する tickets は完全展開・重複除去済み（expandTicketsForSave適用済み）。
+    const lines = displayedAiBetLines.map((line, index) => ({
+      id: `${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`,
+      label: line.label,
+      tickets: [...line.tickets],
+      amountPerPoint: 100,
+      perTicket: null,
+      expanded: false,
+    }));
 
     if (!lines.length) {
       setBetMsg("現在の点数設定で追加できるAI買い目がありません");
@@ -6715,42 +5757,112 @@ export default function App() {
       "本線": Math.max(0, Number(betLimits?.["本線"] ?? 0)),
       "対抗": Math.max(0, Number(betLimits?.["対抗"] ?? 0)),
       "穴": Math.max(0, Number(betLimits?.["穴"] ?? 0)),
-      "展リハ": Math.max(0, Number(betLimits?.["展リハ"] ?? 0)),
     };
-    if (!limits["本線"] && !limits["対抗"] && !limits["穴"] && !limits["展リハ"]) {
-      setBatchBetStatus("本線・対抗・穴・展開リハの点数を1つ以上設定してください");
+    if (!limits["本線"] && !limits["対抗"] && !limits["穴"]) {
+      setBatchBetStatus("本線・対抗・穴の点数を1つ以上設定してください");
       return;
     }
 
-    const batchStartedAt = Date.now();
-    const targets = Array.from({ length: 12 }, (_, i) => i + 1)
-      .filter((r) => String(raceWinds?.[r] || "").trim())
-      .map((r) => ({
-        date: raceDate,
-        venue,
-        race: r,
-        captureToken: `${batchStartedAt}_${r}_${Math.random().toString(36).slice(2, 10)}`,
-      }));
+    const targetRaces = Array.from({ length: 12 }, (_, i) => i + 1)
+      .filter((r) => String(raceWinds?.[r] || "").trim());
 
-    if (!targets.length) {
+    if (!targetRaces.length) {
       setBatchBetStatus("風が設定されているレースがありません");
       return;
     }
 
-    // 以前の一括記録はレース紐付けがずれている可能性があるため、この日・場の分を先に除去して作り直す。
-    await persistBets((prev) => prev.filter((b) => !(
-      b?.batchRecorded
-      && b?.date === raceDate
-      && b?.venue === venue
-      && ["本線", "対抗", "穴", "展リハ", "展開リハ", "伏兵"].includes(String(b?.label || ""))
-    )));
+    // 一括記録は「各レース画面で実際に表示した買い目スナップショット」だけを保存する。
+    // iframeによる再計算は行わない（表示と保存の不一致の原因だったため廃止）。
+    const nowTs = Date.now();
+    const recsAll = [];
+    const skippedRaces = [];
+    for (const r of targetRaces) {
+      const key = `${raceDate}_${venue}_${r}`;
+      const snap = aiBetSnapshotsRef.current?.[key];
+      const targetWind = String(raceWinds?.[r] || "");
+      // スナップショットが無い／風が現在の設定と食い違う場合は保存しない（誤保存防止）。
+      if (
+        !snap
+        || !Array.isArray(snap.bets)
+        || !snap.bets.length
+        || String(snap.date || "") !== String(raceDate)
+        || String(snap.venue || "") !== String(venue)
+        || Number(snap.race) !== r
+        || String(snap.wind || "") !== targetWind
+      ) {
+        skippedRaces.push(r);
+        continue;
+      }
+      const recs = ["本線", "対抗", "穴"].flatMap((label, index) => {
+        if (!limits[label]) return [];
+        const source = snap.bets.find((b) => String(b?.label || "") === label);
+        // スナップショットは表示時点で展開・重複除去済みだが、保存直前にも必ず正規化する（要件C）。
+        const tickets = expandTicketsForSave(Array.isArray(source?.tickets) ? source.tickets : []);
+        if (!tickets.length) return [];
+        return [{
+          id: `batch_${key}_${label}_${nowTs}_${index}`,
+          date: raceDate,
+          venue,
+          race: r,
+          label,
+          points: tickets.length,
+          tickets,
+          amountPerPoint: 100,
+          perTicket: null,
+          amount: tickets.length * 100,
+          result: null,
+          hit: null,
+          payoutOdds: null,
+          payout: 0,
+          settlementStatus: "pending",
+          recordedAt: nowTs,
+          batchRecorded: true,
+          batchCaptureVersion: BATCH_CAPTURE_VERSION,
+          batchSourceKey: key,
+          batchSourceRace: r,
+          batchBetsSignature: String(snap.signature || ""),
+          batchSnapshotAt: Number(snap.updatedAt || 0),
+          wind: String(snap.wind || ""),
+          draftOnly: false,
+        }];
+      });
+      if (recs.length) recsAll.push(...recs);
+      else skippedRaces.push(r);
+    }
 
-    setBatchBetProgress({ done: 0, total: targets.length, saved: 0, skipped: 0 });
+    const savedRaceCount = new Set(recsAll.map((b) => Number(b.race))).size;
+
+    if (!recsAll.length) {
+      setBatchBetProgress({ done: 0, total: 0, saved: 0, skipped: 0 });
+      setBatchBetStatus(
+        "保存できる表示スナップショットがありません。各レース画面を開いてAI買い目の表示を確認してから、もう一度実行してください。"
+      );
+      return;
+    }
+
+    // 以前の一括記録はレース紐付け・買い目がずれている可能性があるため、この日・場の分を先に除去して作り直す。
+    const saved = await persistBets((prev) => {
+      const kept = prev.filter((b) => !(
+        b?.batchRecorded
+        && b?.date === raceDate
+        && b?.venue === venue
+        && ["本線", "対抗", "穴"].includes(String(b?.label || ""))
+      ));
+      return [...recsAll, ...kept];
+    });
+    if (!saved) {
+      setBatchBetStatus("✗ 一括記録の保存に失敗しました。ページを閉じずに、もう一度お試しください");
+      return;
+    }
+
+    setBatchBetProgress({ done: targetRaces.length, total: targetRaces.length, saved: savedRaceCount, skipped: skippedRaces.length });
     setBatchBetStatus(
-      `旧一括記録を削除して再作成中（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}・展開リハ${limits["展リハ"]}／1点100円）`
+      `✓ 一括記録完了：表示スナップショットから${savedRaceCount}レースを記録`
+      + `（本線${limits["本線"]}・対抗${limits["対抗"]}・穴${limits["穴"]}／1点100円）`
+      + (skippedRaces.length
+        ? `。${skippedRaces.join("・")}Rはスナップショット未作成または風設定変更後に未表示のためスキップしました。該当レースの画面を開いて表示を確認後、もう一度実行してください。`
+        : "")
     );
-    predictionSaveRef.current = "";
-    setAiCaptureQueue(targets);
   };
 
   // カートをこのレースの購入として確定。結果・払戻は公式結果確定後に自動反映する。
@@ -6881,8 +5993,7 @@ export default function App() {
 
   // 実際に記録したAI買い目を、単体・組み合わせ・開催場別で同じ判定関数に通す。
   const aiBetStats = useMemo(() => {
-    // 超穴は廃止済みだが、過去に記録した履歴を集計から落とさないためラベルは残す。
-    const labels = ["本線", "対抗", "穴", "展リハ", "伏兵", "超穴"];
+    const labels = ["本線", "対抗", "穴", "超穴"];
     const source = reliableStatBets
       .filter((b) => labels.includes(String(b?.label || "")));
     const byLabel = Object.fromEntries(
@@ -6893,8 +6004,7 @@ export default function App() {
       { name: "本線", labels: ["本線"] },
       { name: "対抗", labels: ["対抗"] },
       { name: "穴", labels: ["穴"] },
-      { name: "展リハ", labels: ["展リハ", "展開リハ", "伏兵"] },
-      { name: "超穴（廃止）", labels: ["超穴"] },
+      { name: "超穴", labels: ["超穴"] },
       { name: "本線+対抗", labels: ["本線", "対抗"] },
       { name: "本線+穴", labels: ["本線", "穴"] },
       { name: "対抗+穴", labels: ["対抗", "穴"] },
@@ -6960,7 +6070,6 @@ export default function App() {
   const systemErrors = [
     correctionStatus && /失敗|failed|error|エラー/i.test(correctionStatus) ? `補正: ${correctionStatus}` : null,
     dbRacerStatus && /失敗|ENVなし|エラー|error/i.test(dbRacerStatus) ? dbRacerStatus : null,
-    resistanceStatus && /失敗|ENVなし|エラー|error/i.test(resistanceStatus) ? resistanceStatus : null,
     nigeStatus && /失敗|ENVなし|エラー|error/i.test(nigeStatus) ? nigeStatus : null,
     autoMsg && /エラー|不足|失敗|failed|error/i.test(autoMsg) ? autoMsg : null,
   ].filter(Boolean);
@@ -7497,15 +6606,41 @@ export default function App() {
           )}
         </div>
 
+        <div style={{
+          display: "flex", justifyContent: "flex-end", gap: 8,
+          margin: "2px 0 8px", flexWrap: "wrap",
+        }}>
+          <button
+            type="button"
+            onClick={openAllBoatCards}
+            style={{
+              padding: "7px 11px", borderRadius: 7, cursor: "pointer",
+              background: "#16273c", color: "#cfe0f0",
+              border: "1px solid #2c4762", fontSize: 11, fontWeight: 800,
+            }}
+          >すべて開く</button>
+          <button
+            type="button"
+            onClick={closeAllBoatCards}
+            style={{
+              padding: "7px 11px", borderRadius: 7, cursor: "pointer",
+              background: "#0e1b2c", color: "#9db5cc",
+              border: "1px solid #2c4762", fontSize: 11, fontWeight: 800,
+            }}
+          >すべて閉じる</button>
+        </div>
+
         <div style={{ display: "grid", gap: 8, marginBottom: 24 }}>
           {[1, 2, 3, 4, 5, 6].map((b) => {
             const noOriginalDisplay = !usesDisplayCorrection(venue);
             const hasHiddenTiming = !noOriginalDisplay && ["tenji", "isshu", "mawari", "chokusen"].some((k) => String(inputs[b][k] ?? "").trim() !== "");
+            const isExpanded = Boolean(expandedBoatCards[b]);
             return (
             <div key={b} style={{
               display: "grid", gridTemplateColumns: "44px 72px 1fr",
               gap: 8, alignItems: "center",
-              background: "#16273c", borderRadius: 10, padding: "8px 10px",
+              background: "#16273c", borderRadius: 10, padding: "8px 52px 8px 10px",
+              position: "relative",
             }}>
               <div style={{
                 width: 36, height: 36, borderRadius: 8,
@@ -7514,31 +6649,52 @@ export default function App() {
                 fontWeight: 800, fontSize: 17,
                 border: b === 1 ? "1px solid #ccc" : "none",
               }}>{b}</div>
-              {racerProfiles[b] && (
-                <div style={{
-                  gridColumn: "2 / -1", display: "flex", gap: 6, alignItems: "baseline",
-                  flexWrap: "wrap", padding: "2px 0 4px", borderBottom: "1px solid #1d3149",
-                }}>
-                  <span style={{
-                    fontSize: 10, fontWeight: 900, color: "#7da3c8",
-                    background: "#0e1b2c", border: "1px solid #2c4762", borderRadius: 5, padding: "2px 6px",
-                  }}>
-                    {racerProfiles[b].grade}{racerProfiles[b].regNo ? ` / ${racerProfiles[b].regNo}` : ""}
-                  </span>
-                  <span style={{ fontSize: 14, fontWeight: 900, color: "#fff", display: "inline-flex", alignItems: "center", gap: 4 }}>
-                    {racerProfiles[b].name}
-                    {racerProfiles[b].isFemale && <span title="女子選手" style={{ color: "#ff6b8a", fontSize: 15, lineHeight: 1 }}>♥</span>}
-                  </span>
-                  <span style={{ fontSize: 11, color: "#9db5cc" }}>
-                    {racerProfiles[b].branch}{racerProfiles[b].birthplace ? ` / ${racerProfiles[b].birthplace}` : ""}{racerProfiles[b].age ? ` / ${racerProfiles[b].age}歳` : ""}
-                  </span>
-                  {racerProfiles[b].fl && (
-                    <span style={{ fontSize: 10, fontWeight: 900, color: "#ff8a80", background: "#3a2030", borderRadius: 5, padding: "2px 6px" }}>
-                      {racerProfiles[b].fl}
+              <div style={{
+                gridColumn: "2 / -1", display: "flex", gap: 6, alignItems: "baseline",
+                flexWrap: "wrap", padding: "2px 0 4px",
+                borderBottom: isExpanded ? "1px solid #1d3149" : "none",
+              }}>
+                {racerProfiles[b] ? (
+                  <>
+                    <span style={{
+                      fontSize: 10, fontWeight: 900, color: "#7da3c8",
+                      background: "#0e1b2c", border: "1px solid #2c4762", borderRadius: 5, padding: "2px 6px",
+                    }}>
+                      {racerProfiles[b].grade}{racerProfiles[b].regNo ? ` / ${racerProfiles[b].regNo}` : ""}
                     </span>
-                  )}
-                </div>
-              )}
+                    <span style={{ fontSize: 14, fontWeight: 900, color: "#fff", display: "inline-flex", alignItems: "center", gap: 4 }}>
+                      {racerProfiles[b].name}
+                      {racerProfiles[b].isFemale && <span title="女子選手" style={{ color: "#ff6b8a", fontSize: 15, lineHeight: 1 }}>♥</span>}
+                    </span>
+                    <span style={{ fontSize: 11, color: "#9db5cc" }}>
+                      {courses[b]}C{motors[b]?.ren3 != null ? ` / モーター3連 ${motors[b].ren3}%` : ""}
+                    </span>
+                    {racerProfiles[b].fl && (
+                      <span style={{ fontSize: 10, fontWeight: 900, color: "#ff8a80", background: "#3a2030", borderRadius: 5, padding: "2px 6px" }}>
+                        {racerProfiles[b].fl}
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <span style={{ fontSize: 12, color: "#9db5cc", fontWeight: 800 }}>
+                    {courses[b]}コース / 選手データ未取得
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => toggleBoatCard(b)}
+                aria-expanded={isExpanded}
+                aria-label={`${b}号艇の詳細を${isExpanded ? "閉じる" : "開く"}`}
+                style={{
+                  position: "absolute", top: 8, right: 8,
+                  width: 36, height: 36, borderRadius: 8, cursor: "pointer",
+                  background: "#0e1b2c", color: "#9db5cc",
+                  border: "1px solid #2c4762", fontSize: 16, fontWeight: 900,
+                }}
+              >{isExpanded ? "▲" : "▼"}</button>
+              {isExpanded && (
+                <>
               <div>
                 <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 2 }}>コース</div>
                 <select
@@ -7731,100 +6887,8 @@ export default function App() {
                   )}
                 </div>
               )}
-
-              {/* 攻められ耐性（現在の進入コース限定・攻めコース別） */}
-              {resistanceByBoat?.[b] && (() => {
-                const myCourse = Number(courses?.[b] || b);
-                const periods = [
-                  { key: "1y", label: "直近1年" },
-                ];
-                const defs = [
-                  { key: "まくり", label: "まくり" },
-                  { key: "まくり差し", label: "まくり差し" },
-                  { key: "差し", label: "差し" },
-                ];
-                const summarize = (rows, kind) => {
-                  const target = (rows || []).filter((r) => String(r?.kimarite || "") === kind);
-                  const n = target.reduce((sum, r) => sum + Number(r?.n || 0), 0);
-                  if (!n) return { n: 0, avg: null, rate2: null, rate3: null };
-                  const weighted = (key) => target.reduce((sum, r) => sum + Number(r?.[key] || 0) * Number(r?.n || 0), 0) / n;
-                  const avg = target.reduce((sum, r) => sum + Number(r?.avg_rank || 0) * Number(r?.n || 0), 0) / n;
-                  return { n, avg, rate2: weighted("rate2"), rate3: weighted("rate3") };
-                };
-                const summaryColor = (summary, baseline) => {
-                  if (summary.n < 3) return "#7d91a8";
-                  const own = Number(summary.rate2 || 0) + Number(summary.rate3 || 0);
-                  const base = Number(baseline.rate2 || 0) + Number(baseline.rate3 || 0);
-                  if (!Number.isFinite(own) || !Number.isFinite(base)) return "#dce8f4";
-                  if (own >= base + 10) return "#5dd39e";
-                  if (own <= base - 10) return "#ff8d86";
-                  return "#dce8f4";
-                };
-                return (
-                  <div style={{
-                    gridColumn: "1 / -1", borderTop: "1px solid #1d3149", paddingTop: 7, marginTop: 2,
-                    fontSize: 11, color: "#9db5cc",
-                  }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", marginBottom: 6 }}>
-                      <span style={{ background: "#0e1b2c", borderRadius: 5, padding: "3px 7px", fontWeight: 800, color: "#7da3c8" }}>
-                        攻められ耐性（{myCourse}コース時）
-                      </span>
-                      <span style={{ color: "#607f9d" }}>※2着率は2着補正、3着率は3着補正に使用</span>
-                    </div>
-                    {myCourse === 6 ? (
-                      <div style={{ color: "#7d91a8", padding: "5px 2px" }}>
-                        6コースは外側に攻め艇がいないため対象外
-                      </div>
-                    ) : (
-                      <div style={{ display: "grid", gap: 8 }}>
-                        {periods.map((period) => {
-                          const periodData = resistanceByBoat?.[b]?.[period.key] || {};
-                          const rows = periodData?.rows || [];
-                          const baseRows = resistanceBaseline?.[period.key]?.[myCourse] || [];
-                          return (
-                            <div key={period.key} style={{ background: "rgba(14,27,44,.55)", borderRadius: 7, padding: "6px 8px" }}>
-                              <div style={{ fontWeight: 900, color: "#8fb4d8", marginBottom: 4 }}>{period.label}</div>
-                              <div style={{ display: "grid", gap: 6 }}>
-                                {defs.map((d) => {
-                                  const summary = summarize(rows, d.key);
-                                  const baseline = summarize(baseRows, d.key);
-                                  const details = (rows || [])
-                                    .filter((r) => String(r?.kimarite || "") === d.key && Number(r?.n || 0) > 0)
-                                    .sort((a, z) => Number(a.attack_course) - Number(z.attack_course));
-                                  return (
-                                    <div key={d.key} style={{ borderTop: "1px solid rgba(44,71,98,.55)", paddingTop: 4 }}>
-                                      <div style={{ color: summaryColor(summary, baseline), lineHeight: 1.55 }}>
-                                        <b style={{ display: "inline-block", minWidth: 62 }}>{d.label}</b>
-                                        {summary.n < 3 ? `${summary.n}回 / データ不足` : (
-                                          <>
-                                            {summary.n}回 / 平均<b>{safeFixed(summary.avg, 2)}</b>着 / 2着<b>{safeFixed(summary.rate2, 1)}</b>% / 3着<b>{safeFixed(summary.rate3, 1)}</b>%
-                                            {Number.isFinite(baseline.rate2) ? <span style={{ color: "#7d91a8" }}>（基準 2着{safeFixed(baseline.rate2, 1)}%・3着{safeFixed(baseline.rate3, 1)}%）</span> : null}
-                                          </>
-                                        )}
-                                      </div>
-                                      <div style={{ marginLeft: 62, marginTop: 2, display: "grid", gap: 1, color: "#7890a8", fontSize: 10 }}>
-                                        {details.length ? details.map((r) => {
-                                          const n = Number(r?.n || 0);
-                                          return (
-                                            <div key={`${d.key}-${r.attack_course}`}>
-                                              {Number(r.attack_course)}Cから：{n}回 / 平均{safeFixed(r.avg_rank, 2)}着 / 2着{safeFixed(r.rate2, 1)}% / 3着{safeFixed(r.rate3, 1)}%
-                                              {n < 3 ? "（参考）" : ""}
-                                            </div>
-                                          );
-                                        }) : <div>攻めコース別の該当なし</div>}
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
+                </>
+              )}
             </div>
             );
           })}
@@ -8238,9 +7302,7 @@ export default function App() {
                   ))}
                 </div>
                 <div style={{ fontSize: 9, color: "#5e7a92", marginTop: 6, lineHeight: 1.5 }}>
-                  ※ 当日気配ベースの試走です。参考指標としてご利用ください。<br />
-                  ※ この分布は下の「展開予想」のシナリオ選定に反映されます。最上位の展開は必ずシナリオに1枠採用され、
-                  頭出現率{18}%以上の艇は対抗・穴の頭候補にも格上げされます。
+                  ※ 当日気配ベースの試走です。参考指標としてご利用ください。
                 </div>
               </div>
             )}
@@ -8291,18 +7353,23 @@ export default function App() {
                             {nigeSim.wall2 != null && <span>2C壁性能 <b style={{ color: nigeSim.wall2 >= 55 ? "#5dd39e" : nigeSim.wall2 <= 35 ? "#ff7b7b" : "#fff" }}>{nigeSim.wall2}</b></span>}
                             {nigeSim.attack3 != null && <span>3C攻撃警戒 <b style={{ color: nigeSim.attack3 >= 45 ? "#ff7b7b" : "#fff" }}>{nigeSim.attack3}</b></span>}
                           </div>
-                          <div style={{
+                          <details style={{
                             marginTop: 2, padding: "8px 9px", borderRadius: 8,
                             background: "rgba(22,39,60,0.78)", border: "1px solid #223c58",
                             fontSize: 10.5, lineHeight: 1.65, color: "#9db5cc",
                           }}>
-                            <div><b style={{ color: "#dbe8f5" }}>上の「1着・逃げ」</b>：その開催場全体の1コース成績です。例：逃げ52%なら「この場で1コースが逃げた割合」。</div>
-                            <div><b style={{ color: "#dbe8f5" }}>1C本人1着</b>：今日1号艇に入っている選手本人が、DB上で1コースに入った時の1着率です。場全体ではなく本人成績なので、上の逃げ率とズレます。</div>
-                            <div><b style={{ color: "#dbe8f5" }}>イン逃げ信頼度</b>：場全体の逃げ率だけではなく、本人1C成績・ST優位・展示評価・風・2C壁性能・3C攻撃警戒を加味した総合評価です。単純な逃げ率ではありません。</div>
-                            <div><b style={{ color: "#dbe8f5" }}>ST優位</b>：1号艇の平均STが他艇よりどれだけ先行しやすいか。プラスが大きいほど逃げに追い風、マイナスは遅れ警戒。</div>
-                            <div><b style={{ color: "#dbe8f5" }}>2C壁性能</b>：2コース艇が壁になって1号艇を逃がしやすい度合い。100点満点目安の内部指数で、標準は50点前後。55点以上は壁として優秀、35点以下は壁が弱く差し・まくりを許しやすい。</div>
-                            <div><b style={{ color: "#dbe8f5" }}>3C攻撃警戒</b>：3コース艇のまくり・まくり差し等の攻撃力。100点満点目安の内部指数で、標準は35点前後。45点以上は攻撃警戒、55点以上は強警戒。高いほどイン逃げ失敗リスクとして見る。</div>
-                          </div>
+                            <summary style={{ cursor: "pointer", color: "#dbe8f5", fontWeight: 900 }}>
+                              ？ 指標の見方・計算方法
+                            </summary>
+                            <div style={{ marginTop: 8 }}>
+                              <div><b style={{ color: "#dbe8f5" }}>上の「1着・逃げ」</b>：その開催場全体の1コース成績です。例：逃げ52%なら「この場で1コースが逃げた割合」。</div>
+                              <div><b style={{ color: "#dbe8f5" }}>1C本人1着</b>：今日1号艇に入っている選手本人が、DB上で1コースに入った時の1着率です。場全体ではなく本人成績なので、上の逃げ率とズレます。</div>
+                              <div><b style={{ color: "#dbe8f5" }}>イン逃げ信頼度</b>：場全体の逃げ率だけではなく、本人1C成績・ST優位・展示評価・風・2C壁性能・3C攻撃警戒を加味した総合評価です。単純な逃げ率ではありません。</div>
+                              <div><b style={{ color: "#dbe8f5" }}>ST優位</b>：1号艇の平均STが他艇よりどれだけ先行しやすいか。プラスが大きいほど逃げに追い風、マイナスは遅れ警戒。</div>
+                              <div><b style={{ color: "#dbe8f5" }}>2C壁性能</b>：2コース艇が壁になって1号艇を逃がしやすい度合い。100点満点目安の内部指数で、標準は50点前後。55点以上は壁として優秀、35点以下は壁が弱く差し・まくりを許しやすい。</div>
+                              <div><b style={{ color: "#dbe8f5" }}>3C攻撃警戒</b>：3コース艇のまくり・まくり差し等の攻撃力。100点満点目安の内部指数で、標準は35点前後。45点以上は攻撃警戒、55点以上は強警戒。高いほどイン逃げ失敗リスクとして見る。</div>
+                            </div>
+                          </details>
                           {nigeSim.failKimarite && (
                             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", fontSize: 11 }}>
                               <span style={{ color: "#7da3c8" }}>逃げ失敗時：</span>
@@ -8690,7 +7757,7 @@ export default function App() {
                           展開予想（気配→ST→モーター→F→風で絞り込み）
                         </div>
                         <div style={{ fontSize: 10, color: "#7da3c8", marginBottom: 8, lineHeight: 1.6, background: "#10202f", borderRadius: 6, padding: "6px 9px" }}>
-                          こちらは「レースがどう決まるか」の<b style={{ color: "#a9c8e8" }}>展開</b>から組む買い目です。<b style={{ color: "#a9c8e8" }}>決まり手率</b>（＝その場の平均的な傾向）と<b style={{ color: "#f5c518" }}>展開リハーサル</b>（＝今日のST・進入・評価での1000回試走）の<b style={{ color: "#a9c8e8" }}>両方</b>をブレンドして、起こりやすい決着パターンごとに目を出します。両方が示す展開ほど上に来ます。（下の本線〜穴は「どの艇が強いか」の総合評価から組みます）
+                          こちらは「レースがどう決まるか」の<b style={{ color: "#a9c8e8" }}>展開</b>から組む買い目です。決まり手率（逃げ・差し・まくり）をもとに、起こりやすい決着パターンごとに目を出します。展開を読んで狙いたいとき向け。（下の本線〜穴は「どの艇が強いか」の総合評価から組みます）
                         </div>
                         <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 10 }}>
                           頭候補：
@@ -8713,39 +7780,9 @@ export default function App() {
                                       シナリオ{i + 1}
                                     </span>
                                     <span style={{ fontSize: 13, fontWeight: 800, color: "#e8eef5" }}>{sc.label}</span>
-                                    <span style={{ display: "flex", gap: 8, marginLeft: "auto", alignItems: "center", flexWrap: "wrap" }}>
-                                      {sc.rate > 0 && (
-                                        <span style={{ fontSize: 11, color: "#7da3c8" }}>{sc.type}率 {sc.rate}%</span>
-                                      )}
-                                      {sc.reh != null && (
-                                        <span style={{
-                                          fontSize: 11, fontWeight: 800, color: "#f5c518",
-                                          background: "#1a2d44", borderRadius: 6, padding: "2px 8px",
-                                          fontVariantNumeric: "tabular-nums",
-                                        }}>リハ {safeFixed(sc.reh, 1)}%</span>
-                                      )}
-                                      {Number.isFinite(Number(sc.confidence)) && (
-                                        <span style={{
-                                          fontSize: 11, fontWeight: 900, color: sc.confidence >= 67 ? "#5dd39e" : sc.confidence >= 52 ? "#f5c518" : "#9db5cc",
-                                          background: "#14263a", borderRadius: 6, padding: "2px 8px",
-                                          fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap",
-                                        }}>
-                                          信頼度 {"★".repeat(sc.confidenceStars || 1)}{"☆".repeat(Math.max(0, 5 - (sc.confidenceStars || 1)))} {sc.confidence}
-                                        </span>
-                                      )}
-                                    </span>
+                                    <span style={{ fontSize: 11, color: "#7da3c8", marginLeft: "auto" }}>{sc.type}率 {sc.rate}%</span>
                                   </div>
                                   <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>{sc.desc}</div>
-                                  {Array.isArray(sc.linkedCards) && sc.linkedCards.length > 0 && (
-                                    <div style={{ fontSize: 10, color: "#5dd39e", marginBottom: 6 }}>
-                                      実買い目と一致：{sc.linkedCards.join("・")}
-                                    </div>
-                                  )}
-                                  {Array.isArray(sc.resistanceNotes) && sc.resistanceNotes.length > 0 && (
-                                    <div style={{ fontSize: 10, color: "#d7b4ef", marginBottom: 6, lineHeight: 1.5 }}>
-                                      耐性補正：{sc.resistanceNotes.join("／")}
-                                    </div>
-                                  )}
                                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                                     {compressTickets(sortTicketsForDisplay(sc.tickets)).map((t) => (
                                       <span key={t} style={{
@@ -8759,8 +7796,7 @@ export default function App() {
                               );
                             })}
                             <div style={{ fontSize: 10, color: "#5e7a92", lineHeight: 1.6 }}>
-                              ※ 「◯◯率」＝その場の決まり手率（平均的な傾向）、「リハ」＝展開リハーサルの出現率（今日の隊形での試走結果）。
-                              「信頼度」は的中確率ではなく、両者の一致度・ブレンドスコア・次点との差から算出した展開根拠の強さです。リハーサル最上位の展開は必ず1枠採用されます。買い目はその展開での目安です。
+                              ※ 決まり手率データから可能性の高い展開を抽出。買い目はその展開での目安です。
                             </div>
                           </div>
                         ) : (
@@ -8786,7 +7822,7 @@ export default function App() {
                         </div>
                         <div style={{ fontSize: 11, color: "#9db5cc", marginBottom: 6 }}>
                           配分の目安：
-                          {["本線", "対抗", "穴", "展リハ"].filter((k) => aiEval.recommend.alloc[k] > 0).map((k, i, arr) => (
+                          {["本線", "対抗", "穴", "超穴"].filter((k) => aiEval.recommend.alloc[k] > 0).map((k, i, arr) => (
                             <span key={k}>{k} {aiEval.recommend.alloc[k]}点{i < arr.length - 1 ? " ／ " : ""}</span>
                           ))}
                         </div>
@@ -8839,17 +7875,10 @@ export default function App() {
                       {aiEval.bets.map((bet) => {
                         const color = bet.label === "本線" ? "#3d7ab8"
                           : bet.label === "対抗" ? "#5a9e2e"
-                          : bet.label === "展リハ" ? "#9c5ec7" : "#b8893d";
-                        // 期間「被りのみ」モード: 本線〜展開リハを共通買い目だけに絞る
-                        let baseTickets = bet.tickets;
-                        if (cmpMode === "overlap" && periodCompare) {
-                          if (bet.label === "本線") baseTickets = bet.tickets.filter((t) => periodCompare.honmei.overlap.includes(t));
-                          if (bet.label === "対抗") baseTickets = bet.tickets.filter((t) => periodCompare.taikou.overlap.includes(t));
-                          if (bet.label === "穴") baseTickets = bet.tickets.filter((t) => periodCompare.ana.overlap.includes(t));
-                        }
-                        const maxPts = baseTickets.length;
-                        const lim = betLimits[bet.label] != null ? Math.min(betLimits[bet.label], maxPts) : maxPts;
-                        const shown = baseTickets.slice(0, lim);
+                          : bet.label === "超穴" ? "#9c5ec7" : "#b8893d";
+                        // 期間「被りのみ」モード・点数設定の適用は displayedTicketsForBet に一本化
+                        //（保存スナップショットと必ず同じ配列になるようにする）。
+                        const { maxPts, lim, shown } = displayedTicketsForBet(bet);
                         // 表示点数に応じた合成オッズ
                         let compShown = null;
                         if (odds) {
@@ -8892,41 +7921,6 @@ export default function App() {
                                 )}
                               </span>
                             </div>
-                            {bet.label === "展リハ" && Array.isArray(bet.gaps) && bet.gaps.length > 0 && (
-                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
-                                {bet.gaps.map((g) => (
-                                  <span key={g.boat} style={{
-                                    fontSize: 11, fontWeight: 700, color: "#e8d5f5",
-                                    background: "#2a1c3a", border: "1px solid #4a3560",
-                                    borderRadius: 6, padding: "3px 9px",
-                                    fontVariantNumeric: "tabular-nums",
-                                  }}>
-                                    {g.boat}号艇 総合1着率{safeFixed(g.reh, 1)}%
-                                    <span style={{ color: "#9c7ec7", marginLeft: 5 }}>／本線・対抗で頭なし</span>
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                            {bet.label === "展リハ" && (
-                              <div style={{ fontSize: 10, color: "#8ea1b5", lineHeight: 1.6, marginBottom: 8 }}>
-                                ※総合1着率＝展開リハーサル1000回で、決まり手を問わずその艇が1着になった割合です。
-                              </div>
-                            )}
-                            {Array.isArray(bet.scenarioGroups) && bet.scenarioGroups.length > 0 && (
-                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
-                                {bet.scenarioGroups.map((g) => (
-                                  <span key={g.label} style={{
-                                    fontSize: 10,
-                                    color: bet.label === "穴" ? "#e5d6b4" : bet.label === "展リハ" ? "#e8d5f5" : "#bcd7ee",
-                                    background: bet.label === "穴" ? "#2b2416" : bet.label === "展リハ" ? "#2a1c3a" : "#13283b",
-                                    border: `1px solid ${bet.label === "穴" ? "#5b4826" : bet.label === "展リハ" ? "#4a3560" : "#294967"}`,
-                                    borderRadius: 6, padding: "3px 8px",
-                                  }}>
-                                    {g.label}：{(g.compressed || compressTickets(g.tickets)).join("・")}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
                             {compShown ? (
                               <div style={{ fontSize: 12, color: "#5dd39e", fontWeight: 800, marginBottom: 6 }}>
                                 合成オッズ 約{safeFixed(compShown?.odds, 1)}倍
@@ -8969,11 +7963,9 @@ export default function App() {
                           対象（最大4つまで選択）{cmpMode === "overlap" ? "・被り買い目から" : ""}
                         </div>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
-                          {["本線", "対抗", "穴", "展リハ"]
-                            .filter((p) => aiEval.bets.some((b) => b.label === p))
-                            .map((p) => {
+                          {["本線", "対抗", "穴", "超穴"].map((p) => {
                             const sel = pickerParts.includes(p);
-                            const c = p === "本線" ? "#3d7ab8" : p === "対抗" ? "#5a9e2e" : p === "展リハ" ? "#9c5ec7" : "#b8893d";
+                            const c = p === "本線" ? "#3d7ab8" : p === "対抗" ? "#5a9e2e" : p === "超穴" ? "#9c5ec7" : "#b8893d";
                             return (
                               <button
                                 key={p}
@@ -9254,10 +8246,10 @@ export default function App() {
                 的中率（結果入力済み {hitStats.judged} レース）
               </div>
               <div style={{ display: "grid", gap: 6 }}>
-                {["本線", "対抗", "穴", "展リハ"].map((l) => {
+                {["本線", "対抗", "穴"].map((l) => {
                   const s = hitStats.per[l];
                   const rate = s.total ? (s.hit / s.total * 100).toFixed(1) : "—";
-                  const color = l === "本線" ? "#3d7ab8" : l === "対抗" ? "#5a9e2e" : l === "展リハ" ? "#9c5ec7" : "#b8893d";
+                  const color = l === "本線" ? "#3d7ab8" : l === "対抗" ? "#5a9e2e" : "#b8893d";
                   return (
                     <div key={l} style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <span style={{
@@ -9359,7 +8351,7 @@ export default function App() {
                             const maxP = b.tickets.length;
                             if (!maxP) return null;
                             const cur = (r.betLimits && r.betLimits[b.label] != null) ? Math.min(r.betLimits[b.label], maxP) : maxP;
-                            const c = b.label === "本線" ? "#3d7ab8" : b.label === "対抗" ? "#5a9e2e" : b.label === "展リハ" ? "#9c5ec7" : "#b8893d";
+                            const c = b.label === "本線" ? "#3d7ab8" : b.label === "対抗" ? "#5a9e2e" : b.label === "超穴" ? "#9c5ec7" : "#b8893d";
                             return (
                               <span key={b.label} style={{ display: "flex", alignItems: "center", gap: 3 }}>
                                 <span style={{ color: c, fontWeight: 700 }}>{b.label}</span>
@@ -9459,7 +8451,8 @@ export default function App() {
           </div>
         </div>
 
-        {/* 舟券の収支記録 */}
+        {/* 舟券の収支記録UIは撤廃（既存データは保持） */}
+        {SHOW_BET_LEDGER && (
         <div style={{ marginTop: 28, borderTop: "1px solid #1d3149", paddingTop: 18 }}>
           <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8", marginBottom: 10 }}>
             舟券の収支記録（3連単）
@@ -9616,9 +8609,10 @@ export default function App() {
               1R〜12RのAI買い目を一括記録
             </div>
             <div style={{ fontSize: 10, color: "#7da3c8", lineHeight: 1.7, marginBottom: 9 }}>
-              風を設定済みの各レースについて、それぞれのAI予想から現在の点数設定
-              （本線{Number(betLimits?.["本線"] ?? 0)}・対抗{Number(betLimits?.["対抗"] ?? 0)}・穴{Number(betLimits?.["穴"] ?? 0)}）
-              を上段の表示順のまま1点100円で記録します。下段の選び順・配分は使用しません。各レースの読込完了を確認してから保存します。公開前などAI予想を取得できないレースはスキップされます。
+              風を設定済みの各レースについて、そのレース画面で実際に表示したAI買い目（現在の点数設定
+              本線{Number(betLimits?.["本線"] ?? 0)}・対抗{Number(betLimits?.["対抗"] ?? 0)}・穴{Number(betLimits?.["穴"] ?? 0)}
+              適用後の表示スナップショット）を、表示順のまま1点100円で記録します。下段の選び順・配分は使用しません。
+              一度も画面で表示していないレースや、共有風を変更した後にまだ表示し直していないレースは、誤保存防止のためスキップされます（該当レースを開いて表示を確認すると記録できます）。
             </div>
             <button
               onClick={startBatchBetRecording}
@@ -9938,6 +8932,7 @@ export default function App() {
             </details>
           )}
         </div>
+        )}
         </>)}
 
         {!captureAiMode && aiCaptureQueue.length > 0 && (
