@@ -2264,8 +2264,10 @@ export default function App() {
 
   // 決まり手・逃げシミュレーション（枠別情報）
   const KIMARI_PERIODS = CORE_CATEGORY_PERIOD_LABELS;
-  const [kimari, setKimari] = useState(null);       // {期間:{nige,nigashi,sasare,sashi[5],makurare,makuri[5],makuraresashi,makurizashi[5]}}
+  const [kimari, setKimari] = useState(null);       // {期間:{nige,nigashi,sasare,sashi[5],makurare,makuri[5],makuraresashi,makurizashi[5],starts[6]}}
   const [kimariPeriod, setKimariPeriod] = useState("直近6ヶ月");
+  // 閲覧用の決まり手率表専用。予想ロジック側の kimariPeriod とは独立させる。
+  const [kimariTablePeriod, setKimariTablePeriod] = useState("直近6ヶ月");
   const [nigeSim, setNigeSim] = useState(null);     // {win1,nigeRate,second[5],third[5],deme[5]}
   const [dbNigeRows, setDbNigeRows] = useState([]);
   const [nigeStatus, setNigeStatus] = useState("逃げシミュ：未取得");
@@ -3440,6 +3442,14 @@ export default function App() {
         const makuriRow = rowAfter("捲り", 6);      // [捲られ, 捲り2..6]
         const mzRow = rowAfter("捲り差し", 6);      // [捲られ差, 捲り差し2..6]
         if (!nigeRow && !sashiRow && !makuriRow) return null;
+        // 各行末の「出走回数」は括弧なしの「14回」形式。
+        // 決まり手ごとの回数は「(5回)」なので除外し、1〜6艇分だけ保存する。
+        const starts = [];
+        const startsRe = /(?:^|[^（(\d])(\d+)\s*回/gm;
+        let startsMatch;
+        while ((startsMatch = startsRe.exec(seg)) !== null && starts.length < 6) {
+          starts.push(Number(startsMatch[1]));
+        }
         return {
           nige: nigeRow ? nigeRow[0] : null,
           nigashi: nigeRow ? nigeRow[1] : null,
@@ -3449,6 +3459,7 @@ export default function App() {
           makuri: makuriRow ? makuriRow.slice(1) : null,
           makuraresashi: mzRow ? mzRow[0] : null,
           makurizashi: mzRow ? mzRow.slice(1) : null,
+          starts: starts.length === 6 ? starts : null,
         };
       };
 
@@ -8212,9 +8223,9 @@ export default function App() {
             )}
 
             {/* 決まり手率（参考表示のみ・予想ロジック未反映） */}
-            {kimari?.[kimariPeriod] && (() => {
-              const km = kimari[kimariPeriod];
-              const pct = (v) => Number.isFinite(Number(v)) ? `${safeFixed(Number(v), 1)}%` : "-";
+            {kimari?.[kimariTablePeriod] && (() => {
+              const km = kimari[kimariTablePeriod];
+              const pct = (v) => v != null && Number.isFinite(Number(v)) ? `${safeFixed(Number(v), 1)}%` : "-";
               const rows = [1, 2, 3, 4, 5, 6].map((b) => {
                 const course = Number(courses?.[b] || b);
                 const idx = course - 2;
@@ -8226,22 +8237,39 @@ export default function App() {
                   sashi: course === 1 ? km.sasare : km.sashi?.[idx],
                   makuri: course === 1 ? km.makurare : km.makuri?.[idx],
                   makurizashi: course === 1 ? km.makuraresashi : km.makurizashi?.[idx],
+                  starts: km.starts?.[b - 1] ?? null,
                 };
               });
               return (
                 <div style={{ marginBottom: 14 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+                  <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
                     <div>
                       <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#7da3c8" }}>決まり手率</div>
-                      <div style={{ fontSize: 10, color: "#607f9d", marginTop: 3 }}>実進入コース基準・{kimariPeriod}</div>
+                      <div style={{ fontSize: 10, color: "#607f9d", marginTop: 3 }}>実進入コース基準</div>
                     </div>
-                    <span style={{ fontSize: 10, color: "#7da3c8" }}>参考表示のみ・予想ロジック未反映</span>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10, color: "#8fb4d8" }}>
+                        集計期間
+                        <select
+                          value={kimariTablePeriod}
+                          onChange={(e) => setKimariTablePeriod(e.target.value)}
+                          style={{
+                            background: "#16273c", color: "#dce8f4", border: "1px solid #315575",
+                            borderRadius: 7, padding: "6px 26px 6px 9px", fontSize: 11, fontWeight: 800,
+                          }}
+                        >
+                          <option value="直近6ヶ月">直近6ヶ月</option>
+                          <option value="直近1年">直近1年</option>
+                        </select>
+                      </label>
+                      <span style={{ fontSize: 10, color: "#7da3c8" }}>参考表示のみ・予想ロジック未反映</span>
+                    </div>
                   </div>
                   <div style={{ overflowX: "auto", background: "#16273c", borderRadius: 10, padding: "6px 8px" }}>
-                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 620 }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 720 }}>
                       <thead>
                         <tr style={{ color: "#7da3c8", fontSize: 10 }}>
-                          {["艇・選手", "進入", "逃げ／逃し", "差され／差し", "まくられ／まくり", "まくられ差し／まくり差し"].map((h, i) => (
+                          {["艇・選手", "進入", "逃げ", "差され／差し", "まくられ／まくり", "まくられ差し／まくり差し", "出走回数"].map((h, i) => (
                             <th key={h} style={{ padding: "7px 6px", textAlign: i === 0 ? "left" : "center", borderBottom: "1px solid #2c4762", whiteSpace: "nowrap" }}>{h}</th>
                           ))}
                         </tr>
@@ -8262,13 +8290,16 @@ export default function App() {
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{pct(r.sashi)}</td>
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{pct(r.makuri)}</td>
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{pct(r.makurizashi)}</td>
+                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4", whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>
+                              {Number.isFinite(Number(r.starts)) ? `${Number(r.starts)}回` : "-"}
+                            </td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
                   <div style={{ fontSize: 9.5, color: "#607f9d", marginTop: 5, lineHeight: 1.5 }}>
-                    ※ 1コースは「逃げ・差され・まくられ・まくられ差し」、2〜6コースは「逃し・差し・まくり・まくり差し」を表示します。
+                    ※ 「逃げ」列は、1コースでは逃げ率、2〜6コースでは逃し率を表示します。1コースは「差され・まくられ・まくられ差し」、2〜6コースは「差し・まくり・まくり差し」です。
                     この表は閲覧用で、AI評価・展開予想・買い目計算には使用しません。
                   </div>
                 </div>

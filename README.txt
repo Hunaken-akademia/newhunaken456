@@ -1,15 +1,15 @@
-WAKE patch v7
+WAKE patch v8
 
-Changes:
-- Moved the attack-resistance section to between Tenkai Rehearsal and Nige Simulation.
-- Added the Kimarite Rate reference table above attack resistance.
-- Kimarite Rate supports the existing 6-month / 1-year selector.
-- Kimarite Rate is display-only and is not passed into AI evaluation, scenario logic, or ticket selection.
-- Attack resistance remains fixed to the latest 1 year.
+変更内容:
+- 決まり手率表に専用の集計期間プルダウンを追加
+  - 直近6ヶ月 / 直近1年
+  - 予想ロジック側の期間選択とは完全に独立
+- 「逃げ／逃し」見出しを「逃げ」に変更
+  - 1コースは逃げ率、2コースは逃し率を表示
+  - 3〜6コースは該当なしのため「-」表示
+- 一番右に出走回数を追加
+- 出走回数を貼り付けデータから読み取る処理を追加
+- 決まり手率表は引き続き参考表示のみ。AI評価・展開予想・買い目ロジックには未反映
 
-Replace:
-src/App.jsx
-
-Validation:
-- JSX syntax checked with the TypeScript parser: 0 diagnostics.
-- Full Vite build could not run in this environment because the internal npm registry does not provide playwright.
+適用方法:
+このZIP内の src/App.jsx を、プロジェクトの src/App.jsx に上書きしてください。
