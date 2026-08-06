@@ -1,11 +1,10 @@
-WAKE patch v3
-
-Fix:
-- Corrected JSX closing structure near the end of the 1-6 boat card map.
-- Specifically fixed the fragment/card closing around the resistance section that caused:
-  Unexpected closing "div" tag does not match opening fragment tag
+WAKE patch v4
 
 Replace:
   src/App.jsx
 
-Then deploy again.
+Fix:
+- Removed stray closing React Fragment around lines 8019-8020.
+- JSX syntax was checked with TypeScript transpile parser: 0 diagnostics.
+
+This patch only contains the modified source file.

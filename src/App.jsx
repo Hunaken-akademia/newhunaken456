@@ -8016,8 +8016,6 @@ export default function App() {
                   <span style={{ fontVariantNumeric: "tabular-nums" }}>{aiEval.confidence.total}</span>
                 </span>
               )}
-                </>
-              )}
             </div>
             {aiEval?.confidence && (
               <div style={{ fontSize: 11, color: "#9db5cc", margin: "-2px 0 10px", lineHeight: 1.6 }}>
