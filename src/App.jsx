@@ -3446,26 +3446,35 @@ export default function App() {
         // コピー時に括弧と数字の間へ改行が入る場合があるため、
         // 「括弧の直後ではない数字」判定ではなく、5個1組の末尾を出走回数として読む。
         const countTokens = [...seg.matchAll(/(\d+)\s*回/g)].map((m) => Number(m[1]));
-        let starts = null;
-        for (let offset = 0; offset + 30 <= countTokens.length; offset += 1) {
-          const candidate = [];
-          let valid = true;
-          for (let row = 0; row < 6; row += 1) {
-            const chunk = countTokens.slice(offset + row * 5, offset + row * 5 + 5);
-            if (chunk.length < 5) { valid = false; break; }
-            const rowStarts = chunk[4];
-            // 出走回数は各決まり手の発生回数以上になる。
-            if (!Number.isFinite(rowStarts) || rowStarts < Math.max(...chunk.slice(0, 4))) {
-              valid = false;
-              break;
+
+        // 出走回数は、決まり手率を計算した「分母」そのものを使う。
+        // コピー元のDOM順は端末や横スクロール位置で変わるため、回数トークンの並び順には依存しない。
+        // 各コースの4つの率から、丸め前の分母Nを逆算し、本文中の「N回」と一致する候補を優先する。
+        const rateRows = [0, 1, 2, 3, 4, 5].map((idx) => (
+          idx === 0
+            ? [nigeRow?.[0], sashiRow?.[0], makuriRow?.[0], mzRow?.[0]]
+            : [nigeRow?.[1], sashiRow?.[idx], makuriRow?.[idx], mzRow?.[idx]]
+        ));
+        const inferDenominator = (rates) => {
+          const ps = (rates || []).map(Number).filter(Number.isFinite);
+          if (!ps.length) return null;
+          const candidates = [];
+          for (let n = 1; n <= 500; n += 1) {
+            let ok = true;
+            let score = countTokens.includes(n) ? 100 : 0;
+            for (const p of ps) {
+              const k = Math.round((p * n) / 100);
+              const reproduced = Math.round(((k * 100) / n) * 10) / 10;
+              if (Math.abs(reproduced - p) > 0.0001) { ok = false; break; }
+              if (countTokens.includes(k)) score += 1;
             }
-            candidate.push(rowStarts);
+            if (ok) candidates.push({ n, score });
           }
-          if (valid) {
-            starts = candidate;
-            break;
-          }
-        }
+          if (!candidates.length) return null;
+          candidates.sort((a, b) => b.score - a.score || a.n - b.n);
+          return candidates[0].n;
+        };
+        const starts = rateRows.map(inferDenominator);
         return {
           nige: nigeRow ? nigeRow[0] : null,
           nigashi: nigeRow ? nigeRow[1] : null,
@@ -8307,7 +8316,7 @@ export default function App() {
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{pct(r.makuri)}</td>
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{pct(r.makurizashi)}</td>
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4", whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>
-                              {Number.isFinite(Number(r.starts)) ? `${Number(r.starts)}回` : "-"}
+                              {Number.isFinite(Number(r.starts)) && Number(r.starts) > 0 ? `${Number(r.starts)}回` : "-"}
                             </td>
                           </tr>
                         ))}
