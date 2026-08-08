@@ -2018,6 +2018,15 @@ export default function App() {
   const [venueStatuses, setVenueStatuses] = useState({});
   const [venueStatusLoading, setVenueStatusLoading] = useState(false);
   const [prefetchInfo, setPrefetchInfo] = useState("");
+  const [prefetchRevision, setPrefetchRevision] = useState(0);
+  const [showBackToTop, setShowBackToTop] = useState(false);
+
+  useEffect(() => {
+    const onScroll = () => setShowBackToTop(window.scrollY > 520);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
   const autoBusyRef = useRef(false);
   const reviewDayCacheRef = useRef({});
   const reviewDayFetchRef = useRef(new Map());
@@ -2892,6 +2901,7 @@ export default function App() {
   const storePrefetchPayload = (v, d, r, data) => {
     try {
       localStorage.setItem(prefetchStorageKey(v, d, r), JSON.stringify({ savedAt: Date.now(), data }));
+      setPrefetchRevision((n) => n + 1);
     } catch (e) {}
   };
 
@@ -7269,6 +7279,26 @@ export default function App() {
                     ? `${cardRace}R / ${st.nextDeadline || "締切確認中"}`
                     : "確認中";
               const disabled = noRace;
+              const statusDate = activeRaceDateValue();
+              const cachedDisplay = cardRace ? readPrefetchPayload(v, statusDate, cardRace) : null;
+              const cachedDisplayReady = !!cachedDisplay && (
+                !!cachedDisplay.displayDisabled || normalizeFetchedDisplayRows(cachedDisplay.rows || []).length === 6
+              );
+              const selectedDisplayReady = selected
+                && String(raceNo || "") === String(cardRace || "")
+                && hasCompleteAutoStaticData(v);
+              const displayReady = usesDisplayCorrection(v)
+                ? (selectedDisplayReady || cachedDisplayReady)
+                : null;
+              const displayStatusText = !usesDisplayCorrection(v)
+                ? "展示対象外"
+                : displayReady
+                  ? "✓ 展示取得済"
+                  : held
+                    ? "展示待ち"
+                    : allClosed
+                      ? "復習データ"
+                      : "";
               return (
                 <button
                   key={v}
@@ -7276,7 +7306,7 @@ export default function App() {
                   disabled={disabled}
                   title={disabled ? `${v}は対象日に未開催です` : `${v}を選択`}
                   style={{
-                    minHeight: 92,
+                    minHeight: 108,
                     padding: 0,
                     borderRadius: 8,
                     cursor: disabled ? "not-allowed" : "pointer",
@@ -7314,6 +7344,18 @@ export default function App() {
                       letterSpacing: 0,
                       whiteSpace: "nowrap",
                     }}>{raceLine}</div>
+                    {displayStatusText && (
+                      <div style={{
+                        display: "inline-flex", alignItems: "center", justifyContent: "center",
+                        marginTop: 5, padding: "2px 5px", borderRadius: 999,
+                        fontSize: 9, fontWeight: 900, lineHeight: 1.2, whiteSpace: "nowrap",
+                        color: displayReady ? "#67e3ad" : !usesDisplayCorrection(v) ? "#9db5cc" : "#ffd28a",
+                        background: displayReady ? "rgba(40,160,105,0.18)" : "rgba(255,190,90,0.08)",
+                        border: displayReady ? "1px solid rgba(93,211,158,0.38)" : "1px solid rgba(157,181,204,0.18)",
+                      }}>
+                        {displayStatusText}
+                      </div>
+                    )}
                   </div>
                 </button>
               );
@@ -10337,6 +10379,35 @@ export default function App() {
             src={`${window.location.pathname}?capture_ai=1&date=${encodeURIComponent(aiCaptureQueue[0].date)}&venue=${encodeURIComponent(aiCaptureQueue[0].venue)}&race=${encodeURIComponent(aiCaptureQueue[0].race)}&capture_token=${encodeURIComponent(aiCaptureQueue[0].captureToken || "")}`}
             style={{ position: "fixed", width: 1, height: 1, opacity: 0, pointerEvents: "none", left: -9999, top: -9999, border: 0 }}
           />
+        )}
+
+        {!captureAiMode && showBackToTop && (
+          <button
+            type="button"
+            aria-label="ページ上部へ戻る"
+            title="一番上へ戻る"
+            onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+            style={{
+              position: "fixed",
+              right: 16,
+              bottom: "calc(18px + env(safe-area-inset-bottom))",
+              width: 48,
+              height: 48,
+              borderRadius: "50%",
+              border: "1px solid #41678b",
+              background: "rgba(19,36,58,0.96)",
+              color: "#e8eef5",
+              boxShadow: "0 8px 24px rgba(0,0,0,0.32)",
+              fontSize: 24,
+              fontWeight: 900,
+              lineHeight: 1,
+              cursor: "pointer",
+              zIndex: 9999,
+              WebkitTapHighlightColor: "transparent",
+            }}
+          >
+            ↑
+          </button>
         )}
 
         {/* ご利用にあたって */}
