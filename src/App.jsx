@@ -8512,7 +8512,7 @@ export default function App() {
                     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 720 }}>
                       <thead>
                         <tr style={{ color: "#7da3c8", fontSize: 10 }}>
-                          {["艇・選手", "進入", "逃げ／逃し", "差され／差し", "まくられ／まくり", "まくられ差し／まくり差し", "出走回数"].map((h, i) => (
+                          {["艇・選手", "進入", "逃げ", "差され／差し", "まくられ／まくり", "まくられ差し／まくり差し", "出走回数"].map((h, i) => (
                             <th key={h} style={{ padding: "7px 6px", textAlign: i === 0 ? "left" : "center", borderBottom: "1px solid #2c4762", whiteSpace: "nowrap" }}>{h}</th>
                           ))}
                         </tr>
@@ -8529,7 +8529,7 @@ export default function App() {
                               <span style={{ color: "#dce8f4", fontWeight: 800 }}>{r.name}</span>
                             </td>
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#8fb4d8", whiteSpace: "nowrap" }}>{r.course}C</td>
-                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{rateCell(r.nige)}</td>
+                            <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{Number(r.course) === 1 ? rateCell(r.nige) : "-"}</td>
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{rateCell(r.sashi)}</td>
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{rateCell(r.makuri)}</td>
                             <td style={{ padding: "8px 6px", textAlign: "center", color: "#dce8f4" }}>{rateCell(r.makurizashi)}</td>
@@ -8543,7 +8543,7 @@ export default function App() {
                   </div>
                   <div style={{ fontSize: 9.5, color: "#607f9d", marginTop: 5, lineHeight: 1.5 }}>
                     ※ 出走回数は、選択期間内に各選手が現在の実進入コースを走った回数です。各率の下には該当決まり手の回数を表示します。<br />
-                    ※ 「逃げ／逃し」列は、1コースでは逃げ率、2〜6コースでは逃し率です。1コースの敗戦は同一レースの1着艇の決まり手から「差され・まくられ・まくられ差し」を集計します。<br />
+                    ※ 「逃げ」は1コース時のみ表示します。2〜6コースの逃し率は表示しません。1コースの敗戦は同一レースの1着艇の決まり手から「差され・まくられ・まくられ差し」を集計します。<br />
                     ※ この表は閲覧用で、AI評価・展開予想・買い目計算には使用しません。
                   </div>
                 </div>
