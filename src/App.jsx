@@ -660,6 +660,70 @@ async function fetchResistanceBaselineByCourse(myCourse, days = 365) {
   return Array.isArray(rows) ? rows : [];
 }
 
+async function fetchResistanceBaselineAllCourses(days = 365) {
+  if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/resistance_baseline_all_courses`, {
+    method: "POST",
+    headers: publicSupabaseHeaders(true),
+    body: JSON.stringify({
+      p_from: daysAgoIso(days),
+      p_to: todayIso(),
+    }),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`resistance_baseline_all_courses ${res.status}${txt ? `: ${txt.slice(0, 160)}` : ""}`);
+  }
+  const rows = await res.json();
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function fetchRacerKimariteStats(regnos, days = 365) {
+  if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
+  const nums = [...new Set((regnos || []).map((v) => Number(v)).filter(Boolean))];
+  if (!nums.length) return [];
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/racer_kimarite_stats`, {
+    method: "POST",
+    headers: publicSupabaseHeaders(true),
+    body: JSON.stringify({
+      p_regnos: nums,
+      p_from: daysAgoIso(days),
+      p_to: todayIso(),
+    }),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`racer_kimarite_stats ${res.status}${txt ? `: ${txt.slice(0, 160)}` : ""}`);
+  }
+  const rows = await res.json();
+  return Array.isArray(rows) ? rows : [];
+}
+
+function buildRacerKimariteTableFromRpc(rowsByPeriod, profiles, courses) {
+  const out = { "直近6ヶ月": {}, "直近1年": {} };
+  const cell = (count, starts) => ({
+    count: Number(count || 0),
+    rate: Number(starts || 0) > 0 ? round1((Number(count || 0) / Number(starts)) * 100) : null,
+  });
+  for (const label of Object.keys(out)) {
+    const source = Array.isArray(rowsByPeriod?.[label]) ? rowsByPeriod[label] : [];
+    for (let boat = 1; boat <= 6; boat += 1) {
+      const regno = Number(profiles?.[boat]?.regNo || profiles?.[boat]?.regno || profiles?.[boat]?.registerNo || 0);
+      const course = Number(courses?.[boat] || boat);
+      const row = source.find((r) => Number(r?.regno) === regno && Number(r?.course) === course);
+      const starts = Number(row?.starts || 0);
+      out[label][boat] = {
+        boat, course, starts,
+        nige: cell(row?.nige, starts),
+        sashi: cell(row?.sashi, starts),
+        makuri: cell(row?.makuri, starts),
+        makurizashi: cell(row?.makurizashi, starts),
+      };
+    }
+  }
+  return out;
+}
+
 async function fetchRaceResultsForVenue(placeNo, days = 365) {
   if (!CORRECTION_TABLE_ENABLED) throw new Error("Supabase ENVなし");
   if (!placeNo) return [];
@@ -2336,10 +2400,9 @@ export default function App() {
   const RACER_CATS = CORE_CATEGORY_PERIOD_LABELS;
   const [racerStats, setRacerStats] = useState(null);
   // 閲覧専用の選手別決まり手率。既存の予想ロジック用 kimari とは完全に分離する。
-  const racerKimariteTable = useMemo(
-    () => buildRacerKimariteTableFromDb(dbRacerRows, racerProfiles, courses),
-    [dbRacerRows, racerProfiles, courses]
-  );
+  // 敗戦時の決まり手は「その選手行の kimarite」ではなく、同一レースの1着艇の決まり手で判定する。
+  const [racerKimariteTable, setRacerKimariteTable] = useState({ "直近6ヶ月": {}, "直近1年": {} });
+  const [racerKimariteStatus, setRacerKimariteStatus] = useState("決まり手率：未取得");
   const [racerCat, setRacerCat] = useState("直近6ヶ月");
   const [resistanceByBoat, setResistanceByBoat] = useState({});
   const [resistanceBaseline, setResistanceBaseline] = useState({});
@@ -3837,6 +3900,41 @@ export default function App() {
 
   useEffect(() => {
     let alive = true;
+    const regnos = [1, 2, 3, 4, 5, 6]
+      .map((b) => Number(racerProfiles?.[b]?.regNo || 0))
+      .filter(Boolean);
+    if (!regnos.length) {
+      setRacerKimariteTable({ "直近6ヶ月": {}, "直近1年": {} });
+      setRacerKimariteStatus("決まり手率：選手未取得");
+      return () => { alive = false; };
+    }
+    if (!CORRECTION_TABLE_ENABLED) {
+      setRacerKimariteStatus("決まり手率：ENVなし");
+      return () => { alive = false; };
+    }
+    setRacerKimariteStatus("決まり手率：読込中");
+    Promise.all([
+      fetchRacerKimariteStats(regnos, 180),
+      fetchRacerKimariteStats(regnos, 365),
+    ]).then(([rows6m, rows1y]) => {
+      if (!alive) return;
+      const byPeriod = { "直近6ヶ月": rows6m, "直近1年": rows1y };
+      setRacerKimariteTable(buildRacerKimariteTableFromRpc(byPeriod, racerProfiles, courses));
+      setRacerKimariteStatus("決まり手率：読込済");
+    }).catch((e) => {
+      console.error("racer kimarite stats load error", e);
+      if (!alive) return;
+      setRacerKimariteTable({ "直近6ヶ月": {}, "直近1年": {} });
+      setRacerKimariteStatus(`決まり手率：失敗 ${String(e?.message || e).slice(0, 70)}`);
+    });
+    return () => { alive = false; };
+  }, [
+    JSON.stringify([1,2,3,4,5,6].map((b) => racerProfiles?.[b]?.regNo || "")),
+    JSON.stringify([1,2,3,4,5,6].map((b) => courses?.[b] || b)),
+  ]);
+
+  useEffect(() => {
+    let alive = true;
     const pairs = [1, 2, 3, 4, 5, 6]
       .map((boat) => ({
         boat,
@@ -3860,18 +3958,22 @@ export default function App() {
     const periods = [
       { key: "1y", label: "直近1年", days: 365 },
     ];
-    const targetCourses = [...new Set(pairs.map((x) => x.course).filter((c) => c >= 1 && c <= 5))];
-
     Promise.all(periods.map(async (period) => {
-      const baselineEntries = await Promise.all(
-        targetCourses.map(async (course) => [course, await fetchResistanceBaselineByCourse(course, period.days)])
-      );
+      // 基準値は6コース分を1回のRPCで取得（旧: コースごと最大5回）。
+      const baselineRows = await fetchResistanceBaselineAllCourses(period.days);
+      const baselines = {};
+      for (const row of baselineRows || []) {
+        const myCourse = Number(row?.my_course);
+        if (!Number.isInteger(myCourse)) continue;
+        if (!baselines[myCourse]) baselines[myCourse] = [];
+        baselines[myCourse].push(row);
+      }
       const items = await Promise.all(pairs.map(async ({ boat, regno, course }) => ({
         boat,
         course,
         rows: course === 6 ? [] : await fetchRacerResistanceByCourse(regno, course, period.days),
       })));
-      return { ...period, baselines: Object.fromEntries(baselineEntries), items };
+      return { ...period, baselines, items };
     })).then((results) => {
       if (!alive) return;
       const nextByBoat = {};
@@ -8318,7 +8420,6 @@ export default function App() {
               const rows = [1, 2, 3, 4, 5, 6].map((b) => {
                 const stat = kmByBoat?.[b] || null;
                 const course = Number(courses?.[b] || b);
-                const exactStarts = racerStats?.n?.[kimariTablePeriod]?.[b - 1];
                 return {
                   boat: b,
                   course,
@@ -8327,7 +8428,7 @@ export default function App() {
                   sashi: stat?.sashi || null,
                   makuri: stat?.makuri || null,
                   makurizashi: stat?.makurizashi || null,
-                  starts: Number.isFinite(Number(exactStarts)) ? Number(exactStarts) : stat?.starts ?? null,
+                  starts: stat?.starts ?? null,
                 };
               });
               const rateCell = (cell) => {
@@ -8361,6 +8462,7 @@ export default function App() {
                           <option value="直近1年">直近1年</option>
                         </select>
                       </label>
+                      <span style={{ fontSize: 10, color: racerKimariteStatus.includes("失敗") ? "#ff8a80" : "#7da3c8" }}>{racerKimariteStatus}</span>
                       <span style={{ fontSize: 10, color: "#7da3c8" }}>参考表示のみ・予想ロジック未反映</span>
                     </div>
                   </div>
@@ -8368,7 +8470,7 @@ export default function App() {
                     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 720 }}>
                       <thead>
                         <tr style={{ color: "#7da3c8", fontSize: 10 }}>
-                          {["艇・選手", "進入", "逃げ", "差され／差し", "まくられ／まくり", "まくられ差し／まくり差し", "出走回数"].map((h, i) => (
+                          {["艇・選手", "進入", "逃げ／逃し", "差され／差し", "まくられ／まくり", "まくられ差し／まくり差し", "出走回数"].map((h, i) => (
                             <th key={h} style={{ padding: "7px 6px", textAlign: i === 0 ? "left" : "center", borderBottom: "1px solid #2c4762", whiteSpace: "nowrap" }}>{h}</th>
                           ))}
                         </tr>
@@ -8399,7 +8501,7 @@ export default function App() {
                   </div>
                   <div style={{ fontSize: 9.5, color: "#607f9d", marginTop: 5, lineHeight: 1.5 }}>
                     ※ 出走回数は、選択期間内に各選手が現在の実進入コースを走った回数です。各率の下には該当決まり手の回数を表示します。<br />
-                    ※ 「逃げ」列は、1コースでは逃げ率、2〜6コースでは逃し率です。1コースは「差され・まくられ・まくられ差し」、2〜6コースは「差し・まくり・まくり差し」です。<br />
+                    ※ 「逃げ／逃し」列は、1コースでは逃げ率、2〜6コースでは逃し率です。1コースの敗戦は同一レースの1着艇の決まり手から「差され・まくられ・まくられ差し」を集計します。<br />
                     ※ この表は閲覧用で、AI評価・展開予想・買い目計算には使用しません。
                   </div>
                 </div>
